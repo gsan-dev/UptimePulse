@@ -448,3 +448,93 @@ SELECT * FROM checks WHERE monitor_id = '<MONITOR_ID>';  -- debe dar 0 filas
 Si al borrar la organización desaparecen solos el monitor y el check, el borrado en cascada funciona.
 
 **Alternativa visual:** conectar DBeaver / TablePlus / la extensión PostgreSQL de VS Code a `localhost:5432`, usuario `uptimepulse`, contraseña `changeme` (están en tu `.env`), base de datos `uptimepulse`.
+
+---
+
+## 2026-09-20 (continuación 4) — Fase 0.4: Convenciones de código compartidas
+
+### Objetivo
+Que `packages/shared` deje de ser un puñado de tipos escritos a mano (como quedó en la Fase 0.1, antes de existir el ERD) y pase a ser la única fuente de verdad de tipos de dominio para `apps/api`, `apps/worker` y `apps/web`; y tener un formato de logging estructurado común entre los dos procesos backend.
+
+### Decisión de diseño: los tipos de `shared` se derivan del esquema real, no se duplican a mano
+En vez de mantener un `Monitor` (y luego `Check`, `Incident`, etc.) escritos a mano en `packages/shared` en paralelo a las tablas de `packages/db` — con el riesgo de que se desincronicen en cuanto alguien cambie una columna sin acordarse de tocar los dos sitios — `packages/shared/src/domain.ts` ahora hace:
+
+```ts
+export type Monitor = InferSelectModel<typeof monitors>;
+```
+
+`InferSelectModel` es una utilidad de Drizzle que convierte la definición de una tabla en el tipo TypeScript exacto de una fila. Cambiar una columna en `packages/db/src/schema.ts` (Fase 0.3) actualiza automáticamente el tipo en `packages/shared`, y de ahí a todo lo que lo consuma — sin tocar `domain.ts` para nada, salvo que se añada una tabla nueva.
+
+### El riesgo que había que evitar: que el frontend arrastre `pg`
+`packages/db` importa `pg` (el driver de Postgres) y, en cuanto se importa su cliente (`client.ts`), intenta leer `DATABASE_URL` y abrir una conexión — código que **no debe existir en el navegador**. Para que `packages/shared` pudiera usar los tipos de `packages/db` sin arrastrar ese runtime al bundle de `apps/web`, todos los imports desde `@uptimepulse/db` en `domain.ts` usan la sintaxis `import type`, nunca `import` normal:
+
+```ts
+import type { InferSelectModel } from "drizzle-orm";
+import type { monitors, checks, /* ... */ } from "@uptimepulse/db";
+```
+
+`import type` se borra por completo del código compilado (tanto `tsc` como el `esbuild` que usa Vite lo eliminan siempre, incluso sin type-checking completo), así que en tiempo de ejecución el navegador nunca ve ni una línea de `@uptimepulse/db`.
+
+**Verificado, no solo asumido:** se arrancó `apps/web`, se pidió por HTTP el archivo `src/App.tsx` ya transformado por Vite (`curl http://localhost:5173/src/App.tsx`), y se comprobó a ojo que el JS servido **no contiene ningún `import` de `@uptimepulse/shared`, `@uptimepulse/db`, `pg` ni `drizzle-orm`** — el `import type { Monitor } from "@uptimepulse/shared"` desapareció sin dejar rastro, tal como se esperaba.
+
+### Qué se hizo
+
+1. **`packages/shared/src/domain.ts`** (nuevo): tipos `Monitor`, `Check`, `Incident`, `NotificationChannel`, `MaintenanceWindow`, `StatusPage`, `Plan`, `Organization` derivados con `InferSelectModel`; `MonitorType`, `CheckStatus`, `ChannelType`, `OrgRole` derivados de los `pgEnum` del esquema (`(typeof monitorTypeEnum.enumValues)[number]`); y `PublicUser` como excepción manual: `Omit<..., "passwordHash" | "oauthId">`, porque esos dos campos **nunca** deben llegar al frontend.
+2. **`packages/shared/src/logger.ts`** (nuevo): `createLogger(service: string)` que devuelve `{ debug, info, warn, error }`, cada uno imprimiendo una línea JSON (`timestamp`, `level`, `service`, `message`, + campos extra). Escrito sin ninguna API de Node (nada de `process.pid` ni similares) para que sea seguro de importar desde cualquier sitio, aunque su uso previsto es solo backend.
+3. **`packages/shared/src/index.ts`**: ahora solo re-exporta `domain.ts` y `logger.ts` (antes tenía los tipos a mano directamente).
+4. **`packages/shared/package.json`**: añadida dependencia `@uptimepulse/db` (para los tipos) y devDependency `drizzle-orm` (para `InferSelectModel`).
+5. **`packages/shared/tsconfig.json`** (nuevo, no existía desde la Fase 0.1): para poder tipar el paquete de forma aislada con `tsc --noEmit -p packages/shared`, igual que ya se hacía con `packages/db`.
+6. **`apps/api/src/index.ts`**: usa `createLogger("api")` en vez de `console.log`, y el placeholder `exampleMonitor` ahora es un objeto `Monitor` completo y válido (con todos los campos reales de la tabla: `organizationId`, `method`, `headers`, `body`, `expectedStatus`, `tags`, `createdAt`...), no la versión simplificada de la Fase 0.1.
+7. **`apps/worker/src/index.ts`**: usa `createLogger("worker")`.
+8. **`apps/web/package.json`**: se añadió la dependencia `@uptimepulse/shared` (curiosamente no se había declarado en la Fase 0.1, aunque `apps/api`/`apps/worker` sí la tenían).
+9. **`apps/web/src/App.tsx`**: añadido un listado placeholder tipado como `Pick<Monitor, "name" | "type" | "target">[]`, solo para demostrar que el tipo llega con autocompletado hasta el frontend (el dashboard real es la Fase 1.4, esto no lo adelanta).
+
+### Comandos ejecutados (y qué hace cada uno)
+
+```bash
+# Instalar las dependencias nuevas (enlaza @uptimepulse/db dentro de @uptimepulse/shared,
+# y @uptimepulse/shared dentro de apps/web, vía los symlinks de npm workspaces)
+npm install
+
+# Comprobar que todo tipa sin errores, paquete por paquete
+npm run lint
+npx tsc --noEmit -p packages/shared
+npx tsc --noEmit -p apps/api
+npx tsc --noEmit -p apps/worker
+npx tsc --noEmit -p apps/web
+
+# Comprobar que los logs salen en JSON de verdad (no solo que compila)
+npm run dev:api      # -> {"timestamp":"...","level":"info","service":"api","message":"servidor placeholder arrancado","monitor":{...}}
+npm run dev:worker   # -> {"timestamp":"...","level":"info","service":"worker","message":"proceso placeholder arrancado..."}
+
+# Comprobar que el import de tipo se borra del bundle del navegador
+npm run dev:web &
+curl http://localhost:5173/src/App.tsx | head -20
+# -> el JS transformado no contiene ningún import de @uptimepulse/shared
+```
+
+### Cómo reproducir / comprobar tú mismo
+
+```bash
+# 1. Arranca api y worker en dos terminales separadas y mira que los logs sean JSON de una línea
+npm run dev:api
+npm run dev:worker
+
+# 2. Arranca el frontend y ábrelo en el navegador
+npm run dev:web
+# -> http://localhost:5173 debe mostrar la lista de 2 monitores de ejemplo (Google, API interna)
+
+# 3. (la comprobación "de verdad") en el navegador, abre las DevTools -> pestaña Network,
+#    recarga la página, y mira la petición a /src/App.tsx: no debe haber ninguna petición
+#    a @uptimepulse/db, pg, drizzle-orm ni nada que empiece por esos nombres.
+
+# 4. Type-check de todo el repo de una vez
+npx tsc --noEmit -p packages/shared && npx tsc --noEmit -p packages/db && npx tsc --noEmit -p apps/api && npx tsc --noEmit -p apps/worker && npx tsc --noEmit -p apps/web
+```
+
+### Pendiente / notas para más adelante
+- `Check.id` es un `bigint` de JavaScript (viene de la columna `bigint` de Postgres). `JSON.stringify()` **no sabe serializar `bigint`** y lanza una excepción si se intenta tal cual — habrá que convertirlo a `string` o `number` al construir las respuestas de la API en la Fase 1.2. Queda anotado aquí para no encontrárselo por sorpresa.
+- No se ha añadido todavía ningún `tsconfig` "raíz" que haga type-check de todo el monorepo de una vez (`tsc --build` con project references); de momento se comprueba paquete por paquete a mano, como en los comandos de arriba. Se puede añadir cuando moleste tener que repetir el comando 5 veces.
+
+### Próximo paso (Fase 1.1)
+Autenticación: registro/login con email+contraseña, hash con bcrypt/argon2, y la decisión de diseño pendiente de JWT vs. sesiones (documentar en la sección de ADR del TASK.md).

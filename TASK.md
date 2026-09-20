@@ -51,10 +51,16 @@ Antes de tocar lógica de negocio, monta el esqueleto para que cada pieza poster
 - [x] Herramienta de migraciones: **Drizzle ORM + drizzle-kit** (no Prisma — ver justificación en el diario: Prisma no modela bien las hypertables/políticas de Timescale; Drizzle permite migraciones SQL "custom" intercaladas con las generadas automáticamente).
 - **Hecho cuando:** existe un diagrama (aunque sea en Markdown/Mermaid) y las migraciones iniciales corren limpias sobre el Postgres del docker-compose. **Verificado:** 13 tablas creadas, `checks` convertida en hypertable, política de retención de 90 días activa, prueba de inserción/borrado en cascada vía el cliente Drizzle exitosa.
 
-### 0.4 Convenciones de código compartidas
-- [ ] `packages/shared`: tipos TS de dominio (Monitor, Check, Incident, etc.) usados tanto por API, worker y web.
-- [ ] Definir formato de logging estructurado (JSON) reutilizable entre API y worker (mejora #6, ver Fase 5).
-- **Hecho cuando:** un cambio en un tipo de `shared` se refleja con autocompletado en `apps/api` y `apps/web` sin duplicar la definición.
+### 0.4 Convenciones de código compartidas ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] `packages/shared`: tipos TS de dominio (Monitor, Check, Incident, etc.) usados tanto por API, worker y web. **Implementado como tipos derivados de `packages/db` vía `InferSelectModel`** (una sola fuente de verdad: el esquema real de la BD), no como copias escritas a mano.
+- [x] Definir formato de logging estructurado (JSON) reutilizable entre API y worker (mejora #6, ver Fase 5). Implementado en `packages/shared/src/logger.ts` (`createLogger(service)`), usado ya en `apps/api` y `apps/worker`.
+- **Hecho cuando:** un cambio en un tipo de `shared` se refleja con autocompletado en `apps/api` y `apps/web` sin duplicar la definición. **Verificado:** `apps/api` usa `Monitor` real con todos sus campos; `apps/web` importa el mismo tipo con `import type` y Vite lo borra por completo del bundle (comprobado inspeccionando el JS servido, cero referencias a `@uptimepulse/shared`/`pg`/`drizzle-orm` en tiempo de ejecución del navegador).
+
+---
+
+## 🎉 Fase 0 completa (Cimientos del proyecto)
+
+Con 0.1, 0.2, 0.3 y 0.4 cerrados, el proyecto tiene: monorepo funcional, infraestructura de datos local (Postgres+TimescaleDB, Redis), esquema de base de datos real con migraciones versionadas, tipos compartidos con una sola fuente de verdad, y logging estructurado. **Siguiente:** Fase 1 (MVP) — empieza por 1.1 (Autenticación), que es la primera pieza que escribe código de negocio real sobre las tablas `users`/`organizations`/`organization_members` ya creadas.
 
 ---
 
