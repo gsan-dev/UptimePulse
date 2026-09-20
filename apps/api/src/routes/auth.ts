@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { eq, type InferSelectModel } from "drizzle-orm";
 import { z } from "zod";
-import { db, organizationMembers, organizations, users } from "@uptimepulse/db";
+import { db, organizationMembers, organizations, plans, users } from "@uptimepulse/db";
 import type { PublicUser } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { hashPassword, verifyPassword } from "../lib/password.js";
@@ -52,9 +52,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const user = await db.transaction(async (tx) => {
       const [newUser] = await tx.insert(users).values({ email, passwordHash }).returning();
+      const freePlan = await tx.query.plans.findFirst({ where: eq(plans.name, "free") });
       const [org] = await tx
         .insert(organizations)
-        .values({ name: organizationName ?? `Organización de ${email}` })
+        .values({ name: organizationName ?? `Organización de ${email}`, planId: freePlan?.id })
         .returning();
       await tx.insert(organizationMembers).values({
         userId: newUser.id,

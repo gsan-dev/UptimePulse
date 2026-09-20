@@ -75,12 +75,12 @@ Objetivo: un usuario se registra, crea un monitor HTTP, un worker lo comprueba c
 - [x] Endpoint `GET /me`.
 - **Hecho cuando:** puedes registrar un usuario, iniciar sesión, y llamar a un endpoint protegido con el token. **Verificado con peticiones HTTP reales:** registro, `/me` sin token (401), `/me` con token (200), registro duplicado (409), login con contraseña incorrecta (401), refresh vía cookie, logout limpia la cookie. También verificado que el registro crea automáticamente una organización personal con el usuario como `admin`.
 
-### 1.2 CRUD de monitores (API)
-- [ ] `POST /monitors`, `GET /monitors`, `GET /monitors/:id`, `PATCH /monitors/:id`, `DELETE /monitors/:id`.
-- [ ] `POST /monitors/:id/pause` / `/resume`.
-- [ ] Validación de input (zod/valibot): URL bien formada, intervalo dentro de los límites del plan.
-- [ ] **Validación anti-SSRF (mejora #1, crítica):** antes de guardar un monitor HTTP/TCP, resolver el hostname y rechazar IPs privadas/loopback/link-local (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `::1`), salvo modo "desarrollo" explícito.
-- **Hecho cuando:** puedes crear/editar/pausar/borrar un monitor vía API y un intento de monitorizar `http://localhost` o `http://169.254.169.254` es rechazado con un error claro.
+### 1.2 CRUD de monitores (API) ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] `POST /monitors`, `GET /monitors`, `GET /monitors/:id`, `PATCH /monitors/:id`, `DELETE /monitors/:id`.
+- [x] `POST /monitors/:id/pause` / `/resume`.
+- [x] Validación de input (zod): URL bien formada (por tipo de monitor, con `z.discriminatedUnion`), intervalo dentro de los límites del plan. Se sembró un plan "free" por defecto (migración `0003_seed_default_plan.sql`) para que este límite tuviera algo real que comprobar.
+- [x] **Validación anti-SSRF (mejora #1, crítica):** implementada en `lib/ssrf-guard.ts`. Resuelve el hostname por DNS y rechaza IPs privadas/loopback/link-local, salvo `ALLOW_PRIVATE_MONITOR_TARGETS=true` en `.env` (modo desarrollo explícito).
+- **Hecho cuando:** puedes crear/editar/pausar/borrar un monitor vía API y un intento de monitorizar `http://localhost` o `http://169.254.169.254` es rechazado con un error claro. **Verificado con 19 pruebas HTTP reales**, incluyendo: creación válida, bloqueo de `localhost`/`169.254.169.254`/IP privada literal/dominio TCP privado, bloqueo por **resolución DNS real** (`localtest.me` → `127.0.0.1`, no solo coincidencia de texto), límite de intervalo mínimo del plan, límite máximo de 5 monitores, aislamiento entre organizaciones (usuario B no puede ver ni listar monitores de A, 404 sin filtrar datos), y ciclo de vida completo (crear/leer/listar/editar/pausar/reanudar/borrar).
 
 ### 1.3 Worker simple (checks HTTP)
 - [ ] Proceso independiente (`apps/worker`) que cada X segundos consulta monitores activos cuyo próximo check toque.
@@ -262,6 +262,18 @@ el volumen de registros/logins de este proyecto. OWASP recomienda Argon2id
 como primera opción; si en algún momento se despliega a un entorno donde la
 compilación nativa no sea un problema, migrar a `argon2` es un cambio
 aislado a `apps/api/src/lib/password.ts`, sin tocar el resto del código.
+
+### 2026-09-20 — CRUD de monitores: una organización "primaria" por usuario, no selector de organización
+Decisión: `getPrimaryOrganizationId(userId)` usa la primera (única, por ahora)
+membresía del usuario, en vez de pedir un `organizationId` explícito en cada
+petición.
+Motivo: hasta la Fase 4 (equipos), el registro crea exactamente una
+organización por usuario, así que no hay ambigüedad todavía. Es una
+simplificación deliberada y temporal: cuando un usuario pueda pertenecer a
+varias organizaciones, esta función deberá sustituirse por un mecanismo
+explícito (header `X-Organization-Id`, o parámetro), elegido activamente en
+el frontend — no adivinado. Está documentado en el propio código
+(`apps/api/src/lib/organizations.ts`) para que no se olvide.
 
 ### 2026-09-20 — `packages/db`: paquete nuevo no contemplado en el README original
 Decisión: crear `packages/db` para el esquema Drizzle + cliente de Postgres,

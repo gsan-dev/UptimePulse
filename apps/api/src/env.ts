@@ -20,4 +20,8 @@ export const env = {
   databaseUrl: required("DATABASE_URL"),
   jwtAccessSecret: required("JWT_ACCESS_SECRET"),
   jwtRefreshSecret: required("JWT_REFRESH_SECRET"),
+  // Solo para desarrollo local: desactiva la comprobación anti-SSRF para
+  // poder monitorizar hosts internos (ej. http://localhost:4000). Ver
+  // lib/ssrf-guard.ts. Nunca debe activarse en un despliegue real.
+  allowPrivateMonitorTargets: process.env.ALLOW_PRIVATE_MONITOR_TARGETS === "true",
 };

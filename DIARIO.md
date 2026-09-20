@@ -714,3 +714,149 @@ WHERE u.email = 'prueba@ejemplo.com';"
 
 ### Próximo paso (Fase 1.2)
 CRUD de monitores: `POST/GET/PATCH/DELETE /monitors`, con la validación anti-SSRF que quedó marcada como crítica en el análisis inicial del README.
+
+---
+
+## 2026-09-20 (continuación 6) — Fase 1.2: CRUD de monitores + validación anti-SSRF
+
+### Objetivo
+Que un usuario autenticado pueda crear, listar, ver, editar, pausar/reanudar y borrar monitores — con la validación anti-SSRF (marcada como crítica en el análisis inicial del README) y los límites del plan de suscripción realmente aplicados, no solo documentados.
+
+### Pieza previa necesaria: sembrar un plan "free" real
+Los monitores tienen que validarse contra "los límites del plan" (README §2.7, TASK §1.2), pero hasta ahora ninguna organización tenía un plan asignado (`organizations.plan_id` llevaba desde la Fase 0.3 sin usarse). Se añadió una migración custom:
+```sql
+-- migrations/0003_seed_default_plan.sql
+INSERT INTO plans (name, max_monitors, min_interval_seconds, allowed_channels)
+VALUES ('free', 5, 300, '["email"]'::jsonb)
+ON CONFLICT (name) DO NOTHING;
+```
+Y se modificó `POST /auth/register` (Fase 1.1) para asignar este plan a toda organización nueva. El `ON CONFLICT DO NOTHING` hace que la migración sea segura de re-ejecutar (idempotente).
+
+### Decisión de diseño: una organización "primaria" por usuario (simplificación temporal)
+`apps/api/src/lib/organizations.ts` expone `getPrimaryOrganizationId(userId)`, que coge la primera membresía del usuario sin pedir que elija cuál. Es correcto hoy porque el registro (Fase 1.1) crea exactamente una organización por usuario; dejará de serlo en la Fase 4 (equipos). Queda documentado en el propio código y en el ADR de TASK.md para no olvidarlo cuando llegue el momento.
+
+### La pieza central: `lib/ssrf-guard.ts`
+Qué hace `assertPublicHost(hostname)`:
+1. Si `hostname` es ya una IP literal (`net.isIP`), la comprueba directamente.
+2. Si es un nombre de dominio, lo resuelve con `dns.lookup(hostname, { all: true })` — pidiendo **todas** las direcciones, no solo la primera — y comprueba cada una.
+3. Si cualquiera de las IPs (o la única) cae en un rango privado/loopback/link-local (IPv4: `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `0.0.0.0/8`; IPv6: `::1`, `fe80::/10`, `fc00::/7`, y direcciones IPv4-mapeadas `::ffff:x.x.x.x`), lanza `SsrfBlockedError` con un mensaje claro.
+4. Se puede desactivar con `ALLOW_PRIVATE_MONITOR_TARGETS=true` en `.env`, pensado solo para poder monitorizar servicios internos durante el desarrollo local.
+
+**Por qué comprobar por DNS y no solo por texto:** bloquear el string `"localhost"` o `"169.254.169.254"` a mano habría dejado un hueco enorme — cualquier dominio público que resuelva a una IP privada (a propósito, vía "DNS rebinding") lo habría esquivado. La prueba con `localtest.me` (ver más abajo) demuestra justo esto: es un dominio público de verdad, pero configurado para resolver a `127.0.0.1`, y el guardián lo bloquea igualmente porque comprueba la IP resuelta, no el nombre.
+
+`lib/target.ts` extrae el hostname a comprobar según el tipo de monitor: la URL completa para `http` (`new URL(target).hostname`), la parte antes de los dos puntos para `tcp` (`host:puerto`), y el target tal cual para `ping`.
+
+### Validación de entrada con Zod (por tipo de monitor)
+`createMonitorSchema` es un `z.discriminatedUnion("type", [...])`: cada tipo de monitor (`http`/`tcp`/`ping`) tiene su propia forma de validar `target` (URL completa, `host:puerto`, o solo un string no vacío), y los campos específicos de HTTP (`method`, `headers`, `body`, `expectedStatus`) solo existen en el schema de tipo `http`. El intervalo por defecto se fijó en **300 segundos a propósito**, para que coincida con el mínimo del plan "free" — así, si el cliente no manda `intervalSeconds`, nunca choca contra el límite del plan sin querer.
+
+### Endpoints implementados (todos protegidos por `requireAuth`, vía `app.addHook("preHandler", requireAuth)` a nivel de todo el plugin de rutas)
+| Método y ruta | Qué hace |
+|---|---|
+| `POST /monitors` | Valida input, comprueba límites del plan (intervalo mínimo, nº máximo), comprueba anti-SSRF, crea el monitor. |
+| `GET /monitors` | Lista los monitores de la organización del usuario. |
+| `GET /monitors/:id` | Un monitor, solo si pertenece a la organización del usuario (si no, 404 — no 403, para no confirmar que el id existe). |
+| `PATCH /monitors/:id` | Actualiza campos parciales; si cambia `target`, repite la comprobación anti-SSRF; si cambia `intervalSeconds`, repite la comprobación del plan. |
+| `DELETE /monitors/:id` | Borra (con la misma comprobación de propiedad). |
+| `POST /monitors/:id/pause` / `/resume` | Cambia `isPaused`. |
+
+### Comandos ejecutados
+
+```bash
+# Generar y aplicar la migración de seed del plan free
+cd packages/db && npx drizzle-kit generate --custom --name=seed_default_plan
+# (se rellenó a mano, ver arriba)
+npm run db:migrate
+
+# Comprobar tipos y estilo
+npx tsc --noEmit -p apps/api
+npm run lint
+
+# Arrancar la API
+npm run dev:api
+```
+
+### Verificación completa (19 comprobaciones con peticiones HTTP reales)
+
+**Anti-SSRF (la parte crítica):**
+```bash
+# Válido: pasa
+curl -X POST http://localhost:3000/monitors -H "$AUTH" -d '{"name":"Example","type":"http","target":"https://example.com"}'
+# -> 201
+
+# localhost -> bloqueado (resuelve a ::1)
+curl -X POST http://localhost:3000/monitors -H "$AUTH" -d '{"name":"Localhost","type":"http","target":"http://localhost:3000"}'
+# -> 422 "localhost resuelve a ::1, una dirección privada/interna..."
+
+# IP de metadatos cloud, literal -> bloqueado
+curl -X POST http://localhost:3000/monitors -H "$AUTH" -d '{"name":"Metadata","type":"http","target":"http://169.254.169.254/"}'
+# -> 422
+
+# DOMINIO PÚBLICO que resuelve a 127.0.0.1 (localtest.me) -> bloqueado por DNS, no por texto
+curl -X POST http://localhost:3000/monitors -H "$AUTH" -d '{"name":"DNS rebinding test","type":"http","target":"http://localtest.me"}'
+# -> 422 "localtest.me resuelve a 127.0.0.1..."
+
+# TCP contra IP privada -> bloqueado
+curl -X POST http://localhost:3000/monitors -H "$AUTH" -d '{"name":"DB interna","type":"tcp","target":"10.0.0.5:5432"}'
+# -> 422
+
+# PATCH cambiando el target a uno privado -> también se revalida
+curl -X PATCH http://localhost:3000/monitors/<id> -H "$AUTH" -d '{"target":"http://127.0.0.1"}'
+# -> 422
+```
+
+**Límites del plan:**
+```bash
+# Intervalo por debajo del mínimo (300s) -> 422
+curl -X POST .../monitors -d '{"...","intervalSeconds":60}'  # -> 422 "Tu plan exige un intervalo mínimo de 300 segundos"
+
+# Crear hasta 5 monitores, el 6º falla
+# (se crearon 5 con éxito, el 6º dio:)
+# -> 422 "Tu plan permite un máximo de 5 monitores"
+```
+
+**Aislamiento entre organizaciones:**
+```bash
+# Usuario B intenta ver un monitor del usuario A -> 404 (no filtra ni con un 403 que confirme que existe)
+curl http://localhost:3000/monitors/<id-de-A> -H "Authorization: Bearer <token-de-B>"
+# -> 404 "Monitor no encontrado"
+```
+
+**Ciclo de vida completo:** crear → `GET /monitors/:id` → `GET` de un id inexistente (404) → `GET` de un id mal formado (400, sin llegar a tocar la BD) → `PATCH` (nombre e intervalo) → pausar → reanudar → borrar → `GET` tras borrar (404). Los 8 pasos se comprobaron uno a uno y dieron el código HTTP esperado.
+
+Los datos de prueba (2 usuarios, sus organizaciones y monitores) se borraron después de verificar.
+
+### Cómo reproducir / comprobar tú mismo
+
+```bash
+# 0. Preparación (si no lo tienes ya corriendo)
+docker compose up -d
+npm run db:migrate
+npm run dev:api
+
+# 1. Regístrate y guarda el accessToken de la respuesta
+curl -X POST http://localhost:3000/auth/register -H "Content-Type: application/json" \
+  -d '{"email":"tu-email@ejemplo.com","password":"password123"}'
+
+# 2. Crea un monitor válido
+curl -X POST http://localhost:3000/monitors \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"name":"Mi web","type":"http","target":"https://example.com"}'
+# -> 201
+
+# 3. Prueba el anti-SSRF con un objetivo interno
+curl -X POST http://localhost:3000/monitors \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"name":"Interno","type":"http","target":"http://localhost"}'
+# -> debe dar 422, no 201
+
+# 4. Lista tus monitores
+curl http://localhost:3000/monitors -H "Authorization: Bearer <TOKEN>"
+```
+
+### Pendiente / notas para más adelante
+- La comprobación anti-SSRF se hace **al crear/editar** el monitor, pero no se repite en cada check periódico (Fase 1.3). Esto es una ventana teórica: un dominio podría resolver a una IP pública en el momento de crearlo y cambiar a una IP privada después (DNS rebinding "diferido" en el tiempo, no en la misma resolución). Cuando se construya el worker (Fase 1.3), conviene repetir `assertPublicHost` justo antes de cada request real, no fiarse solo de la comprobación en el momento de guardar. Anotado para no olvidarlo.
+- No hay paginación en `GET /monitors` — para 5 monitores como máximo (plan free) no hace falta todavía; si los límites de plan suben en el futuro, revisar.
+- Las cabeceras (`headers`) y el `body` de un monitor HTTP se guardan tal cual en la BD sin ningún límite de tamaño — no es un problema de seguridad grave (el usuario solo se perjudica a sí mismo), pero podría añadirse un límite de tamaño razonable más adelante.
+
+### Próximo paso (Fase 1.3)
+El worker de verdad: un proceso que recorra los monitores activos, ejecute el check HTTP real (repitiendo la comprobación anti-SSRF justo antes de cada petición, según la nota de arriba), y guarde el resultado en la tabla `checks`.

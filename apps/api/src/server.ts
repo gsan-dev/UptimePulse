@@ -3,6 +3,7 @@ import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import { createLogger } from "@uptimepulse/shared";
 import { authRoutes } from "./routes/auth.js";
+import { monitorRoutes } from "./routes/monitors.js";
 
 const logger = createLogger("api");
 
@@ -17,6 +18,7 @@ export async function buildServer() {
   app.get("/health", async () => ({ status: "ok" }));
 
   await app.register(authRoutes);
+  await app.register(monitorRoutes);
 
   app.setErrorHandler((error: Error, request, reply) => {
     logger.error("error no controlado", { error: error.message, path: request.url });
