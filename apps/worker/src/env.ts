@@ -17,7 +17,10 @@ function required(name: string): string {
 
 export const env = {
   databaseUrl: required("DATABASE_URL"),
-  pollIntervalMs: Number(process.env.WORKER_POLL_INTERVAL_MS ?? 10000),
+  redisUrl: required("REDIS_URL"),
+  // Cuántos checks puede ejecutar en paralelo ESTE proceso worker (no el
+  // total del sistema — cada instancia que arranques suma su propia cuota).
+  concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
   allowPrivateMonitorTargets: process.env.ALLOW_PRIVATE_MONITOR_TARGETS === "true",
   smtpHost: process.env.SMTP_HOST ?? "localhost",
   smtpPort: Number(process.env.SMTP_PORT ?? 1025),

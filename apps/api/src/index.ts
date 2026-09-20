@@ -4,8 +4,11 @@
 import { env } from "./env.js";
 import { createLogger } from "@uptimepulse/shared";
 import { buildServer } from "./server.js";
+import { reconcileMonitorSchedulers } from "./reconcile-schedulers.js";
 
 const logger = createLogger("api");
+
+await reconcileMonitorSchedulers();
 
 const app = await buildServer();
 

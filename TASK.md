@@ -114,12 +114,12 @@ Con 1.1 a 1.5 cerrados, UptimePulse ya es un producto usable de principio a fin:
 
 ## Fase 2 — Cola de trabajo real, incidentes, tiempo real
 
-### 2.1 Cola de trabajo (Redis + BullMQ)
-- [ ] Sustituir el bucle simple del worker por jobs programados en BullMQ (uno por monitor, con `repeat` según su intervalo).
-- [ ] Separar "productor" (API que agenda/actualiza jobs cuando se crea/edita/borra un monitor) de "consumidor" (proceso worker que ejecuta el check).
-- [ ] Escalar a N workers concurrentes; verificar que no se duplican checks (idempotencia / locks).
-- [ ] Dashboard de administración de la cola (Bull Board) en desarrollo.
-- **Hecho cuando:** puedes lanzar 2 instancias del worker y los checks se reparten entre ellas sin duplicarse ni perderse.
+### 2.1 Cola de trabajo (Redis + BullMQ) ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] Sustituido el bucle simple del worker por **Job Schedulers de BullMQ** (uno por monitor, vía `upsertJobScheduler` con `every: intervalSeconds * 1000` — la API moderna de BullMQ para "repeat", no la antigua basada en claves de repetición).
+- [x] Separado productor (`apps/api`, agenda/reprograma/quita el job al crear/editar el intervalo/pausar/reanudar/borrar un monitor) de consumidor (`apps/worker`, un `Worker` de BullMQ que solo procesa jobs de la cola `monitor-checks`).
+- [x] Verificado con **2 instancias reales del worker corriendo a la vez**: los checks se repartieron entre ambas sin duplicarse ni perderse.
+- [x] Bull Board montado en `/admin/queues` (solo cuando `NODE_ENV !== "production"`).
+- **Hecho cuando:** puedes lanzar 2 instancias del worker y los checks se reparten entre ellas sin duplicarse ni perderse. **Verificado con datos reales:** 5 monitores de prueba con intervalo de 15s, 2 workers (PIDs distintos en los logs) repartiéndose los jobs; consulta SQL final: `COUNT(*) = COUNT(DISTINCT timestamp)` para cada monitor (cero duplicados). También verificado que pausar/reanudar/borrar vía la API quita/añade el *job scheduler* correspondiente (confirmado con el contador `jobSchedulerCount` de Bull Board bajando y subiendo exactamente como se esperaba), y que la reconciliación al arrancar la API recupera los monitores creados antes de esta migración.
 
 ### 2.2 Motor de incidentes
 - [ ] Job/listener que, al ver N checks fallidos consecutivos (configurable, ej. 2), crea un `incident` con `started_at`.
@@ -269,6 +269,26 @@ el volumen de registros/logins de este proyecto. OWASP recomienda Argon2id
 como primera opción; si en algún momento se despliega a un entorno donde la
 compilación nativa no sea un problema, migrar a `argon2` es un cambio
 aislado a `apps/api/src/lib/password.ts`, sin tocar el resto del código.
+
+### 2026-09-20 — Cola de trabajo: paquete nuevo `packages/queue`, Job Schedulers de BullMQ (no la API antigua de "repeat")
+Decisión: `packages/queue` centraliza toda la interacción con BullMQ/Redis
+(nombre de la cola, forma del payload del job, cómo programar/quitar el job
+de un monitor), usado tanto por `apps/api` (productor) como `apps/worker`
+(consumidor) — mismo patrón que `packages/server-utils` y `packages/mailer`.
+
+Dentro de BullMQ, se usa `upsertJobScheduler`/`removeJobScheduler` (la API
+de "Job Schedulers", más reciente) en vez del mecanismo antiguo de
+"repeatable jobs" con claves de repetición manuales — permite actualizar el
+intervalo de un monitor existente con una sola llamada idempotente, sin
+tener que buscar y borrar el job antiguo a mano primero.
+
+**Detalle importante:** BullMQ con `every` no ejecuta el primer job hasta
+que pasa el intervalo completo (la opción `immediately` solo funciona con
+patrones cron). Para no perder el "se comprueba nada más crearlo" de la
+Fase 1.3, `scheduleMonitorCheck()` además encola un check inmediato aparte
+con `queue.add()`. La reconciliación al arrancar la API usa la variante sin
+ese extra (`upsertMonitorScheduler`) para no disparar una ráfaga de checks
+en cada reinicio del proceso.
 
 ### 2026-09-20 — Alertas por email: Nodemailer + Mailpit, no Resend
 Decisión: `Nodemailer` (librería) apuntando a `Mailpit` (servidor SMTP de

@@ -7,9 +7,12 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
+    "@bull-board/api": "^9.10.0",
+    "@bull-board/fastify": "^9.10.0",
     "@fastify/cookie": "^11.0.0",
     "@fastify/cors": "^10.0.0",
     "@uptimepulse/db": "*",
+    "@uptimepulse/queue": "*",
     "@uptimepulse/server-utils": "*",
     "@uptimepulse/shared": "*",
     "bcryptjs": "^2.4.3",

@@ -3,10 +3,12 @@ import { eq, and, desc, sql } from "drizzle-orm";
 import { z } from "zod";
 import { checks, db, monitors } from "@uptimepulse/db";
 import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepulse/server-utils";
+import { scheduleMonitorCheck, unscheduleMonitorCheck } from "@uptimepulse/queue";
 import { env } from "../env.js";
 import { requireAuth } from "../plugins/auth.js";
 import { getPrimaryOrganizationId } from "../lib/organizations.js";
 import { getOrganizationPlanLimits } from "../lib/plans.js";
+import { monitorCheckQueue } from "../queue.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] as const;
 
@@ -158,6 +160,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       })
       .returning();
 
+    await scheduleMonitorCheck(monitorCheckQueue, monitor.id, monitor.intervalSeconds);
+
     return reply.code(201).send(monitor);
   });
 
@@ -249,6 +253,14 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const [updated] = await db.update(monitors).set(patch).where(eq(monitors.id, id)).returning();
+
+    // Solo reprogramar si de verdad cambió el intervalo y el monitor está
+    // activo — si está pausado, no hay que reactivarlo de rebote por editar
+    // otro campo cualquiera.
+    if (patch.intervalSeconds !== undefined && !updated.isPaused) {
+      await scheduleMonitorCheck(monitorCheckQueue, updated.id, updated.intervalSeconds);
+    }
+
     return reply.send(updated);
   });
 
@@ -263,6 +275,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     }
 
     await db.delete(monitors).where(eq(monitors.id, id));
+    await unscheduleMonitorCheck(monitorCheckQueue, id);
+
     return reply.code(204).send();
   });
 
@@ -277,6 +291,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const [updated] = await db.update(monitors).set({ isPaused: true }).where(eq(monitors.id, id)).returning();
+    await unscheduleMonitorCheck(monitorCheckQueue, id);
+
     return reply.send(updated);
   });
 
@@ -291,6 +307,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const [updated] = await db.update(monitors).set({ isPaused: false }).where(eq(monitors.id, id)).returning();
+    await scheduleMonitorCheck(monitorCheckQueue, updated.id, updated.intervalSeconds);
+
     return reply.send(updated);
   });
 }

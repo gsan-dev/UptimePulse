@@ -2,32 +2,31 @@
 import { env } from "./env.js";
 import { createLogger } from "@uptimepulse/shared";
 import { pool } from "@uptimepulse/db";
-import { pollDueMonitors } from "./poller.js";
+import { createMonitorCheckWorker, createRedisConnection } from "@uptimepulse/queue";
+import { processCheckJob } from "./lib/process-check.js";
 
 const logger = createLogger("worker");
 
-logger.info("worker arrancado", { pollIntervalMs: env.pollIntervalMs });
+const connection = createRedisConnection(env.redisUrl);
+const worker = createMonitorCheckWorker(connection, processCheckJob, env.concurrency);
+
+worker.on("failed", (job, error) => {
+  logger.error("job de check fallido", {
+    jobId: job?.id,
+    monitorId: job?.data.monitorId,
+    error: error.message,
+  });
+});
+
+logger.info("worker escuchando la cola de checks", { concurrency: env.concurrency, pid: process.pid });
 
 let stopping = false;
 
-async function tick(): Promise<void> {
-  try {
-    await pollDueMonitors();
-  } catch (error) {
-    logger.error("error en el ciclo de sondeo", {
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-  if (!stopping) {
-    setTimeout(tick, env.pollIntervalMs);
-  }
-}
-
-void tick();
-
 async function shutdown(signal: string): Promise<void> {
-  logger.info("apagando worker", { signal });
+  if (stopping) return;
   stopping = true;
+  logger.info("apagando worker", { signal });
+  await worker.close();
   await pool.end();
   process.exit(0);
 }

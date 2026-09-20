@@ -1194,3 +1194,115 @@ npm run dev:web
 ## 🎉 Fase 1 completa (MVP)
 
 Con esto, UptimePulse hace de principio a fin lo que promete el README: te registras, añades un monitor, un proceso independiente lo comprueba de verdad, y te avisa por email cuando cambia de estado — todo verificado con pruebas reales en cada paso, no solo "debería funcionar". La Fase 2 sustituye las partes deliberadamente simples del MVP (bucle de sondeo N+1, polling de 10s en el frontend) por la arquitectura de sistemas distribuidos real: cola de trabajo con BullMQ, motor de incidentes, y tiempo real por WebSocket.
+
+---
+
+## 2026-09-21 — Fase 2.1: Cola de trabajo real con BullMQ
+
+### Objetivo
+Sustituir el bucle de sondeo del worker (Fase 1.3: "cada 10s, pregunta a la BD quién le toca") por una cola de trabajo real sobre Redis, donde cada monitor tiene su propio job programado según su intervalo, y el trabajo se reparte automáticamente entre tantas instancias de worker como se levanten — sin duplicar ni perder checks.
+
+### Decisión de diseño: paquete nuevo `packages/queue`, y la API moderna de BullMQ
+`packages/queue` centraliza el nombre de la cola, la forma del job, y cómo programar/quitar el check de un monitor — usado por `apps/api` (productor) y `apps/worker` (consumidor), mismo patrón que `packages/server-utils`/`packages/mailer`.
+
+Dentro de BullMQ se usa **`upsertJobScheduler`/`removeJobScheduler`** — la API de "Job Schedulers" (más moderna que el mecanismo clásico de "repeatable jobs" con claves manuales). Se comprobaron los tipos reales de la librería instalada (`node_modules/bullmq/dist/esm/classes/queue.d.ts`) antes de escribir código, en vez de asumir la API por la documentación general.
+
+**Detalle que había que resolver:** `upsertJobScheduler({ every: ms })` no ejecuta el primer job de inmediato — solo tras el primer intervalo completo (`immediately` de BullMQ solo aplica a patrones cron). Para no perder el "se comprueba nada más crearlo" de la Fase 1.3, se separaron dos funciones:
+- `upsertMonitorScheduler()` — solo programa/reprograma, idempotente, sin efectos secundarios. Se usa en la reconciliación al arrancar la API.
+- `scheduleMonitorCheck()` — programa **y además** encola un check inmediato (`queue.add()`). Se usa solo en las acciones que el usuario dispara a propósito (crear, reanudar un monitor).
+
+Esta separación importaba de verdad: si la reconciliación usara la versión con check inmediato, cada reinicio de la API en desarrollo (con `tsx watch`, que reinicia en cada guardado) dispararía una ráfaga de checks de todos los monitores activos.
+
+### Qué se hizo
+
+**`packages/queue/`** (nuevo): `createRedisConnection`, `createMonitorCheckQueue`, `createMonitorCheckWorker`, `upsertMonitorScheduler`, `enqueueImmediateCheck`, `scheduleMonitorCheck`, `unscheduleMonitorCheck`.
+
+**`apps/api/src/`**:
+- `queue.ts` — conexión Redis + instancia de `Queue` del proceso API (productor).
+- `reconcile-schedulers.ts` — al arrancar, recorre todos los monitores activos y les asegura un scheduler (necesario para los monitores creados antes de esta migración, y como red de seguridad si Redis se reinicia).
+- `routes/monitors.ts` — cableado completo: `POST /monitors` programa, `PATCH` reprograma solo si cambió `intervalSeconds` (y el monitor no está pausado — para no reactivar uno pausado de rebote al editar otro campo), `DELETE` y `pause` desprograman, `resume` reprograma.
+- `server.ts` — Bull Board montado en `/admin/queues`, solo si `NODE_ENV !== "production"` (es una herramienta de desarrollo, no algo para dejar expuesto sin autenticación en un despliegue real).
+- `index.ts` — llama a `reconcileMonitorSchedulers()` antes de arrancar a escuchar peticiones.
+
+**`apps/worker/src/`**:
+- `lib/process-check.ts` (nuevo) — la lógica que antes vivía en el bucle de `poller.ts` (ejecutar el check, guardarlo, detectar transición, notificar), ahora como el *processor* de un job de BullMQ. Si el monitor ya no existe o está pausado (carrera normal API↔cola), simplemente no hace nada — no es un error.
+- `index.ts` (reescrito) — crea un `Worker` de BullMQ con concurrencia configurable (`WORKER_CONCURRENCY`, por defecto 5) en vez del `setTimeout` recursivo de la Fase 1.3.
+- `poller.ts` — **borrado**, sustituido por completo.
+
+**Variables de entorno**: `WORKER_CONCURRENCY` sustituye a `WORKER_POLL_INTERVAL_MS` (ya no tiene sentido: BullMQ decide cuándo toca cada check, el worker ya no "pregunta" en un bucle).
+
+### Comandos ejecutados
+
+```bash
+npm view bullmq version   # comprobar versión real antes de diseñar sobre supuestos
+npm install               # bullmq, ioredis, @bull-board/api, @bull-board/fastify
+npx tsc --noEmit -p packages/queue
+npx tsc --noEmit -p apps/api
+npx tsc --noEmit -p apps/worker
+npm run lint
+
+docker compose up -d      # postgres, redis, mailpit
+npm run dev:api           # dispara la reconciliación de schedulers al arrancar
+npm run dev:worker &      # instancia A
+npm run dev:worker &      # instancia B, a la vez
+```
+
+### Verificación completa (la más rigurosa de todo el proyecto hasta ahora)
+
+**1. Reconciliación al arrancar:** con 2 monitores ya existentes en la BD (creados por el usuario probando la web en una fase anterior), el log de arranque de la API mostró `"schedulers de monitores reconciliados","count":2` — confirmado también consultando Bull Board (`jobSchedulerCount: 2`).
+
+**2. Reparto entre dos workers, sin duplicados:** se insertaron 5 monitores de prueba con intervalo de 15s, se arrancaron dos instancias del worker a la vez (con el PID de cada una impreso en los logs para poder distinguirlas), y tras un breve pico inicial de checks atrasados (los monitores llevaban ~30s programados antes de que arrancara ningún worker — comportamiento correcto de BullMQ, no un bug: recupera lo pendiente en cuanto hay un worker disponible), la cadencia se asentó exactamente en 15s:
+```
+Q1: 22:26:25.382 → 22:26:27.608 → 22:26:42.651 → 22:26:57.623 → 22:27:12.611
+                    (recuperando atrasados)      (~15s)         (~15s)          (~15s)
+```
+Verificación definitiva en SQL — **cero duplicados**, comprobado con la condición más estricta posible (que el número de filas sea igual al número de timestamps distintos):
+```sql
+SELECT m.name, COUNT(DISTINCT c.timestamp) AS distintos, COUNT(*) AS totales
+FROM checks c JOIN monitors m ON m.id = c.monitor_id
+WHERE m.organization_id = '<id>' GROUP BY m.name;
+-- -> Q1..Q5: distintos = totales en las 5 filas, sin excepción
+```
+
+**3. Pausar/reanudar/borrar reprograman de verdad**, no solo actualizan la BD:
+```bash
+POST /monitors/<id>/pause   # jobSchedulerCount: 7 -> 6
+POST /monitors/<id>/resume  # jobSchedulerCount: 6 -> 7
+DELETE /monitors/<id>       # jobSchedulerCount: 7 -> 6
+```
+Los tres confirmados leyendo `jobSchedulerCount` de la API de Bull Board antes y después de cada llamada.
+
+### Incidente durante la propia verificación (y la lección que deja)
+Para poder insertar monitores de prueba con intervalo de 15s (el mínimo del plan free vía la API es 300s), se insertaron directamente por SQL, como en fases anteriores. Al terminar, se limpiaron borrando la organización de prueba también por SQL — **pero eso dejó los *job schedulers* de esos 4 monitores huérfanos en Redis**, porque nunca pasaron por el `DELETE /monitors/:id` de la API, que es el único sitio donde se llama a `unscheduleMonitorCheck()`. Se detectó comprobando que `jobSchedulerCount` seguía en 6 tras borrar por SQL (debería haber bajado a 2), y se limpiaron a mano con un script puntual usando `unscheduleMonitorCheck()` directamente.
+
+**Lección importante para todo lo que viene a partir de ahora:** antes de la Fase 2.1, tocar monitores por SQL directamente no tenía coste — el worker releía la BD en cada ciclo, así que un monitor borrado por SQL sin más simplemente dejaba de aparecer. **Desde la Fase 2.1, la cola en Redis es un segundo sistema con estado que hay que mantener sincronizado.** A partir de ahora, cualquier prueba manual de monitores debería hacerse a través de la API (que sí mantiene la cola sincronizada), no con `INSERT`/`DELETE` directos — o, si hace falta por algún motivo (como el intervalo corto de esta prueba), recordar limpiar también el scheduler correspondiente.
+
+### Cómo comprobarlo tú mismo
+
+```bash
+# 1. Arranca todo
+docker compose up -d
+npm run dev:api
+
+# 2. Mira el panel de administración de la cola
+# http://localhost:3000/admin/queues  (verás tus monitores reales programados)
+
+# 3. Arranca DOS terminales con el worker a la vez
+npm run dev:worker   # terminal A
+npm run dev:worker   # terminal B
+
+# 4. Observa los logs de ambas: cada "check registrado" lleva un "pid" distinto
+#    según qué instancia lo procesó. Ningún monitor debería aparecer registrado
+#    dos veces para el mismo ciclo en ambas terminales a la vez.
+
+# 5. Pausa un monitor desde la web y comprueba en /admin/queues que su
+#    "Job Schedulers" desaparece de la lista; reanúdalo y comprueba que vuelve.
+```
+
+### Pendiente / notas para más adelante
+- Bull Board queda accesible en `/admin/queues` sin autenticación — aceptable solo porque está bloqueado a `NODE_ENV !== "production"`. Si este proyecto llegara a desplegarse alguna vez con acceso público en modo desarrollo (no debería), habría que protegerlo con autenticación básica como mínimo.
+- La concurrencia (`WORKER_CONCURRENCY=5`) es por instancia, no global — no hay (todavía) un límite agregado de "cuántos checks como máximo a la vez en todo el sistema", relevante si algún día hay muchísimos monitores y muchas instancias de worker.
+- El script de limpieza de schedulers huérfanos (`cleanup-orphan-schedulers.mts`) fue puntual y se borró tras usarlo — no forma parte del repo. Si esto se repite a menudo, valdría la pena un comando de mantenimiento de verdad ("reconciliar y purgar huérfanos"), pero no se ha construido porque no hace falta para el desarrollo normal (solo para las pruebas manuales agresivas de esta sesión).
+
+### Próximo paso (Fase 2.2)
+Motor de incidentes real: agrupar N checks fallidos consecutivos (no solo 1, como ahora) en un "incidente" con inicio/fin, respetando ventanas de mantenimiento, y calculando métricas de uptime — sustituyendo la detección de transición simple de la Fase 1.5 por algo más robusto.
