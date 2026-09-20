@@ -26,11 +26,11 @@ Antes de tocar lógica de negocio, monta el esqueleto para que cada pieza poster
 - [x] Configurar TypeScript compartido (`tsconfig.base.json`) y ESLint/Prettier a nivel de repo.
 - **Hecho cuando:** `npm install` en la raíz resuelve las tres apps sin errores y cada una tiene un `dev` script que arranca (aunque sea un "Hello world"). **Verificado.**
 
-### 0.2 Docker Compose para desarrollo
-- [ ] `docker-compose.yml` con: PostgreSQL (+ TimescaleDB), Redis.
-- [ ] Variables de entorno vía `.env` (con `.env.example` versionado, nunca el `.env` real).
-- [ ] Volúmenes persistentes para no perder datos al reiniciar contenedores.
-- **Hecho cuando:** `docker compose up -d` deja Postgres y Redis accesibles desde el host.
+### 0.2 Docker Compose para desarrollo ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] `docker-compose.yml` con: PostgreSQL (+ TimescaleDB), Redis.
+- [x] Variables de entorno vía `.env` (con `.env.example` versionado, nunca el `.env` real).
+- [x] Volúmenes persistentes para no perder datos al reiniciar contenedores.
+- **Hecho cuando:** `docker compose up -d` deja Postgres y Redis accesibles desde el host. **Verificado:** ambos contenedores en estado `healthy`, extensión `timescaledb` (v2.30.1) instalable, Redis responde `PONG`, volúmenes `uptimepulse_postgres_data` y `uptimepulse_redis_data` creados.
 
 ### 0.3 (diseño) Modelo de datos inicial
 - [ ] Diseñar el ERD antes de escribir migraciones. Entidades mínimas:
