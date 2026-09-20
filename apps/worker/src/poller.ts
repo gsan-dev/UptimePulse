@@ -2,17 +2,23 @@ import { desc, eq } from "drizzle-orm";
 import { checks, db, monitors } from "@uptimepulse/db";
 import { createLogger } from "@uptimepulse/shared";
 import { runCheckWithRetries } from "./lib/run-check.js";
+import { notifyTransition } from "./lib/notifications.js";
 
 const logger = createLogger("worker");
 
-async function getLastCheckTimestamp(monitorId: string): Promise<Date | null> {
+interface LastCheck {
+  timestamp: Date;
+  status: "up" | "down";
+}
+
+async function getLastCheck(monitorId: string): Promise<LastCheck | null> {
   const [last] = await db
-    .select({ timestamp: checks.timestamp })
+    .select({ timestamp: checks.timestamp, status: checks.status })
     .from(checks)
     .where(eq(checks.monitorId, monitorId))
     .orderBy(desc(checks.timestamp))
     .limit(1);
-  return last?.timestamp ?? null;
+  return last ?? null;
 }
 
 function isDue(lastCheckAt: Date | null, intervalSeconds: number): boolean {
@@ -35,8 +41,8 @@ export async function pollDueMonitors(): Promise<void> {
   const activeMonitors = await db.query.monitors.findMany({ where: eq(monitors.isPaused, false) });
 
   for (const monitor of activeMonitors) {
-    const lastCheckAt = await getLastCheckTimestamp(monitor.id);
-    if (!isDue(lastCheckAt, monitor.intervalSeconds)) continue;
+    const lastCheck = await getLastCheck(monitor.id);
+    if (!isDue(lastCheck?.timestamp ?? null, monitor.intervalSeconds)) continue;
 
     const outcome = await runCheckWithRetries({
       id: monitor.id,
@@ -64,5 +70,21 @@ export async function pollDueMonitors(): Promise<void> {
       responseTimeMs: outcome.responseTimeMs,
       errorMessage: outcome.errorMessage,
     });
+
+    // Transición real (up->down o down->up), no el primer check de la vida
+    // del monitor (no hay "anterior" con el que compararlo todavía).
+    if (lastCheck && lastCheck.status !== outcome.status) {
+      try {
+        await notifyTransition(
+          { id: monitor.id, name: monitor.name, target: monitor.target, organizationId: monitor.organizationId },
+          outcome
+        );
+      } catch (error) {
+        logger.error("no se pudo enviar la notificación de cambio de estado", {
+          monitorId: monitor.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 }

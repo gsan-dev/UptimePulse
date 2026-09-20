@@ -19,4 +19,10 @@ export const env = {
   databaseUrl: required("DATABASE_URL"),
   pollIntervalMs: Number(process.env.WORKER_POLL_INTERVAL_MS ?? 10000),
   allowPrivateMonitorTargets: process.env.ALLOW_PRIVATE_MONITOR_TARGETS === "true",
+  smtpHost: process.env.SMTP_HOST ?? "localhost",
+  smtpPort: Number(process.env.SMTP_PORT ?? 1025),
+  smtpSecure: process.env.SMTP_SECURE === "true",
+  smtpUser: process.env.SMTP_USER || undefined,
+  smtpPass: process.env.SMTP_PASS || undefined,
+  mailFrom: process.env.MAIL_FROM ?? "UptimePulse <alerts@uptimepulse.local>",
 };

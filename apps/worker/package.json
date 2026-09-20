@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@uptimepulse/db": "*",
+    "@uptimepulse/mailer": "*",
     "@uptimepulse/server-utils": "*",
     "@uptimepulse/shared": "*",
     "dotenv": "^16.4.0",

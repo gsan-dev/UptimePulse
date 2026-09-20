@@ -98,11 +98,17 @@ Objetivo: un usuario se registra, crea un monitor HTTP, un worker lo comprueba c
 - [x] Vista de detalle con tabla de los últimos checks (fecha, estado, tiempo de respuesta, mensaje de error).
 - **Hecho cuando:** desde el navegador puedes loguearte, crear un monitor, y ver que su estado cambia tras un rato. **Verificado sin poder usar un navegador real** (no había herramienta de automatización disponible en la sesión): `tsc`, `vite build` de producción, y sobre todo probando con `curl` el contrato exacto que consume el frontend (registro → login → `GET /monitors` con el nuevo campo `lastCheck` → crear monitor → el worker genera un check real → `GET /monitors/:id/checks` con el `id` bigint ya convertido a string) y las cabeceras CORS con credenciales. La API y el frontend quedaron corriendo al terminar la fase para que el usuario hiciera la comprobación visual final él mismo.
 
-### 1.5 Alertas por email (mínimo viable)
-- [ ] Integración con Resend/Nodemailer.
-- [ ] Al detectar transición up→down o down→up, enviar email al dueño del monitor.
-- [ ] Plantilla de email simple (texto plano o HTML mínimo).
-- **Hecho cuando:** al parar el servicio de prueba, llega un email; al reanudarlo, llega el email de recuperación.
+### 1.5 Alertas por email (mínimo viable) ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] Integración con **Nodemailer** (no Resend, ver ADR) + **Mailpit** como servidor SMTP de pruebas en desarrollo (nuevo servicio en `docker-compose.yml`).
+- [x] Al detectar transición up→down o down→up, envía email a todos los miembros de la organización del monitor. Sin duplicados: si el estado se mantiene igual entre checks consecutivos, no reenvía.
+- [x] Plantilla de email simple, texto plano + HTML mínimo (`packages/mailer/src/templates.ts`), con escapado de HTML para evitar inyección desde el nombre/target del monitor (ambos son input de usuario).
+- **Hecho cuando:** al parar el servicio de prueba, llega un email; al reanudarlo, llega el email de recuperación. **Verificado de extremo a extremo:** monitor de prueba con target forzado a fallar (404) → email de caída recibido en Mailpit (confirmado vía su API JSON, asunto y cuerpo correctos) → target restaurado → email de recuperación recibido → exactamente 2 correos en total pese a que hubo un check "down" repetido de por medio (sin spam de notificaciones para el mismo estado).
+
+---
+
+## 🎉 Fase 1 completa (MVP)
+
+Con 1.1 a 1.5 cerrados, UptimePulse ya es un producto usable de principio a fin: registro/login, CRUD de monitores con protección anti-SSRF, un worker que los comprueba de verdad (HTTP y TCP, con reintentos), un dashboard real en el navegador, y alertas por email cuando algo cambia de estado. Todo verificado con pruebas reales (HTTP, DB, email), no solo "debería funcionar". **Siguiente:** Fase 2 (cola de trabajo real con BullMQ, motor de incidentes, tiempo real por WebSocket) — la parte que sustituye los enfoques deliberadamente simples del MVP (el bucle de sondeo N+1 del worker, el polling de 10s del frontend) por la arquitectura de sistemas distribuidos que le da valor de portfolio al proyecto.
 
 ---
 
@@ -263,6 +269,19 @@ el volumen de registros/logins de este proyecto. OWASP recomienda Argon2id
 como primera opción; si en algún momento se despliega a un entorno donde la
 compilación nativa no sea un problema, migrar a `argon2` es un cambio
 aislado a `apps/api/src/lib/password.ts`, sin tocar el resto del código.
+
+### 2026-09-20 — Alertas por email: Nodemailer + Mailpit, no Resend
+Decisión: `Nodemailer` (librería) apuntando a `Mailpit` (servidor SMTP de
+pruebas en Docker) en desarrollo.
+Motivo: Resend requiere una cuenta y una API key reales — no tiene sentido
+pedirle al usuario que cree una cuenta en un servicio externo solo para
+poder probar un email de alerta en local. Mailpit captura los correos sin
+salir a internet y expone una API JSON (`localhost:8025/api/v1/messages`)
+que permite **comprobar de verdad** que un email llegó, con qué asunto y a
+quién — en vez de solo confiar en que el código "debería" enviarlo. Migrar a
+un proveedor real en producción (Resend, SES, un SMTP de pago) es cambiar
+las variables `SMTP_*` del `.env`, no tocar código: `packages/mailer` recibe
+su configuración como parámetro, no la lee de `process.env` ella misma.
 
 ### 2026-09-20 — CRUD de monitores: una organización "primaria" por usuario, no selector de organización
 Decisión: `getPrimaryOrganizationId(userId)` usa la primera (única, por ahora)

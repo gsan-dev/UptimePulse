@@ -1094,3 +1094,103 @@ Abre `http://localhost:5173`:
 
 ### Próximo paso (Fase 1.5)
 Alertas por email: al detectar una transición up→down o down→up, enviar un correo al dueño del monitor (Resend/Nodemailer).
+
+---
+
+## 2026-09-20 (continuación 9) — Fase 1.5: Alertas por email
+
+### Objetivo
+Que el worker avise por email cuando un monitor cambia de estado (se cae o se recupera) — cerrando la Fase 1 (MVP) al completo.
+
+### Decisión de diseño: Nodemailer + Mailpit, no Resend
+El README y el TASK.md dejaban abierta la elección entre Resend y Nodemailer. Resend exige una cuenta real y una API key — no tenía sentido pedirte que te dieras de alta en un servicio externo solo para que esta fase funcionase. En su lugar:
+- **Nodemailer** como librería (habla SMTP estándar, sirve tanto para un servidor de pruebas local como para cualquier proveedor real después).
+- **Mailpit** (`axllent/mailpit`, nuevo servicio en `docker-compose.yml`) como servidor SMTP de mentira: captura los correos sin salir a internet, y expone una API JSON en `http://localhost:8025/api/v1/messages` — que es exactamente lo que ha permitido **comprobar de verdad** que los emails llegaron, en vez de solo confiar en que el código no lanzó ninguna excepción.
+
+Migrar a un proveedor real en producción es cambiar las variables `SMTP_*` del `.env`; `packages/mailer` recibe la configuración como parámetro (`createMailer(config)`), no la lee de `process.env` ella misma — mismo patrón que `assertPublicHost` en `packages/server-utils` (Fase 1.3).
+
+### Qué se hizo
+
+1. **`docker-compose.yml`**: nuevo servicio `mailpit`, puertos `1025` (SMTP) y `8025` (UI web + API).
+2. **`packages/mailer/`** (nuevo paquete):
+   - `src/index.ts` — `createMailer(config)` → `{ sendMail }`, envoltorio fino sobre Nodemailer.
+   - `src/templates.ts` — `monitorDownEmail()` / `monitorRecoveredEmail()`, cada una devuelve `{ subject, text, html }`. El HTML escapa `name`/`target` del monitor (son input de usuario desde la Fase 1.2 — sin escapar, un nombre de monitor con `<script>` se colaría en el email).
+3. **`apps/worker/src/lib/notifications.ts`** (nuevo): `notifyTransition(monitor, outcome)` — busca los emails de todos los miembros de la organización del monitor (no solo "el dueño": con la Fase 4 de equipos, varios usuarios podrían compartir una organización) y envía la plantilla que corresponda según `outcome.status`.
+4. **`apps/worker/src/poller.ts`**: `getLastCheckTimestamp()` pasó a `getLastCheck()` (ahora también trae el `status`, no solo el `timestamp`). Tras guardar cada check nuevo, si había un check anterior **y** su estado difiere del nuevo, llama a `notifyTransition()` — envuelto en `try/catch` para que un fallo de envío de email (SMTP caído, lo que sea) nunca tumbe el bucle de checks.
+5. **`apps/worker/src/env.ts`**: variables `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`/`SMTP_PASS` (opcionales, Mailpit no pide autenticación), `MAIL_FROM`.
+
+### Decisión de diseño: solo se notifica en transición real, nunca en el primer check
+Si un monitor nunca se ha comprobado, su primer resultado (sea `up` o `down`) **no** genera email — no hay un estado "anterior" con el que comparar, así que técnicamente no hay "transición". Esto es deliberado y simple: evita inventarse una regla especial para "recién creado", y se ve confirmado en la Fase 2.2 (motor de incidentes real, con lógica de N-checks-consecutivos) que sustituirá esto por algo más completo de todas formas.
+
+### Comandos ejecutados
+
+```bash
+npm install                          # nodemailer, @types/nodemailer
+npx tsc --noEmit -p packages/mailer
+npx tsc --noEmit -p apps/worker
+npm run lint
+
+docker compose up -d mailpit
+npm run dev:worker
+```
+
+### Verificación completa (end-to-end real, no solo "no lanzó excepción")
+
+Se registró un usuario de prueba y se insertó un monitor con intervalo de 15s (igual que en la Fase 1.3, para no esperar minutos), apuntando a `https://example.com`:
+
+```bash
+# 1. Primer check (up) -> SIN email, correcto (no hay "anterior" con el que comparar)
+curl http://localhost:8025/api/v1/messages   # -> total: 0
+
+# 2. Se fuerza la caída (UPDATE del target a una ruta 404)
+# El worker detecta la transición up->down tras sus 3 reintentos:
+# {"...","message":"notificación de cambio de estado enviada","status":"down","recipients":1}
+
+curl http://localhost:8025/api/v1/messages
+# -> total: 1, asunto "🔴 Alert test monitor está caído"
+
+# Contenido completo verificado (vía GET /api/v1/message/<id>):
+# "Tu monitor "Alert test monitor" (https://.../pagina-que-no-existe...) ha dejado
+#  de responder.\n\nMotivo: Se esperaba un status < 400, se obtuvo 404\n\n— UptimePulse"
+
+# 3. Se restaura el target válido
+# El worker detecta la transición down->up:
+# {"...","message":"notificación de cambio de estado enviada","status":"up","recipients":1}
+
+curl http://localhost:8025/api/v1/messages
+# -> total: 2 (uno de caída, uno de recuperación — SIN duplicados)
+```
+
+**Detalle interesante que confirma que la deduplicación funciona bien:** por el timing de mi cambio manual por SQL, hubo un segundo check "down" de más (el worker leyó el target antiguo una vez más antes de que mi `UPDATE` surtiera efecto) — y **no generó un segundo email de caída**, porque el estado anterior ya era "down" y no hubo transición real. Solo se disparan notificaciones cuando el estado cambia de verdad, tal como se diseñó.
+
+### Cómo reproducir / comprobar tú mismo
+
+```bash
+# 0. Preparación
+docker compose up -d          # incluye mailpit ahora
+npm run db:migrate
+npm run dev:api
+npm run dev:worker
+npm run dev:web
+
+# 1. Desde el navegador (http://localhost:5173): regístrate y crea un monitor
+#    contra una URL que puedas "romper" fácilmente (ej. tu propia web de prueba,
+#    o cambia el target más tarde a una ruta que dé 404).
+
+# 2. Abre http://localhost:8025 en el navegador — es la bandeja de entrada de
+#    Mailpit. Cuando el worker detecte que el monitor se cae, el correo
+#    aparecerá ahí en tiempo real (Mailpit tiene su propia UI en vivo).
+
+# 3. Arregla el monitor (edítalo desde la propia web, o pon el target bueno
+#    otra vez) y espera al siguiente check: debería llegar el email de
+#    recuperación.
+```
+
+### Pendiente / notas para más adelante
+- Solo hay canal de email — SMS (Twilio), webhooks y Slack/Discord (README §2.4) quedan para la Fase 3.2.
+- No hay "resumen semanal" (README §2.4) — es una función aparte, no ligada a transiciones, pendiente de una fase futura.
+- No hay preferencias por canal/monitor (la "matriz de alertas" del README §3.5, tabla `monitor_notification_channels` ya creada en la Fase 0.3 pero sin usar todavía) — ahora mismo TODOS los miembros de la organización reciben TODAS las alertas de TODOS sus monitores, sin poder desactivarlo. Es la simplificación correcta para un MVP de una sola persona por organización; dejará de serlo en cuanto haya equipos de verdad (Fase 4).
+
+## 🎉 Fase 1 completa (MVP)
+
+Con esto, UptimePulse hace de principio a fin lo que promete el README: te registras, añades un monitor, un proceso independiente lo comprueba de verdad, y te avisa por email cuando cambia de estado — todo verificado con pruebas reales en cada paso, no solo "debería funcionar". La Fase 2 sustituye las partes deliberadamente simples del MVP (bucle de sondeo N+1, polling de 10s en el frontend) por la arquitectura de sistemas distribuidos real: cola de trabajo con BullMQ, motor de incidentes, y tiempo real por WebSocket.
