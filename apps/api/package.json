@@ -7,9 +7,20 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "@uptimepulse/shared": "*"
+    "@fastify/cookie": "^11.0.0",
+    "@fastify/cors": "^10.0.0",
+    "@uptimepulse/db": "*",
+    "@uptimepulse/shared": "*",
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.0",
+    "drizzle-orm": "^0.45.0",
+    "fastify": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "zod": "^3.23.0"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.7",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }

@@ -538,3 +538,179 @@ npx tsc --noEmit -p packages/shared && npx tsc --noEmit -p packages/db && npx ts
 
 ### Próximo paso (Fase 1.1)
 Autenticación: registro/login con email+contraseña, hash con bcrypt/argon2, y la decisión de diseño pendiente de JWT vs. sesiones (documentar en la sección de ADR del TASK.md).
+
+---
+
+## 2026-09-20 (continuación 5) — Fase 1.1: Autenticación
+
+### Objetivo
+Que `apps/api` deje de ser un placeholder y tenga un servidor HTTP real con registro, login, JWT (access + refresh) y un endpoint protegido (`GET /me`) — la primera funcionalidad de negocio real del proyecto.
+
+### Decisiones de diseño (razonadas en detalle en la sección de ADR de TASK.md)
+- **Framework: Fastify**, no Express.
+- **JWT access (15 min) + refresh (7 días) en cookie httpOnly**, no sesiones de servidor. El access token va en el body de la respuesta (el frontend lo guardará en memoria en la Fase 1.4, nunca en `localStorage`); el refresh token no lo toca JavaScript del navegador.
+- **`bcryptjs`** para el hash de contraseñas, no `bcrypt`/`argon2` nativos — para evitar otro punto de fricción con compilación nativa en esta máquina (ya tuvimos problemas de permisos con `pnpm`/`corepack` en la Fase 0.1).
+- Al registrarse, se crea automáticamente una **organización personal** (`Organización de <email>`) con el usuario como `admin` — sin esto, un usuario recién registrado no tendría dónde colgar sus monitores en la Fase 1.2.
+
+### Qué se hizo
+
+**Estructura nueva en `apps/api/src/`:**
+- `env.ts` — carga `.env` de la raíz (con `dotenv`) y valida que existan las variables necesarias, lanzando un error explícito si falta alguna. **Debe ser siempre el primer import** de cualquier punto de entrada que toque `@uptimepulse/db`, porque el cliente de esa librería lee `process.env.DATABASE_URL` en cuanto se importa.
+- `lib/password.ts` — `hashPassword` / `verifyPassword`, envoltorio fino sobre `bcryptjs`.
+- `lib/tokens.ts` — `signAccessToken` / `verifyAccessToken` / `signRefreshToken` / `verifyRefreshToken`, sobre `jsonwebtoken`. Dos secretos distintos (`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`) para que filtrar uno no comprometa el otro.
+- `plugins/auth.ts` — `requireAuth`, un `preHandler` de Fastify que exige `Authorization: Bearer <token>`, lo verifica, y cuelga `request.user = { id, email }` para que la ruta lo use.
+- `routes/auth.ts` — `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /me`. Validación de entrada con `zod` (`registerSchema`, `loginSchema`).
+- `server.ts` — construye la instancia de Fastify, registra `@fastify/cookie` y `@fastify/cors`, y un error handler que usa el logger de la Fase 0.4 en vez del logger por defecto de Fastify.
+- `index.ts` — punto de entrada; arranca el servidor en el puerto de `.env` (`PORT`, por defecto 3000).
+
+**Variables de entorno nuevas** (`.env.example` y `.env`): `PORT`, `NODE_ENV`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`. Los secretos del `.env` real se generaron con:
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+(uno para access, otro para refresh — nunca el mismo valor para los dos).
+
+**Cómo se protege `PublicUser`:** la función `toPublicUser()` en `routes/auth.ts` desestructura y descarta explícitamente `passwordHash` y `oauthId` antes de devolver el usuario en cualquier respuesta HTTP — usando el tipo `PublicUser` de `packages/shared` (Fase 0.4) para que TypeScript avise si algún día se intenta devolver un campo sensible sin querer.
+
+**Ajuste a ESLint:** se añadió una regla (`argsIgnorePattern`/`varsIgnorePattern: "^_"`) para permitir variables descartadas a propósito con prefijo `_` (necesario para `const { passwordHash: _passwordHash, ... }`), en vez de tener que inventarse un uso artificial solo para pasar el linter.
+
+### Comandos ejecutados (y qué hace cada uno)
+
+```bash
+# Generar los secretos JWT (una vez, para el .env real — nunca para .env.example)
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+# Instalar fastify, @fastify/cookie, @fastify/cors, bcryptjs, jsonwebtoken, zod, dotenv...
+npm install
+
+# Comprobar tipos y estilo
+npx tsc --noEmit -p apps/api
+npm run lint
+
+# Arrancar la API de verdad
+npm run dev:api
+```
+
+### Verificación completa realizada (peticiones HTTP reales, no solo "debería funcionar")
+
+```bash
+curl http://localhost:3000/health
+# -> {"status":"ok"}
+
+curl -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/me
+# -> HTTP 401 (sin token, correctamente rechazado)
+
+curl -c cookies.txt -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@uptimepulse.dev","password":"password123"}'
+# -> 201, devuelve { user: {...sin passwordHash ni oauthId...}, accessToken }
+
+# Login, guardando la cookie de refresh
+curl -c cookies.txt -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@uptimepulse.dev","password":"password123"}'
+
+curl http://localhost:3000/me -H "Authorization: Bearer <accessToken>"
+# -> 200, devuelve el usuario
+
+# Casos de error
+curl -o /dev/null -w "%{http_code}\n" -X POST http://localhost:3000/auth/register -d '...(mismo email)...'
+# -> 409 (email duplicado)
+curl -o /dev/null -w "%{http_code}\n" -X POST http://localhost:3000/auth/login -d '...(password incorrecta)...'
+# -> 401
+
+# Refresh usando la cookie httpOnly (sin mandar el access token)
+curl -b cookies.txt -X POST http://localhost:3000/auth/refresh
+# -> 200, devuelve un accessToken nuevo
+
+# Logout
+curl -i -b cookies.txt -X POST http://localhost:3000/auth/logout
+# -> 204, y la respuesta incluye Set-Cookie que borra la cookie de refresh
+```
+
+**Verificación directa en la base de datos** (que el registro creó la organización y la membresía, no solo el usuario):
+```sql
+SELECT u.email, o.name AS organizacion, om.role
+FROM users u
+JOIN organization_members om ON om.user_id = u.id
+JOIN organizations o ON o.id = om.organization_id
+WHERE u.email = 'test@uptimepulse.dev';
+-- -> test@uptimepulse.dev | Organización de test@uptimepulse.dev | admin
+```
+
+Los datos de prueba se borraron después de verificar (`DELETE FROM organizations ...` + `DELETE FROM users ...`), para no dejar registros de prueba en la base de datos de desarrollo.
+
+### Cómo reproducir / comprobar tú mismo
+
+```bash
+# 1. Asegúrate de que Postgres está corriendo (Fase 0.2) y las migraciones aplicadas (Fase 0.3)
+docker compose up -d
+npm run db:migrate
+
+# 2. Arranca la API
+npm run dev:api
+# -> deberías ver: {"timestamp":"...","level":"info","service":"api","message":"servidor escuchando","address":"http://127.0.0.1:3000"}
+
+# 3. Regístrate (cambia el email si ya lo usaste antes)
+curl -c cookies.txt -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"tu-email@ejemplo.com","password":"unaContraseñaLarga123"}'
+# copia el "accessToken" de la respuesta
+
+# 4. Prueba el endpoint protegido
+curl http://localhost:3000/me -H "Authorization: Bearer <PEGA_AQUI_EL_TOKEN>"
+
+# 5. Prueba que SIN token te rechaza
+curl -o /dev/null -w "%{http_code}\n" http://localhost:3000/me
+# -> debe dar 401
+```
+
+### Pendiente / notas para más adelante
+- No hay revocación de refresh tokens (no hay tabla `refresh_tokens` con estado "activo/revocado") — un refresh token filtrado sigue siendo válido hasta que caduque a los 7 días. Es una limitación aceptada para el MVP, anotada para revisar en la Fase 5 (seguridad) si se necesita "cerrar sesión en todos los dispositivos" o revocación activa.
+- No hay rate limiting en `/auth/login` todavía — un atacante podría intentar fuerza bruta sin límite. Pertenece a la Fase 5.1 (seguridad), donde ya está anotado.
+- OAuth (GitHub/Google, mencionado en el README §2.7) no se ha tocado — los campos `oauth_provider`/`oauth_id` existen en el esquema desde la Fase 0.3 pero no hay flujo implementado.
+- `@fastify/cors` está configurado con `origin: true` (permite cualquier origen) — válido para desarrollo local, pero **hay que restringirlo** a los dominios reales antes de desplegar a producción (anotado también en la Fase 5.1 del TASK.md).
+
+### Cómo comprobar tú mismo que esto funciona (en cualquier momento)
+
+```bash
+# 0. Preparación
+docker compose up -d
+npm run dev:api
+# -> espera a ver: {"...","message":"servidor escuchando","address":"http://127.0.0.1:3000"}
+
+# 1. Vivo, y bloquea sin token
+curl http://localhost:3000/health                                   # -> {"status":"ok"}
+curl -o /dev/null -w "%{http_code}\n" http://localhost:3000/me       # -> 401
+
+# 2. Registro (guarda la cookie de refresh en cookies.txt)
+curl -c cookies.txt -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"prueba@ejemplo.com","password":"password123"}'
+# -> 201, copia el "accessToken" de la respuesta
+
+# 3. Endpoint protegido con el token copiado
+curl http://localhost:3000/me -H "Authorization: Bearer <TOKEN>"    # -> 200, tu usuario
+
+# 4. Casos que deben fallar
+curl -o /dev/null -w "%{http_code}\n" -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" -d '{"email":"prueba@ejemplo.com","password":"password123"}'  # -> 409 (duplicado)
+curl -o /dev/null -w "%{http_code}\n" -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" -d '{"email":"prueba@ejemplo.com","password":"mala"}'          # -> 401
+
+# 5. Refresh y logout con la cookie guardada
+curl -b cookies.txt -X POST http://localhost:3000/auth/refresh      # -> 200, accessToken nuevo
+curl -i -b cookies.txt -X POST http://localhost:3000/auth/logout    # -> 204 + Set-Cookie que borra la cookie
+
+# 6. (la prueba más reveladora) confirmar en la BD que se creó la organización personal
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse -c "
+SELECT u.email, o.name AS organizacion, om.role
+FROM users u
+JOIN organization_members om ON om.user_id = u.id
+JOIN organizations o ON o.id = om.organization_id
+WHERE u.email = 'prueba@ejemplo.com';"
+```
+
+**Nota si usas PowerShell en vez de Git Bash:** ahí `curl` es un alias de `Invoke-WebRequest` y no acepta `-d`/`-c` de la misma forma. Usa `curl.exe` explícitamente (con la extensión, para forzar el curl real de Windows) y el resto de comandos funciona igual.
+
+### Próximo paso (Fase 1.2)
+CRUD de monitores: `POST/GET/PATCH/DELETE /monitors`, con la validación anti-SSRF que quedó marcada como crítica en el análisis inicial del README.

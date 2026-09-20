@@ -6,5 +6,12 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   {
     ignores: ["**/dist/**", "**/node_modules/**", "**/coverage/**"],
+  },
+  {
+    rules: {
+      // Permite descartar variables a propósito (ej. desestructurar y omitir
+      // un campo) prefijándolas con "_", en vez de tener que usarlas igualmente.
+      "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
+    },
   }
 );

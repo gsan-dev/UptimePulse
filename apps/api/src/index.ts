@@ -1,22 +1,18 @@
-import { createLogger, type Monitor } from "@uptimepulse/shared";
+// IMPORTANTE: este import va primero a propósito. Carga las variables de
+// entorno (.env de la raíz) antes de que cualquier otro módulo —en
+// particular "@uptimepulse/db"— intente leerlas.
+import { env } from "./env.js";
+import { createLogger } from "@uptimepulse/shared";
+import { buildServer } from "./server.js";
 
 const logger = createLogger("api");
 
-const exampleMonitor: Monitor = {
-  id: "00000000-0000-0000-0000-000000000000",
-  organizationId: "00000000-0000-0000-0000-000000000000",
-  name: "API arrancada",
-  type: "http",
-  target: "https://example.com",
-  method: null,
-  headers: null,
-  body: null,
-  expectedStatus: null,
-  intervalSeconds: 60,
-  timeoutMs: 5000,
-  isPaused: false,
-  tags: [],
-  createdAt: new Date(),
-};
+const app = await buildServer();
 
-logger.info("servidor placeholder arrancado", { monitor: exampleMonitor });
+app.listen({ port: env.port, host: "0.0.0.0" }, (err, address) => {
+  if (err) {
+    logger.error("no se pudo arrancar el servidor", { error: err.message });
+    process.exit(1);
+  }
+  logger.info("servidor escuchando", { address });
+});

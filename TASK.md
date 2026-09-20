@@ -68,12 +68,12 @@ Con 0.1, 0.2, 0.3 y 0.4 cerrados, el proyecto tiene: monorepo funcional, infraes
 
 Objetivo: un usuario se registra, crea un monitor HTTP, un worker lo comprueba cada minuto, y ve el resultado en un dashboard básico. Alertas por email si cae.
 
-### 1.1 Autenticación
-- [ ] Registro/login con email + contraseña (hash con `bcrypt`/`argon2`).
-- [ ] Emisión de JWT (access token corto + refresh token, o sesiones con cookie httpOnly — **decisión de diseño**, documentar por qué).
-- [ ] Middleware de autenticación en la API.
-- [ ] Endpoint `GET /me`.
-- **Hecho cuando:** puedes registrar un usuario, iniciar sesión, y llamar a un endpoint protegido con el token.
+### 1.1 Autenticación ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] Registro/login con email + contraseña (hash con **bcryptjs**, ver ADR — no `bcrypt`/`argon2` nativos).
+- [x] Emisión de JWT (access token corto de 15 min + refresh token de 7 días en cookie httpOnly). Ver ADR en TASK.md.
+- [x] Middleware de autenticación en la API (`requireAuth`, preHandler de Fastify).
+- [x] Endpoint `GET /me`.
+- **Hecho cuando:** puedes registrar un usuario, iniciar sesión, y llamar a un endpoint protegido con el token. **Verificado con peticiones HTTP reales:** registro, `/me` sin token (401), `/me` con token (200), registro duplicado (409), login con contraseña incorrecta (401), refresh vía cookie, logout limpia la cookie. También verificado que el registro crea automáticamente una organización personal con el usuario como `admin`.
 
 ### 1.2 CRUD de monitores (API)
 - [ ] `POST /monitors`, `GET /monitors`, `GET /monitors/:id`, `PATCH /monitors/:id`, `DELETE /monitors/:id`.
@@ -234,3 +234,37 @@ no necesita validar sesiones, solo el API gateway.
 ```
 
 (Añade aquí cada decisión conforme la tomes.)
+
+### 2026-09-20 — Framework HTTP de la API: Fastify
+Decisión: Fastify en vez de Express.
+Motivo: mejor rendimiento, validación de esquemas más integrada, tipado TS
+de primera clase. Encaja con el resto del stack (Drizzle, Zod) sin fricción.
+
+### 2026-09-20 — Autenticación: JWT vs. sesiones
+Decisión: JWT access token (15 min, en el body de la respuesta) + refresh
+token (7 días, en cookie httpOnly/SameSite=Strict).
+Motivo: permite escalar la API horizontalmente sin sticky sessions; el
+worker no necesita validar sesiones, solo el API gateway. El access token
+corto limita la ventana de riesgo si se filtra; el refresh token nunca lo
+toca JavaScript del navegador (mitiga robo por XSS). No se implementa
+todavía revocación de refresh tokens (tabla `refresh_tokens` con estado) —
+para el MVP basta con la caducidad de 7 días; revisar en Fase 5 (seguridad)
+si hace falta revocación activa (ej. "cerrar sesión en todos los dispositivos").
+
+### 2026-09-20 — Hash de contraseñas: bcryptjs en vez de bcrypt/argon2 nativos
+Decisión: `bcryptjs` (implementación 100% JavaScript), no `bcrypt` ni
+`argon2` (ambos requieren compilar bindings nativos).
+Motivo: esta máquina de desarrollo ya dio problemas de permisos con
+compilación nativa/postinstall scripts (ver incidente de `pnpm`/`corepack`
+y los avisos de `esbuild` en la Fase 0.1). `bcryptjs` elimina ese riesgo por
+completo a cambio de ser algo más lento — irrelevante en la práctica para
+el volumen de registros/logins de este proyecto. OWASP recomienda Argon2id
+como primera opción; si en algún momento se despliega a un entorno donde la
+compilación nativa no sea un problema, migrar a `argon2` es un cambio
+aislado a `apps/api/src/lib/password.ts`, sin tocar el resto del código.
+
+### 2026-09-20 — `packages/db`: paquete nuevo no contemplado en el README original
+Decisión: crear `packages/db` para el esquema Drizzle + cliente de Postgres,
+separado de `packages/shared`.
+Motivo: `apps/web` no debe arrastrar el driver `pg` en su bundle. Ver
+detalle completo en DIARIO.md, entrada de la Fase 0.3.
