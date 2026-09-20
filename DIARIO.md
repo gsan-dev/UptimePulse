@@ -242,3 +242,209 @@ docker compose logs -f     # ver logs en vivo de ambos servicios
 
 ### Próximo paso (Fase 0.3)
 Diseñar el modelo de datos (ERD) y elegir herramienta de migraciones (Prisma/Drizzle/node-pg-migrate) para empezar a aplicar el esquema sobre este Postgres.
+
+---
+
+## 2026-09-20 (continuación 3) — Fase 0.3: Modelo de datos inicial
+
+### Objetivo
+Diseñar el esquema completo de base de datos (13 tablas), elegir una herramienta de migraciones, y aplicarlo de verdad sobre el Postgres de la Fase 0.2 — no solo dejarlo dibujado en un documento.
+
+### Decisión de diseño: Drizzle ORM + drizzle-kit, no Prisma
+El TASK.md dejaba la elección abierta entre Prisma, Drizzle o node-pg-migrate. Motivo de la elección:
+
+- La tabla `checks` necesita ser una **hypertable de TimescaleDB** (`create_hypertable()`) y llevar una **política de retención** (`add_retention_policy()`) — ambas son llamadas a funciones SQL específicas de Timescale que Prisma no sabe representar en su lenguaje de esquema (`schema.prisma`), obligando a workarounds frágiles.
+- **Drizzle-kit soporta migraciones "custom"**: además de generar SQL automáticamente a partir del esquema TypeScript (como Prisma), permite intercalar archivos SQL escritos a mano en el mismo flujo de migraciones versionadas. Así, las partes "normales" (tablas, FKs, enums) se generan solas, y las partes Timescale-específicas se escriben a mano sin salirse del sistema de migraciones.
+- Sigue dando tipos TypeScript inferidos automáticamente del esquema (igual que Prisma), que es lo que de verdad importa para que `apps/api` y `apps/worker` trabajen con autocompletado y sin duplicar tipos a mano.
+
+### Decisión de diseño: nuevo paquete `packages/db`
+El README original solo contemplaba `packages/shared`. Se añade `packages/db` porque:
+- El esquema de base de datos y el cliente de Postgres (`pg`) solo los necesitan `apps/api` y `apps/worker` — **no** `apps/web`. Meterlo en `packages/shared` arrastraría el driver de Postgres al bundle del frontend.
+- `packages/shared` sigue existiendo para los tipos de dominio ligeros que sí usa el frontend (`Monitor`, `MonitorStatus`, etc., de la Fase 0.1). Son deliberadamente dos cosas distintas: `shared` = contratos ligeros multi-plataforma; `db` = esquema real + acceso a datos, solo backend.
+
+### El ERD (13 tablas)
+
+```mermaid
+erDiagram
+    PLANS ||--o{ ORGANIZATIONS : "limita a"
+    ORGANIZATIONS ||--o{ ORGANIZATION_MEMBERS : tiene
+    USERS ||--o{ ORGANIZATION_MEMBERS : pertenece
+    ORGANIZATIONS ||--o{ MONITORS : posee
+    MONITORS ||--o{ CHECKS : genera
+    MONITORS ||--o{ INCIDENTS : sufre
+    MONITORS ||--o{ MAINTENANCE_WINDOWS : tiene
+    ORGANIZATIONS ||--o{ NOTIFICATION_CHANNELS : configura
+    MONITORS ||--o{ MONITOR_NOTIFICATION_CHANNELS : usa
+    NOTIFICATION_CHANNELS ||--o{ MONITOR_NOTIFICATION_CHANNELS : "se usa en"
+    ORGANIZATIONS ||--o{ STATUS_PAGES : publica
+    STATUS_PAGES ||--o{ STATUS_PAGE_MONITORS : muestra
+    MONITORS ||--o{ STATUS_PAGE_MONITORS : "aparece en"
+    ORGANIZATIONS ||--o{ API_KEYS : emite
+```
+
+Tablas y su propósito (todas creadas y verificadas contra la BD real):
+
+| Tabla | Para qué sirve |
+|---|---|
+| `plans` | Límites de cada plan de suscripción (nº monitores, intervalo mínimo, canales permitidos). |
+| `organizations` | Cuenta/equipo dueño de los monitores; referencia a su plan. |
+| `users` | Usuarios, con soporte para password o login OAuth. |
+| `organization_members` | Tabla puente usuario↔organización con rol (admin/editor/readonly). |
+| `monitors` | Configuración de cada monitor (tipo, target, intervalo, timeout, etc.). |
+| `checks` | **Hypertable de TimescaleDB.** Un resultado de comprobación por fila; volumen alto, particionado por tiempo. |
+| `incidents` | Agrupación de checks fallidos consecutivos en un incidente con inicio/fin. |
+| `notification_channels` | Canales configurados por organización (email/SMS/webhook/Slack/Discord). |
+| `monitor_notification_channels` | Tabla puente monitor↔canal — la "matriz de alertas" del README §3.5. |
+| `maintenance_windows` | Ventanas de mantenimiento (mejora añadida sobre el README original, ver análisis inicial). |
+| `status_pages` / `status_page_monitors` | Páginas de estado públicas y qué monitores muestran. |
+| `api_keys` | Claves de API por organización, con scopes y hash (nunca la clave en claro). |
+
+### Decisiones concretas sobre columnas (para que quede razonado, no solo hecho)
+
+- **IDs**: `uuid` con `defaultRandom()` (usa `gen_random_uuid()`) para todas las tablas salvo `checks`. Evita exponer IDs secuenciales adivinables en la API pública (ej. status pages).
+- **`checks.id`**: aquí sí es `bigint` autoincremental, no `uuid`. Motivo: es la tabla de mayor volumen con diferencia (una fila por check, cada 30s-15min por monitor); un `bigint` ocupa 8 bytes frente a los 16 de un `uuid`, y no necesita ser impredecible porque nunca se expone en una URL pública.
+- **Clave primaria de `checks` = `(id, timestamp)`**, no solo `id`. Esto no es una preferencia sino un **requisito técnico de TimescaleDB**: la clave primaria de una hypertable debe incluir la columna de partición temporal.
+- **Borrado en cascada** (`ON DELETE CASCADE`) desde `monitors`, `organizations`, etc. hacia sus tablas hijas: al borrar una organización o un monitor, se limpia todo lo asociado (checks, incidentes, ventanas de mantenimiento...) sin dejar huérfanos. Verificado en la prueba de humo (ver más abajo).
+- **`headers`, `tags`, `config`, `scopes`, `allowed_channels`** son `jsonb` en vez de tablas normalizadas aparte — son datos de forma variable/opcional por fila donde no hace falta consultarlos con SQL relacional; `jsonb` es el compromiso estándar de Postgres para esto.
+
+### Política de retención de datos (decisión pendiente del análisis inicial, ahora resuelta)
+- Los checks en crudo se conservan **90 días** (`add_retention_policy('checks', INTERVAL '90 days')`), ya activa y verificada contra la BD real.
+- A partir de esos 90 días, TimescaleDB borra automáticamente los chunks antiguos.
+- **Importante para la Fase 2.2:** los *continuous aggregates* (rollups horarios/diarios para calcular uptime % histórico) deben crearse **antes** de que la política de retención empiece a borrar datos con los que aún no se ha calculado ningún rollup. En desarrollo esto no es un problema (no hay datos de producción de más de 90 días), pero es la razón por la que la Fase 2.2 del TASK.md debe implementarse sin demorarla demasiado una vez haya datos reales.
+
+### Comandos ejecutados (y qué hace cada uno)
+
+```bash
+# 1. Instalar las dependencias nuevas (drizzle-orm, drizzle-kit, pg, dotenv, tsx)
+npm install
+
+# 2. Generar una migración "en blanco" para escribir SQL a mano (extensiones de Postgres)
+cd packages/db
+npx drizzle-kit generate --custom --name=enable_extensions
+# -> crea migrations/0000_enable_extensions.sql vacío, que se rellenó a mano con:
+#    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+#    CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+# 3. Generar la migración del esquema completo, comparando schema.ts contra "nada" (primera vez)
+npx drizzle-kit generate
+# -> crea migrations/0001_grey_deadpool.sql con las 13 tablas, enums y foreign keys
+
+# 4. Otra migración en blanco para la conversión a hypertable + retención
+npx drizzle-kit generate --custom --name=checks_hypertable
+# -> se rellenó a mano con create_hypertable(), add_retention_policy() y un índice de apoyo
+
+# 5. Aplicar las tres migraciones, en orden, contra el Postgres del docker-compose
+npm run db:migrate
+```
+
+### Problema encontrado y resuelto: `drizzle-kit` no encontraba `drizzle-orm`
+
+Al ejecutar el paso 2 por primera vez, `drizzle-kit` fallaba con:
+```
+Please install latest version of drizzle-orm
+```
+...incluso teniendo la versión correcta instalada. La causa (investigada leyendo el propio código de `drizzle-kit` en `node_modules`): `drizzle-orm` tiene muchos peer-dependencies opcionales (uno por cada driver de BD que soporta: `pg`, `postgres`, `mysql2`, `better-sqlite3`...), y el algoritmo de hoisting de `npm` en el monorepo decidió **no elevarlo** a la raíz `node_modules/`, dejándolo solo dentro de `packages/db/node_modules/`. El binario de `drizzle-kit`, que sí vive en la raíz, intenta hacer `import("drizzle-orm/version")` resolviendo desde su propia ubicación (la raíz) y no lo encuentra.
+
+**Solución aplicada:** declarar `drizzle-orm` también como `devDependency` en el `package.json` raíz (además de en `packages/db`, que es donde realmente se usa en tiempo de ejecución). Esto es un workaround pragmático y conocido en la comunidad de Drizzle+npm-workspaces, no una solución "elegante", pero es la forma estándar de resolver este problema concreto sin migrar de gestor de paquetes.
+
+> Si en el futuro esto vuelve a romperse tras un `npm install` limpio, el síntoma es el mismo mensaje de error, y el diagnóstico es: `find . -maxdepth 4 -iname "drizzle-orm" -type d` para ver dónde quedó instalado, y confirmar que también existe en `node_modules/drizzle-orm` (raíz).
+
+### Verificación completa realizada
+
+```bash
+# Tablas creadas
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse -c "\dt"
+# -> 13 tablas listadas
+
+# checks es una hypertable de verdad
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse \
+  -c "SELECT hypertable_name FROM timescaledb_information.hypertables;"
+# -> checks
+
+# La política de retención está activa
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse \
+  -c "SELECT hypertable_name, config FROM timescaledb_information.jobs WHERE proc_name='policy_retention';"
+# -> checks | {"drop_after": "90 days", ...}
+```
+
+Además, se hizo una **prueba de extremo a extremo** con un script temporal (`smoke-test.mts`, borrado después de usarlo, no forma parte del repo) que:
+1. Insertó un plan, una organización, un monitor y un check reales usando el cliente Drizzle (`db.insert(...).returning()`), confirmando que los tipos TypeScript inferidos del esquema funcionan en la práctica (autocompletado, tipos de retorno correctos, `check.id` como `bigint` de JS).
+2. Borró la organización de prueba y comprobó que el borrado en cascada limpió también el monitor y el check asociados, sin necesidad de borrarlos a mano uno por uno.
+
+`npm run lint` y `npx tsc --noEmit -p packages/db` también se ejecutaron limpios sobre todo el código nuevo.
+
+### Cómo reproducir este paso tú mismo, desde cero
+
+1. Asegúrate de que Docker está corriendo y `docker compose up -d` (Fase 0.2) está aplicado.
+2. `npm install` en la raíz (instala drizzle-orm, drizzle-kit, pg, dotenv).
+3. Si necesitas volver a generar migraciones tras cambiar `packages/db/src/schema.ts`:
+   ```bash
+   npm run db:generate    # desde la raíz; genera un nuevo archivo en packages/db/migrations/
+   ```
+4. Para aplicar las migraciones pendientes contra la base de datos:
+   ```bash
+   npm run db:migrate     # desde la raíz
+   ```
+5. Si necesitas escribir una migración manual (SQL específico de Timescale, un índice raro, etc.):
+   ```bash
+   cd packages/db
+   npx drizzle-kit generate --custom --name=<nombre-descriptivo>
+   # rellena el .sql vacío que se genera en migrations/
+   ```
+6. **Nunca edites un archivo de `migrations/` que ya se haya aplicado en algún entorno** (ni siquiera el tuyo si ya lo compartiste) — crea uno nuevo. El historial de migraciones es append-only por diseño.
+
+### Pendiente / notas para más adelante
+- El paquete `packages/shared` (Fase 0.1) todavía no está alineado con este esquema real — sus tipos (`Monitor`, etc.) son una versión simplificada hecha a mano antes de tener el ERD. Cuando se implemente la API (Fase 1.2), conviene revisar si esos tipos deben derivarse de los tipos de `packages/db` (con `InferSelectModel`) filtrando los campos que sí debe ver el frontend, en vez de mantenerse como una copia manual separada.
+- Falta lo último de la Fase 0.4 (convenciones de logging estructurado compartido entre API y worker) — no se ha tocado todavía.
+
+### Próximo paso (Fase 0.4 o Fase 1.1)
+Terminar la Fase 0.4 (convención de logging compartido) o saltar directamente a la Fase 1.1 (autenticación), que es lo primero que necesita tocar estas tablas (`users`, `organizations`, `organization_members`) desde código de API real.
+
+### Cómo comprobar tú mismo que esto funciona (en cualquier momento, sin depender de mí)
+
+```bash
+# 1. ¿Están vivos los contenedores?
+docker compose ps
+# -> uptimepulse-postgres y uptimepulse-redis, ambos "Up (healthy)"
+
+# 2. ¿Existen las 13 tablas?
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse -c "\dt"
+
+# 3. ¿"checks" es una hypertable de verdad?
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse \
+  -c "SELECT hypertable_name FROM timescaledb_information.hypertables;"
+# -> debe devolver: checks
+
+# 4. ¿Está activa la política de retención de 90 días?
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse \
+  -c "SELECT hypertable_name, config FROM timescaledb_information.jobs WHERE proc_name='policy_retention';"
+# -> debe devolver: checks | {"drop_after": "90 days", ...}
+```
+
+Prueba manual más convincente (entrar a `psql` interactivo y comprobar el borrado en cascada con tus propios ojos):
+```bash
+docker exec -it uptimepulse-postgres psql -U uptimepulse -d uptimepulse
+```
+```sql
+INSERT INTO plans (name, max_monitors, min_interval_seconds, allowed_channels)
+VALUES ('free-manual', 3, 300, '["email"]') RETURNING id;   -- copia el id -> <PLAN_ID>
+
+INSERT INTO organizations (name, plan_id) VALUES ('Mi org de prueba', '<PLAN_ID>') RETURNING id; -- -> <ORG_ID>
+
+INSERT INTO monitors (organization_id, name, type, target)
+VALUES ('<ORG_ID>', 'Google', 'http', 'https://google.com') RETURNING id;  -- -> <MONITOR_ID>
+
+INSERT INTO checks (monitor_id, status, response_time_ms, http_status)
+VALUES ('<MONITOR_ID>', 'up', 87, 200) RETURNING *;
+
+SELECT m.name, c.status, c.response_time_ms, c.timestamp
+FROM checks c JOIN monitors m ON m.id = c.monitor_id;
+
+DELETE FROM organizations WHERE id = '<ORG_ID>';
+SELECT * FROM monitors WHERE id = '<MONITOR_ID>';        -- debe dar 0 filas
+SELECT * FROM checks WHERE monitor_id = '<MONITOR_ID>';  -- debe dar 0 filas
+\q
+```
+Si al borrar la organización desaparecen solos el monitor y el check, el borrado en cascada funciona.
+
+**Alternativa visual:** conectar DBeaver / TablePlus / la extensión PostgreSQL de VS Code a `localhost:5432`, usuario `uptimepulse`, contraseña `changeme` (están en tu `.env`), base de datos `uptimepulse`.

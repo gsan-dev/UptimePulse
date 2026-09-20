@@ -32,8 +32,8 @@ Antes de tocar lógica de negocio, monta el esqueleto para que cada pieza poster
 - [x] Volúmenes persistentes para no perder datos al reiniciar contenedores.
 - **Hecho cuando:** `docker compose up -d` deja Postgres y Redis accesibles desde el host. **Verificado:** ambos contenedores en estado `healthy`, extensión `timescaledb` (v2.30.1) instalable, Redis responde `PONG`, volúmenes `uptimepulse_postgres_data` y `uptimepulse_redis_data` creados.
 
-### 0.3 (diseño) Modelo de datos inicial
-- [ ] Diseñar el ERD antes de escribir migraciones. Entidades mínimas:
+### 0.3 (diseño) Modelo de datos inicial ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] Diseñar el ERD antes de escribir migraciones. Entidades mínimas:
   - `users` (id, email, password_hash, created_at, oauth_provider, oauth_id)
   - `organizations` (id, name, plan_id) — aunque no haya equipos hasta fase 4, crea el concepto desde ya para no reescribir FKs luego.
   - `organization_members` (user_id, organization_id, role)
@@ -47,9 +47,9 @@ Antes de tocar lógica de negocio, monta el esqueleto para que cada pieza poster
   - `maintenance_windows` (id, monitor_id, starts_at, ends_at, note) — **añadido respecto al README, ver nota de mejora #3**.
   - `api_keys` (id, org_id, key_hash, scopes, last_used_at)
   - `plans` (id, name, max_monitors, min_interval_seconds, allowed_channels)
-- [ ] Decidir política de **retención de datos** (mejora #4): ej. checks en crudo 90 días, luego agregados a rollups horarios/diarios permanentes. Documentar la decisión.
-- [ ] Herramienta de migraciones: Prisma / Drizzle / node-pg-migrate (elegir una y justificar).
-- **Hecho cuando:** existe un diagrama (aunque sea en Markdown/Mermaid) y las migraciones iniciales corren limpias sobre el Postgres del docker-compose.
+- [x] Decidir política de **retención de datos** (mejora #4): **decisión tomada e implementada** — checks en crudo 90 días (`add_retention_policy` de TimescaleDB ya activa sobre la hypertable `checks`); los rollups horarios/diarios permanentes se añadirán como *continuous aggregates* en la Fase 2.2, antes de que la política de retención empiece a borrar datos reales (en desarrollo, con datos de prueba, no hay urgencia).
+- [x] Herramienta de migraciones: **Drizzle ORM + drizzle-kit** (no Prisma — ver justificación en el diario: Prisma no modela bien las hypertables/políticas de Timescale; Drizzle permite migraciones SQL "custom" intercaladas con las generadas automáticamente).
+- **Hecho cuando:** existe un diagrama (aunque sea en Markdown/Mermaid) y las migraciones iniciales corren limpias sobre el Postgres del docker-compose. **Verificado:** 13 tablas creadas, `checks` convertida en hypertable, política de retención de 90 días activa, prueba de inserción/borrado en cascada vía el cliente Drizzle exitosa.
 
 ### 0.4 Convenciones de código compartidas
 - [ ] `packages/shared`: tipos TS de dominio (Monitor, Check, Incident, etc.) usados tanto por API, worker y web.
