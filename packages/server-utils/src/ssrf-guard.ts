@@ -1,6 +1,5 @@
 import dns from "node:dns/promises";
 import net from "node:net";
-import { env } from "../env.js";
 
 export class SsrfBlockedError extends Error {}
 
@@ -36,18 +35,28 @@ function isPrivateIp(ip: string): boolean {
   return net.isIP(ip) === 6 ? isPrivateIPv6(ip) : isPrivateIPv4(ip);
 }
 
+export interface AssertPublicHostOptions {
+  /**
+   * Desactiva la comprobación por completo. Pensado para que cada proceso
+   * (api, worker) lo controle con su propia variable de entorno
+   * ALLOW_PRIVATE_MONITOR_TARGETS, sin que este paquete dependa de ningún
+   * mecanismo concreto de configuración.
+   */
+  allowPrivateTargets?: boolean;
+}
+
 /**
  * Lanza SsrfBlockedError si `hostname` es, o resuelve por DNS a, una IP
  * privada/loopback/link-local. Comprueba TODAS las direcciones que devuelve
  * el DNS (no solo la primera) para no dejar un hueco vía round-robin/DNS
  * rebinding.
  *
- * Se puede desactivar en local con ALLOW_PRIVATE_MONITOR_TARGETS=true en el
- * .env, para poder monitorizar servicios internos durante el desarrollo.
- * NUNCA debe activarse en un despliegue real.
+ * Usado en dos sitios: `apps/api` al crear/editar un monitor, y
+ * `apps/worker` justo antes de ejecutar cada check real — un dominio podría
+ * resolver a una IP pública al crearlo y cambiar a una privada más tarde.
  */
-export async function assertPublicHost(hostname: string): Promise<void> {
-  if (env.allowPrivateMonitorTargets) return;
+export async function assertPublicHost(hostname: string, options: AssertPublicHostOptions = {}): Promise<void> {
+  if (options.allowPrivateTargets) return;
 
   if (net.isIP(hostname)) {
     if (isPrivateIp(hostname)) {

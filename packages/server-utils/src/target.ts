@@ -1,7 +1,7 @@
-import type { MonitorType } from "@uptimepulse/shared";
+export type MonitorKind = "http" | "tcp" | "ping";
 
 /** Extrae el hostname a resolver para la comprobación anti-SSRF, según el tipo de monitor. */
-export function extractHostname(type: MonitorType, target: string): string {
+export function extractHostname(type: MonitorKind, target: string): string {
   if (type === "http") {
     return new URL(target).hostname;
   }

@@ -82,12 +82,13 @@ Objetivo: un usuario se registra, crea un monitor HTTP, un worker lo comprueba c
 - [x] **Validación anti-SSRF (mejora #1, crítica):** implementada en `lib/ssrf-guard.ts`. Resuelve el hostname por DNS y rechaza IPs privadas/loopback/link-local, salvo `ALLOW_PRIVATE_MONITOR_TARGETS=true` en `.env` (modo desarrollo explícito).
 - **Hecho cuando:** puedes crear/editar/pausar/borrar un monitor vía API y un intento de monitorizar `http://localhost` o `http://169.254.169.254` es rechazado con un error claro. **Verificado con 19 pruebas HTTP reales**, incluyendo: creación válida, bloqueo de `localhost`/`169.254.169.254`/IP privada literal/dominio TCP privado, bloqueo por **resolución DNS real** (`localtest.me` → `127.0.0.1`, no solo coincidencia de texto), límite de intervalo mínimo del plan, límite máximo de 5 monitores, aislamiento entre organizaciones (usuario B no puede ver ni listar monitores de A, 404 sin filtrar datos), y ciclo de vida completo (crear/leer/listar/editar/pausar/reanudar/borrar).
 
-### 1.3 Worker simple (checks HTTP)
-- [ ] Proceso independiente (`apps/worker`) que cada X segundos consulta monitores activos cuyo próximo check toque.
-- [ ] Ejecuta el HTTP request con timeout configurado, guarda el resultado en `checks`.
-- [ ] Reintentos antes de marcar como "down" (ej. 2 reintentos con backoff corto) para evitar falsos positivos (README §2.2).
-- [ ] Manejo de errores de red distinto de errores de código de estado (timeout vs. 500 vs. DNS failure) — guardarlo en `error_message`.
-- **Hecho cuando:** con un monitor de prueba apuntando a una URL real, aparecen filas nuevas en `checks` cada minuto sin intervención manual.
+### 1.3 Worker simple (checks HTTP) ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] Proceso independiente (`apps/worker`) que cada X segundos consulta monitores activos cuyo próximo check toque. Implementado también para **TCP**, no solo HTTP (el tipo `ping` queda pendiente, ver nota).
+- [x] Ejecuta el request con timeout configurado, guarda el resultado en `checks`.
+- [x] Reintentos antes de marcar como "down" (hasta 3 intentos con 1s de espera) para evitar falsos positivos (README §2.2).
+- [x] Manejo de errores de red distinto de errores de código de estado (timeout vs. status inesperado vs. DNS failure vs. conexión rechazada) — guardado en `error_message` con un mensaje distinto para cada caso.
+- [x] **Cierra el pendiente de la Fase 1.2:** la comprobación anti-SSRF se revalida justo antes de cada check real (no solo al crear/editar el monitor), moviendo `ssrf-guard.ts`/`target.ts` a un paquete nuevo `packages/server-utils` compartido entre `api` y `worker`.
+- **Hecho cuando:** con un monitor de prueba apuntando a una URL real, aparecen filas nuevas en `checks` sin intervención manual. **Verificado con 5 monitores de prueba** (HTTP éxito, HTTP con status inesperado y reintentos, dominio DNS irresoluble bloqueado por el guardián anti-SSRF, TCP éxito, TCP con timeout y reintentos) y comprobando en la BD que la cadencia respeta el `interval_seconds` de cada monitor (un monitor de 15s se repitió 3 veces en el tiempo que uno de 300s no se repitió ni una).
 
 ### 1.4 Dashboard básico (frontend)
 - [ ] Setup de `apps/web` con React + Vite + TailwindCSS.

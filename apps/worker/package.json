@@ -7,7 +7,11 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
-    "@uptimepulse/shared": "*"
+    "@uptimepulse/db": "*",
+    "@uptimepulse/server-utils": "*",
+    "@uptimepulse/shared": "*",
+    "dotenv": "^16.4.0",
+    "drizzle-orm": "^0.45.0"
   },
   "devDependencies": {
     "tsx": "^4.19.0",

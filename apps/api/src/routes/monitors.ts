@@ -2,11 +2,11 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { eq, and, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db, monitors } from "@uptimepulse/db";
+import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepulse/server-utils";
+import { env } from "../env.js";
 import { requireAuth } from "../plugins/auth.js";
 import { getPrimaryOrganizationId } from "../lib/organizations.js";
 import { getOrganizationPlanLimits } from "../lib/plans.js";
-import { assertPublicHost, SsrfBlockedError } from "../lib/ssrf-guard.js";
-import { extractHostname } from "../lib/target.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] as const;
 
@@ -110,7 +110,7 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     }
 
     try {
-      await assertPublicHost(extractHostname(input.type, input.target));
+      await assertPublicHost(extractHostname(input.type, input.target), { allowPrivateTargets: env.allowPrivateMonitorTargets });
     } catch (error) {
       if (error instanceof SsrfBlockedError) {
         return reply.code(422).send({ error: error.message });
@@ -186,7 +186,7 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
 
     if (patch.target !== undefined) {
       try {
-        await assertPublicHost(extractHostname(existing.type, patch.target));
+        await assertPublicHost(extractHostname(existing.type, patch.target), { allowPrivateTargets: env.allowPrivateMonitorTargets });
       } catch (error) {
         if (error instanceof SsrfBlockedError) {
           return reply.code(422).send({ error: error.message });

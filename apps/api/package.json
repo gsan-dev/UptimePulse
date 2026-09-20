@@ -10,6 +10,7 @@
     "@fastify/cookie": "^11.0.0",
     "@fastify/cors": "^10.0.0",
     "@uptimepulse/db": "*",
+    "@uptimepulse/server-utils": "*",
     "@uptimepulse/shared": "*",
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.0",

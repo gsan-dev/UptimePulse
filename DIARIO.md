@@ -860,3 +860,117 @@ curl http://localhost:3000/monitors -H "Authorization: Bearer <TOKEN>"
 
 ### Próximo paso (Fase 1.3)
 El worker de verdad: un proceso que recorra los monitores activos, ejecute el check HTTP real (repitiendo la comprobación anti-SSRF justo antes de cada petición, según la nota de arriba), y guarde el resultado en la tabla `checks`.
+
+---
+
+## 2026-09-20 (continuación 7) — Fase 1.3: Worker real (checks HTTP y TCP)
+
+### Objetivo
+Que `apps/worker` deje de ser un placeholder y ejecute de verdad los checks de los monitores activos, con reintentos y clasificación de errores, guardando cada resultado en la hypertable `checks` — y de paso, cerrar el pendiente que quedó anotado al final de la Fase 1.2 (revalidar anti-SSRF justo antes de cada check real, no solo al crear el monitor).
+
+### Refactor previo: `packages/server-utils`
+La comprobación anti-SSRF (`ssrf-guard.ts`) vivía solo dentro de `apps/api`. El worker la necesita igual de estricta — quizás más, porque es el proceso que de verdad hace las peticiones de red — así que duplicarla a mano era el tipo de decisión que años después provoca un fix de seguridad aplicado en un sitio y olvidado en el otro. Se extrajo a un paquete nuevo, `packages/server-utils`, sin ninguna dependencia de runtime (solo usa `node:dns`/`node:net`), usado ahora por `apps/api` y `apps/worker` por igual.
+
+Cambio de firma al extraerlo: `assertPublicHost(hostname, { allowPrivateTargets })` recibe la opción como parámetro en vez de leer una variable de entorno ella misma — así el paquete no depende de ningún mecanismo concreto de configuración (cada app decide cómo lee su propio `ALLOW_PRIVATE_MONITOR_TARGETS`).
+
+### Un bug de TypeScript entretenido (y cómo se resolvió)
+Al crear `packages/server-utils`, `tsc` fallaba con `Cannot find name 'node:dns/promises'` / `'node:net'`, como si no reconociera los tipos de Node — pese a que `packages/db` y `apps/api` usan `node:url` sin ningún problema con la misma configuración base. Se investigó a fondo:
+- Se comprobó que `@types/node` sí estaba disponible (tanto la copia elevada a la raíz como, en un intento, una copia local en el propio paquete) — no era un problema de "falta el paquete".
+- Se comprobó que el binario de `tsc` que se estaba usando (resuelto siempre desde la raíz del monorepo por `npx`) es la **versión 6.0.3** — y con ese mismo binario, `packages/db`/`apps/api` sí compilan bien.
+- No se identificó la causa raíz exacta (probablemente algún cambio de comportamiento de auto-inclusión de `@types` en TypeScript 6.0 combinado con cómo `npm workspaces` resuelve este paquete en concreto, que no tiene ninguna otra dependencia de runtime).
+
+**Solución aplicada** (pragmática, no un intento de encontrar la causa perfecta): declarar explícitamente `"types": ["node"]` en `packages/server-utils/tsconfig.json`, en vez de depender de que TypeScript lo detecte solo. Es más explícito y más robusto de todas formas — si esto se repite en algún paquete nuevo sin dependencias de runtime, la solución es la misma línea.
+
+### Qué se hizo
+
+**`packages/server-utils/`** (nuevo): `ssrf-guard.ts` y `target.ts` (movidos de `apps/api`, con el cambio de firma ya comentado).
+
+**`apps/api`**: `routes/monitors.ts` ahora importa de `@uptimepulse/server-utils` y pasa `{ allowPrivateTargets: env.allowPrivateMonitorTargets }` en las dos llamadas a `assertPublicHost`. Se borraron los archivos duplicados de `apps/api/src/lib/`.
+
+**`apps/worker/src/`** (todo nuevo):
+- `env.ts` — mismo patrón que `apps/api`: carga `.env` de la raíz, valida `DATABASE_URL`, añade `WORKER_POLL_INTERVAL_MS` (cada cuánto el worker *pregunta* si hay algo pendiente — no confundir con `interval_seconds`, que es cada cuánto se comprueba *cada monitor concreto*) y `ALLOW_PRIVATE_MONITOR_TARGETS`.
+- `lib/types.ts` — `CheckOutcome` (status, responseTimeMs, httpStatus, errorMessage): la forma común que devuelve cualquier tipo de check.
+- `lib/http-check.ts` — `runHttpCheck()`: hace el `fetch` con `AbortSignal.timeout()`, decide "up" según `expectedStatus` (si se configuró) o `status < 400` (si no), y clasifica errores de red (`ENOTFOUND`, `ECONNREFUSED`, `ECONNRESET`, certificado caducado, timeout) en mensajes legibles.
+- `lib/tcp-check.ts` — `runTcpCheck()`: abre un socket TCP crudo (`net.createConnection`), "up" si conecta, clasifica `ECONNREFUSED`/`ENOTFOUND`/`EHOSTUNREACH`/timeout.
+- `lib/run-check.ts` — `runCheckWithRetries()`: revalida anti-SSRF, luego intenta hasta 3 veces (1s de espera entre intentos) y devuelve el primer éxito o el último fallo. El tipo `ping` está reconocido pero no implementado (ver pendientes).
+- `poller.ts` — `pollDueMonitors()`: por cada monitor activo, mira cuándo fue su último check (`ORDER BY timestamp DESC LIMIT 1`) y decide si le toca ya según su `interval_seconds`; si le toca, ejecuta el check y guarda la fila en `checks`.
+- `index.ts` — bucle principal (`setTimeout` recursivo, no `setInterval`, para no solaparse si un ciclo tarda más de `WORKER_POLL_INTERVAL_MS`), con apagado limpio en `SIGINT`/`SIGTERM` (cierra el pool de Postgres antes de salir).
+
+### Decisión de diseño: consulta N+1 por ciclo, no una única query con JOIN LATERAL
+`pollDueMonitors()` hace una consulta por monitor para saber su último check, en vez de una única query SQL con `JOIN LATERAL` que resolvería "el último check de cada monitor" de una vez. Con el límite del plan free (5 monitores) esto es irrelevante en rendimiento, y el código es mucho más legible sin SQL crudo complejo. Se sustituirá por completo en la Fase 2.1 (BullMQ), donde cada monitor tiene su propio job programado y ni siquiera hace falta "preguntar" quién le toca — así que optimizar esta consulta ahora sería trabajo tirado.
+
+### Diseño de reintentos
+Hasta 3 intentos con 1 segundo de espera fija entre ellos (no backoff exponencial — para un worker en segundo plano que no bloquea ninguna petición de usuario, la complejidad de un backoff progresivo no se justifica todavía). Solo se guarda **una fila** en `checks` por ciclo (el resultado final tras los reintentos), nunca una fila por intento — si se guardara una por intento, un monitor caído generaría 3x más filas en la hypertable sin aportar información real.
+
+### Comandos ejecutados
+
+```bash
+npm install
+npx tsc --noEmit -p packages/server-utils
+npx tsc --noEmit -p apps/worker
+npx tsc --noEmit -p apps/api   # revalidar que el refactor no rompió nada
+npm run lint
+
+npm run dev:api      # necesario para registrar el usuario de prueba
+npm run dev:worker
+```
+
+### Verificación completa realizada
+
+Se registró un usuario de prueba (vía API) para obtener una organización real, y se insertaron 5 monitores **directamente por SQL** (para controlar `interval_seconds` con precisión de segundos en vez de los 300s mínimos que exige el plan free vía la API — solo para poder probar la cadencia del worker en una sesión corta, no para saltarse la validación en producción):
+
+| Monitor | Qué demuestra | Resultado obtenido |
+|---|---|---|
+| `https://example.com` (http, 300s) | Caso feliz | `up`, 138ms, sin reintentos |
+| `https://httpstat.us/500` (http, 15s) | Status inesperado + reintentos + cadencia | 3 intentos fallidos (`"Se esperaba un status < 400, se obtuvo 404"`) → `down`; **se repitió otras 2 veces** a los ~15s y ~38s, confirmando que respeta su intervalo |
+| Dominio inventado que no resuelve (http, 300s) | Revalidación anti-SSRF antes del check real | `down`, sin llegar a intentar el HTTP, con el mensaje del propio guardián: `"No se pudo resolver el host..."` |
+| `example.com:443` (tcp, 300s) | Check TCP exitoso | `up`, 19ms |
+| `example.com:9999` (tcp, 300s, timeout 3s) | Timeout de red + reintentos | 3 intentos de 3s cada uno (`"Timeout tras 3000ms conectando..."`) → `down` |
+
+**La prueba de cadencia más reveladora:** en la misma ventana de ~45 segundos, el monitor de 15s generó 3 filas en `checks` mientras que los 4 monitores de 300s generaron solo 1 fila cada uno (la primera, inmediata, porque nunca se habían comprobado) — confirmando que `isDue()` respeta el `interval_seconds` de cada monitor de forma independiente.
+
+Verificación final directa en la tabla:
+```sql
+SELECT m.name, c.status, c.response_time_ms, c.http_status, c.error_message, c.timestamp
+FROM checks c JOIN monitors m ON m.id = c.monitor_id
+WHERE m.organization_id = '<id>'
+ORDER BY c.timestamp;
+-- -> 7 filas, exactamente las esperadas
+```
+
+Los datos de prueba se borraron después (cascada desde `organizations`).
+
+### Cómo reproducir / comprobar tú mismo
+
+```bash
+# 0. Preparación
+docker compose up -d
+npm run db:migrate
+npm run dev:api      # en una terminal
+
+# 1. Regístrate y crea un monitor real por la API (en otra terminal)
+curl -X POST http://localhost:3000/auth/register -H "Content-Type: application/json" \
+  -d '{"email":"tu-email@ejemplo.com","password":"password123"}'
+# copia el accessToken
+
+curl -X POST http://localhost:3000/monitors -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"name":"Mi web","type":"http","target":"https://example.com"}'
+
+# 2. Arranca el worker en una tercera terminal
+npm run dev:worker
+# -> en menos de 10s (WORKER_POLL_INTERVAL_MS) deberías ver en el log:
+#    {"...","message":"check registrado","...,"status":"up",...}
+
+# 3. Comprueba en la BD que la fila existe de verdad
+docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse \
+  -c "SELECT * FROM checks ORDER BY timestamp DESC LIMIT 5;"
+```
+
+### Pendiente / notas para más adelante
+- **`ping` no está implementado.** El tipo existe en el esquema y en la validación de la API desde la Fase 1.2, pero el worker lo registra como `down` con el mensaje explícito "Los checks de tipo 'ping' todavía no están implementados" en vez de fingir que funciona. Implementarlo de verdad (ICMP real) requiere sockets raw (privilegios de administrador en la mayoría de sistemas) o invocar el comando `ping` del sistema operativo — con la complicación añadida de que la sintaxis difiere entre Windows (`-n`/`-w`) y Linux (`-c`/`-W`). Se ha dejado fuera a propósito de esta fase para no introducir código frágil y no probado en un entorno real Linux (esta máquina de desarrollo es Windows).
+- **La consulta N+1 del poller** es aceptable ahora (máx. 5 monitores) pero no escala — sustituir por BullMQ en la Fase 2.1, como ya estaba previsto.
+- **El bucle de sondeo es un único proceso secuencial**: si hay muchos monitores pendientes a la vez, se comprueban uno detrás de otro, no en paralelo. Para 5 monitores es instantáneo; con más, convendría `Promise.all` con un límite de concurrencia — otra razón más para que la Fase 2.1 (workers concurrentes de verdad) llegue pronto.
+- Anotado también: la comprobación anti-SSRF del worker, al resolver DNS para el hostname, hace que la clasificación de error `ENOTFOUND` dentro de `http-check.ts` casi nunca se llegue a activar en la práctica para monitores HTTP (el guardián ya corta antes) — no es un bug, simplemente ese código de `http-check.ts` queda como red de seguridad para el caso raro en que la resolución DNS cambie entre la comprobación del guardián y la petición real de `fetch`.
+
+### Próximo paso (Fase 1.4)
+Dashboard básico en `apps/web`: login/registro real (conectado a la API), listado de monitores con su estado, y un formulario para crear/editar monitores — sustituyendo por fin los datos de ejemplo (`placeholderMonitors`) de la Fase 0.4.
