@@ -53,3 +53,17 @@ export type Organization = InferSelectModel<typeof organizations>;
 // Los usuarios sí necesitan una versión "recortada": el frontend nunca debe
 // recibir el hash de la contraseña ni los identificadores de OAuth.
 export type PublicUser = Omit<InferSelectModel<typeof users>, "passwordHash" | "oauthId">;
+
+/**
+ * Los tipos de arriba reflejan las columnas tal como las devuelve Drizzle en
+ * el servidor (con `Date` de verdad y `bigint` de verdad para `Check.id`).
+ * Pero JSON no sabe serializar ninguno de los dos: una fecha llega al
+ * navegador como string ISO, y un bigint literalmente no se puede meter en
+ * un JSON.stringify (lanza una excepción) — por eso la API lo convierte a
+ * string antes de responder. `Serialized<T>` refleja la forma REAL en la que
+ * un tipo de dominio llega al frontend tras cruzar la red; úsalo ahí, no el
+ * tipo original.
+ */
+export type Serialized<T> = {
+  [K in keyof T]: T[K] extends Date ? string : T[K] extends bigint ? string : T[K];
+};

@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { z } from "zod";
-import { db, monitors } from "@uptimepulse/db";
+import { checks, db, monitors } from "@uptimepulse/db";
 import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepulse/server-utils";
 import { env } from "../env.js";
 import { requireAuth } from "../plugins/auth.js";
@@ -64,6 +64,10 @@ const updateMonitorSchema = z
 
 const idParamSchema = z.object({ id: z.string().uuid() });
 
+const listChecksQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+
 function parseId(request: FastifyRequest, reply: FastifyReply): string | undefined {
   const result = idParamSchema.safeParse(request.params);
   if (!result.success) {
@@ -77,6 +81,25 @@ async function findOwnedMonitor(organizationId: string, monitorId: string) {
   return db.query.monitors.findFirst({
     where: and(eq(monitors.id, monitorId), eq(monitors.organizationId, organizationId)),
   });
+}
+
+// El "estado actual" de un monitor no es una columna de la tabla `monitors`
+// (ver MonitorStatus en packages/shared): se deriva del último check
+// guardado por el worker. Se adjunta aquí, no en el esquema, porque es
+// exactamente el tipo de dato que solo tiene sentido en la respuesta de la
+// API, no en el modelo de la base de datos.
+async function getLastCheck(monitorId: string) {
+  const [last] = await db
+    .select({ status: checks.status, responseTimeMs: checks.responseTimeMs, timestamp: checks.timestamp })
+    .from(checks)
+    .where(eq(checks.monitorId, monitorId))
+    .orderBy(desc(checks.timestamp))
+    .limit(1);
+  return last ?? null;
+}
+
+async function withLastCheck<T extends { id: string }>(monitor: T) {
+  return { ...monitor, lastCheck: await getLastCheck(monitor.id) };
 }
 
 export async function monitorRoutes(app: FastifyInstance): Promise<void> {
@@ -144,7 +167,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.send([]);
     }
     const rows = await db.query.monitors.findMany({ where: eq(monitors.organizationId, organizationId) });
-    return reply.send(rows);
+    const withStatus = await Promise.all(rows.map(withLastCheck));
+    return reply.send(withStatus);
   });
 
   app.get("/monitors/:id", async (request, reply) => {
@@ -156,7 +180,36 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
-    return reply.send(monitor);
+    return reply.send(await withLastCheck(monitor));
+  });
+
+  app.get("/monitors/:id/checks", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const queryParsed = listChecksQuerySchema.safeParse(request.query);
+    if (!queryParsed.success) {
+      return reply.code(400).send({ error: queryParsed.error.flatten() });
+    }
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    const rows = await db
+      .select()
+      .from(checks)
+      .where(eq(checks.monitorId, id))
+      .orderBy(desc(checks.timestamp))
+      .limit(queryParsed.data.limit);
+
+    // checks.id es un bigint (Fase 0.3): JSON no sabe serializarlo, hay que
+    // convertirlo a string explícitamente antes de responder (ver la nota
+    // de Serialized<T> en packages/shared).
+    const serialized = rows.map((row) => ({ ...row, id: row.id.toString() }));
+    return reply.send(serialized);
   });
 
   app.patch("/monitors/:id", async (request, reply) => {

@@ -1,25 +1,25 @@
-import type { Monitor } from "@uptimepulse/shared";
-
-// Placeholder para probar que el tipo Monitor (derivado del esquema real de
-// la BD en la Fase 0.3) llega con autocompletado hasta el frontend. El
-// listado real, con datos de la API, llega en la Fase 1.4.
-const placeholderMonitors: Pick<Monitor, "name" | "type" | "target">[] = [
-  { name: "Google", type: "http", target: "https://google.com" },
-  { name: "API interna", type: "tcp", target: "10.0.0.5:5432" },
-];
+import { Navigate, Route, Routes } from "react-router-dom";
+import { ProtectedRoute } from "./components/ProtectedRoute";
+import { AuthProvider } from "./context/AuthContext";
+import { DashboardPage } from "./pages/DashboardPage";
+import { LoginPage } from "./pages/LoginPage";
+import { MonitorDetailPage } from "./pages/MonitorDetailPage";
+import { NewMonitorPage } from "./pages/NewMonitorPage";
+import { RegisterPage } from "./pages/RegisterPage";
 
 export default function App() {
   return (
-    <main style={{ fontFamily: "sans-serif", padding: "2rem" }}>
-      <h1>UptimePulse</h1>
-      <p>Esqueleto del frontend (Fase 0.1). El dashboard real llega en la Fase 1.4.</p>
-      <ul>
-        {placeholderMonitors.map((monitor) => (
-          <li key={monitor.target}>
-            {monitor.name} — {monitor.type} — {monitor.target}
-          </li>
-        ))}
-      </ul>
-    </main>
+    <AuthProvider>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
+        <Route element={<ProtectedRoute />}>
+          <Route path="/monitors" element={<DashboardPage />} />
+          <Route path="/monitors/new" element={<NewMonitorPage />} />
+          <Route path="/monitors/:id" element={<MonitorDetailPage />} />
+        </Route>
+        <Route path="*" element={<Navigate to="/monitors" replace />} />
+      </Routes>
+    </AuthProvider>
   );
 }

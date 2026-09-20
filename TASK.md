@@ -90,13 +90,13 @@ Objetivo: un usuario se registra, crea un monitor HTTP, un worker lo comprueba c
 - [x] **Cierra el pendiente de la Fase 1.2:** la comprobación anti-SSRF se revalida justo antes de cada check real (no solo al crear/editar el monitor), moviendo `ssrf-guard.ts`/`target.ts` a un paquete nuevo `packages/server-utils` compartido entre `api` y `worker`.
 - **Hecho cuando:** con un monitor de prueba apuntando a una URL real, aparecen filas nuevas en `checks` sin intervención manual. **Verificado con 5 monitores de prueba** (HTTP éxito, HTTP con status inesperado y reintentos, dominio DNS irresoluble bloqueado por el guardián anti-SSRF, TCP éxito, TCP con timeout y reintentos) y comprobando en la BD que la cadencia respeta el `interval_seconds` de cada monitor (un monitor de 15s se repitió 3 veces en el tiempo que uno de 300s no se repitió ni una).
 
-### 1.4 Dashboard básico (frontend)
-- [ ] Setup de `apps/web` con React + Vite + TailwindCSS.
-- [ ] Página de login/registro.
-- [ ] Listado de monitores (polling simple, sin WebSocket todavía) con estado actual y último tiempo de respuesta.
-- [ ] Formulario de creación/edición de monitor.
-- [ ] Vista de detalle con tabla simple de los últimos checks (sin gráficos aún).
-- **Hecho cuando:** desde el navegador puedes loguearte, crear un monitor, y ver que su estado cambia tras un rato (refrescando o con `setInterval` de polling).
+### 1.4 Dashboard básico (frontend) ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
+- [x] Setup de `apps/web` con React + Vite + TailwindCSS (v4, vía `@tailwindcss/vite`) + React Router.
+- [x] Página de login/registro, con sesión persistida entre recargas (refresh token en cookie httpOnly, access token en memoria).
+- [x] Listado de monitores (polling cada 10s) con estado actual (badge de color) y último tiempo de respuesta.
+- [x] Formulario de creación de monitor (campos por tipo: HTTP/TCP/ping) y edición inline (nombre/intervalo) en la vista de detalle.
+- [x] Vista de detalle con tabla de los últimos checks (fecha, estado, tiempo de respuesta, mensaje de error).
+- **Hecho cuando:** desde el navegador puedes loguearte, crear un monitor, y ver que su estado cambia tras un rato. **Verificado sin poder usar un navegador real** (no había herramienta de automatización disponible en la sesión): `tsc`, `vite build` de producción, y sobre todo probando con `curl` el contrato exacto que consume el frontend (registro → login → `GET /monitors` con el nuevo campo `lastCheck` → crear monitor → el worker genera un check real → `GET /monitors/:id/checks` con el `id` bigint ya convertido a string) y las cabeceras CORS con credenciales. La API y el frontend quedaron corriendo al terminar la fase para que el usuario hiciera la comprobación visual final él mismo.
 
 ### 1.5 Alertas por email (mínimo viable)
 - [ ] Integración con Resend/Nodemailer.

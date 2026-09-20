@@ -974,3 +974,123 @@ docker exec uptimepulse-postgres psql -U uptimepulse -d uptimepulse \
 
 ### Próximo paso (Fase 1.4)
 Dashboard básico en `apps/web`: login/registro real (conectado a la API), listado de monitores con su estado, y un formulario para crear/editar monitores — sustituyendo por fin los datos de ejemplo (`placeholderMonitors`) de la Fase 0.4.
+
+---
+
+## 2026-09-20 (continuación 8) — Fase 1.4: Dashboard real en el frontend
+
+### Objetivo
+Que `apps/web` deje de mostrar datos de ejemplo (Fase 0.4) y sea una aplicación real: login/registro contra la API, listado de monitores con su estado en vivo, formulario de creación, y vista de detalle con el historial de checks.
+
+### Aviso importante sobre cómo se verificó esto
+Se comprobó que **no hay ninguna herramienta de control de navegador real** disponible en esta sesión (se buscó explícitamente antes de empezar). Por tanto, esta fase se verificó con todo el rigor posible sin clicar de verdad en un navegador:
+- Tipos (`tsc --noEmit`) y lint limpios.
+- **Build de producción** (`vite build`), que compila JSX/TS de verdad y falla si algo no encaja (más fiable que solo el dev server).
+- Se inspeccionó el bundle final para confirmar que sigue sin colar `pg`/`drizzle-orm`/`@uptimepulse/db` (0 coincidencias), pese a que ahora el frontend usa los tipos compartidos mucho más que antes.
+- Se probó **exactamente el contrato HTTP que el código del frontend consume** (mismos headers, mismo `credentials: include`, mismo origen simulado) contra la API real y el worker real corriendo, incluyendo las cabeceras CORS de un preflight real.
+- Al terminar, se dejaron la API, el worker y el frontend corriendo para que el usuario pudiera hacer la comprobación visual final él mismo — eso no se puede sustituir.
+
+### Decisiones de diseño
+
+**Dos endpoints nuevos en la API, necesarios porque el frontend los necesitaba de verdad (no por adelantado):**
+1. `GET /monitors/:id/checks` — no existía ningún endpoint para leer el historial de checks de un monitor. Se añadió con paginación simple (`?limit=`, por defecto 50, máx. 200).
+2. `GET /monitors` y `GET /monitors/:id` ahora incluyen un campo `lastCheck` (`{ status, responseTimeMs, timestamp } | null`) calculado al vuelo con una consulta al último check — porque el "estado actual" de un monitor (README §3.2) no es una columna de la tabla `monitors`, se deriva del último resultado. Este cálculo vive en la API, no en el frontend, para no duplicar esa lógica si mañana hay una app móvil u otro cliente.
+
+**Se cerró un pendiente que llevaba dos fases esperando: la serialización de `bigint` y `Date`.** Ya estaba anotado desde la Fase 0.4 ("`Check.id` es un `bigint`... `JSON.stringify()` no sabe serializarlo") y desde la Fase 1.1 (fechas como `Date` vs. string por HTTP). Ahora que el frontend consume estos datos de verdad, había que resolverlo:
+- La API convierte `check.id` (bigint) a string antes de responder (`row.id.toString()`).
+- `packages/shared/src/domain.ts` ganó un tipo de utilidad nuevo, `Serialized<T>`, que convierte `Date → string` y `bigint → string` a nivel de tipos — así el frontend tipa sus datos como `Serialized<Monitor>`/`Serialized<Check>` (la forma REAL en que llegan) en vez de fingir que sigue siendo un `Date`/`bigint` como en el servidor. Esto sigue derivándose del esquema real (Fase 0.3/0.4), no son tipos nuevos inventados a mano.
+
+**Gestión de sesión en el frontend:** el access token vive solo en una variable en memoria dentro de `api/client.ts` (no `localStorage`), tal como se decidió en la Fase 1.1. Esto significa que se pierde al recargar la página — por diseño, para reducir el riesgo de robo por XSS. Para que la sesión sobreviva a un F5, `AuthContext` intenta un `silentRefresh()` al montar la app (usa la cookie httpOnly de refresh, invisible a JavaScript). `apiFetch()` además reintenta automáticamente una vez si una petición cualquiera devuelve 401 (el access token caducó a los 15 minutos), antes de rendirse y dejar que la UI pida login de nuevo.
+
+**TailwindCSS v4**, no v3: se usa `@tailwindcss/vite` (plugin oficial) con un único `@import "tailwindcss";` en `index.css` — ya no hace falta `tailwind.config.js` ni `postcss.config.js` para el uso básico, a diferencia de v3.
+
+**React Router**, no un enrutado manual: dado que ya hay 5 pantallas (login, registro, dashboard, detalle, nuevo monitor) con URLs propias, un router de verdad es la opción естándar, no una sobre-ingeniería.
+
+### Qué se hizo
+
+**Backend** (`apps/api/src/routes/monitors.ts`):
+- `getLastCheck()` / `withLastCheck()` — adjuntan el último check a la respuesta de un monitor.
+- `GET /monitors/:id/checks` — historial paginado, con el `id` serializado a string.
+
+**`packages/shared/src/domain.ts`**: tipo `Serialized<T>`.
+
+**Frontend** (`apps/web/src/`, todo nuevo salvo `App.tsx`/`main.tsx`, reescritos):
+- `api/client.ts` — `apiFetch()` con reintento de refresh en 401, `ApiError` con mensaje legible (incluye desempaquetar los errores de validación de Zod, que llegan como objeto `{formErrors, fieldErrors}`, no como string).
+- `api/auth.ts`, `api/monitors.ts`, `api/types.ts` — funciones tipadas por endpoint, usando `Serialized<Monitor>`/`Serialized<Check>`/`Serialized<PublicUser>` de `@uptimepulse/shared`.
+- `context/AuthContext.tsx` — estado de sesión + `silentRefresh()` al montar.
+- `components/ProtectedRoute.tsx` — redirige a `/login` si no hay sesión.
+- `components/StatusBadge.tsx` — badge de color reutilizable (README §3.7) + `monitorDisplayStatus()`, que decide "paused"/"pending"/"up"/"down" a partir de `isPaused` + `lastCheck`.
+- `pages/LoginPage.tsx`, `pages/RegisterPage.tsx`, `pages/DashboardPage.tsx` (listado con polling cada 10s), `pages/NewMonitorPage.tsx` (formulario con campos condicionales según el tipo de monitor), `pages/MonitorDetailPage.tsx` (info + pausar/reanudar/editar/borrar + tabla de últimos 20 checks, también con polling).
+- `App.tsx` — rutas (`/login`, `/register`, `/monitors`, `/monitors/new`, `/monitors/:id`, todas las de monitores protegidas).
+
+### Comandos ejecutados
+
+```bash
+npm install
+npx tsc --noEmit -p apps/web
+npm run lint
+cd apps/web && npx vite build          # build de producción real, no solo dev server
+grep -c "drizzle\|@uptimepulse/db" dist/assets/*.js   # -> 0, confirma que no se coló nada del backend
+
+npm run dev:api
+npm run dev:web
+npm run dev:worker
+```
+
+### Verificación completa (contrato HTTP real, simulando exactamente al frontend)
+
+```bash
+# Registro y login con el header Origin que mandaría el navegador real
+curl -c cookies.txt -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" -H "Origin: http://localhost:5173" \
+  -d '{"email":"...","password":"..."}'
+
+# Crear un monitor, luego comprobar que aparece con lastCheck:null (sin checks aún)
+curl http://localhost:3000/monitors -H "Authorization: Bearer <TOKEN>"
+# -> [{ ..., "lastCheck": null }]
+
+# (arrancar el worker, esperar un ciclo)
+
+# Comprobar que lastCheck ya tiene datos reales
+curl http://localhost:3000/monitors -H "Authorization: Bearer <TOKEN>"
+# -> [{ ..., "lastCheck": { "status": "up", "responseTimeMs": 140, "timestamp": "..." } }]
+
+# Comprobar que el id (bigint) llega como STRING, no como número
+curl http://localhost:3000/monitors/<id>/checks -H "Authorization: Bearer <TOKEN>"
+# -> [{ "id": "10", ... }]   <- "10" entre comillas, es un string
+
+# Comprobar las cabeceras CORS de un preflight real (necesarias para credentials:"include")
+curl -i -X OPTIONS http://localhost:3000/monitors \
+  -H "Origin: http://localhost:5173" -H "Access-Control-Request-Method: GET"
+# -> access-control-allow-origin: http://localhost:5173
+# -> access-control-allow-credentials: true
+```
+
+Todas las respuestas coincidieron exactamente con lo que el código de `apps/web` espera recibir.
+
+### Cómo comprobarlo tú mismo (la parte que de verdad importa: verlo en el navegador)
+
+```bash
+docker compose up -d
+npm run db:migrate
+npm run dev:api      # terminal 1
+npm run dev:worker   # terminal 2
+npm run dev:web      # terminal 3
+```
+Abre `http://localhost:5173`:
+1. Regístrate con cualquier email/contraseña (mínimo 8 caracteres).
+2. Deberías caer en `/monitors`, vacío. Click en "+ Nuevo monitor".
+3. Crea uno de tipo HTTP contra `https://example.com` (o cualquier web real).
+4. Vuelve al listado: en menos de 10 segundos (el polling de la página) debería aparecer con estado "Sin datos" y luego, cuando el worker lo compruebe (hasta 10s más), cambiar a "Operativo" con su tiempo de respuesta.
+5. Entra al detalle del monitor: deberías ver la tabla de checks poblándose cada vez que el worker vuelve a comprobarlo (según su intervalo).
+6. Prueba "Pausar", "Editar" (cambia el nombre) y "Borrar".
+7. Recarga la página (F5) estando logueado: no debería pedirte login otra vez (gracias al refresh silencioso).
+
+### Pendiente / notas para más adelante
+- El polling de 10 segundos consume ancho de banda/DB innecesariamente si hay la pestaña abierta mucho tiempo sin cambios — la Fase 2.3 lo sustituye por WebSockets (solo se notifica cuando de verdad cambia algo).
+- El formulario de edición en la vista de detalle solo permite cambiar nombre e intervalo, no `target`/`method`/`headers` — una edición completa reutilizando el formulario de creación es una mejora razonable pero no bloqueante para el MVP.
+- No hay página de "olvidé mi contraseña" ni verificación de email — fuera del alcance de la Fase 1 (README §2.7 solo pide registro/login básico).
+- El diseño visual es funcional pero mínimo (Tailwind con la paleta oscura del README, sin sparklines/gráficos — eso es la Fase 2.4 y Fase 5 de pulido visual).
+
+### Próximo paso (Fase 1.5)
+Alertas por email: al detectar una transición up→down o down→up, enviar un correo al dueño del monitor (Resend/Nodemailer).
