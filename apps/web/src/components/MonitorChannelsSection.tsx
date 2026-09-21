@@ -19,6 +19,7 @@ export function MonitorChannelsSection({ monitorId }: { monitorId: string }) {
   const [channels, setChannels] = useState<ApiNotificationChannel[] | null>(null);
   const [attachedIds, setAttachedIds] = useState<Set<string>>(new Set());
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     const [channelsData, attachedData] = await Promise.all([listChannels(), listMonitorChannelIds(monitorId)]);
@@ -32,6 +33,7 @@ export function MonitorChannelsSection({ monitorId }: { monitorId: string }) {
 
   async function handleToggle(channelId: string, isAttached: boolean): Promise<void> {
     setPendingId(channelId);
+    setError(null);
     try {
       if (isAttached) {
         await detachChannelFromMonitor(monitorId, channelId);
@@ -44,6 +46,8 @@ export function MonitorChannelsSection({ monitorId }: { monitorId: string }) {
         await attachChannelToMonitor(monitorId, channelId);
         setAttachedIds((prev) => new Set(prev).add(channelId));
       }
+    } catch {
+      setError("No se pudo actualizar el canal, inténtalo de nuevo");
     } finally {
       setPendingId(null);
     }
@@ -54,6 +58,7 @@ export function MonitorChannelsSection({ monitorId }: { monitorId: string }) {
   return (
     <div className="mb-6">
       <h2 className="mb-3 text-lg font-medium text-white">Canales de notificación</h2>
+      {error && <p className="mb-2 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
       {channels.length === 0 ? (
         <p className="text-sm text-gray-400">
           Todavía no tienes canales creados.{" "}

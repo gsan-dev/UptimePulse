@@ -9,6 +9,7 @@ import {
   type NotificationChannelType,
   type TestChannelResult,
 } from "../api/channels";
+import { useConfirm } from "../context/ConfirmContext";
 import type { ApiNotificationChannel } from "../api/types";
 
 const inputClass =
@@ -39,6 +40,8 @@ export function NotificationChannelsPage() {
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [testResults, setTestResults] = useState<Record<string, TestChannelResult | "pending">>({});
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const confirm = useConfirm();
 
   const refresh = useCallback(async () => {
     try {
@@ -71,10 +74,25 @@ export function NotificationChannelsPage() {
     }
   }
 
-  async function handleDelete(id: string): Promise<void> {
-    if (!confirm("¿Borrar este canal? Se desactivará en todos los monitores que lo tuvieran activado.")) return;
-    await deleteChannel(id);
-    await refresh();
+  async function handleDelete(id: string, channelName: string): Promise<void> {
+    const confirmed = await confirm({
+      title: `¿Borrar el canal "${channelName}"?`,
+      description: "Se desactivará en todos los monitores que lo tuvieran activado. Esta acción no se puede deshacer.",
+    });
+    if (!confirmed) return;
+
+    setError(null);
+    setDeletingId(id);
+    try {
+      await deleteChannel(id);
+      await refresh();
+    } catch (err) {
+      // Antes este error se perdía en silencio (promesa sin capturar) y el
+      // canal parecía "no borrarse" sin ninguna pista de por qué.
+      setError(err instanceof ApiError ? err.message : "No se pudo borrar el canal");
+    } finally {
+      setDeletingId(null);
+    }
   }
 
   async function handleTest(id: string): Promise<void> {
@@ -197,10 +215,11 @@ export function NotificationChannelsPage() {
                     {result === "pending" ? "Probando…" : "Probar conexión"}
                   </button>
                   <button
-                    onClick={() => void handleDelete(channel.id)}
-                    className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10"
+                    onClick={() => void handleDelete(channel.id, channel.name)}
+                    disabled={deletingId === channel.id}
+                    className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
                   >
-                    Borrar
+                    {deletingId === channel.id ? "Borrando…" : "Borrar"}
                   </button>
                 </div>
               </div>

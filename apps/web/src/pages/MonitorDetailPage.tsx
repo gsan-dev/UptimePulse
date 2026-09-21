@@ -17,6 +17,7 @@ import { MonitorChannelsSection } from "../components/MonitorChannelsSection";
 import { RangeSelector } from "../components/RangeSelector";
 import { ResponseTimeChart } from "../components/ResponseTimeChart";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
+import { useConfirm } from "../context/ConfirmContext";
 import { useRealtime } from "../context/RealtimeContext";
 import { useToast } from "../context/ToastContext";
 
@@ -36,6 +37,7 @@ export function MonitorDetailPage() {
   const navigate = useNavigate();
   const { subscribe } = useRealtime();
   const { showToast } = useToast();
+  const confirm = useConfirm();
   const [monitor, setMonitor] = useState<ApiMonitor | null>(null);
   const [checks, setChecks] = useState<ApiCheck[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -110,14 +112,27 @@ export function MonitorDetailPage() {
 
   async function handleTogglePause(): Promise<void> {
     if (!monitor) return;
-    setMonitor(monitor.isPaused ? await resumeMonitor(monitor.id) : await pauseMonitor(monitor.id));
+    try {
+      setMonitor(monitor.isPaused ? await resumeMonitor(monitor.id) : await pauseMonitor(monitor.id));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "No se pudo pausar/reanudar el monitor");
+    }
   }
 
   async function handleDelete(): Promise<void> {
     if (!monitor) return;
-    if (!confirm(`¿Borrar el monitor "${monitor.name}"? Esta acción no se puede deshacer.`)) return;
-    await deleteMonitor(monitor.id);
-    navigate("/monitors");
+    const confirmed = await confirm({
+      title: `¿Borrar el monitor "${monitor.name}"?`,
+      description: "Se borrarán también su historial de checks e incidentes. Esta acción no se puede deshacer.",
+    });
+    if (!confirmed) return;
+    try {
+      await deleteMonitor(monitor.id);
+      navigate("/monitors");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "No se pudo borrar el monitor");
+    }
   }
 
   async function handleSaveEdit(): Promise<void> {

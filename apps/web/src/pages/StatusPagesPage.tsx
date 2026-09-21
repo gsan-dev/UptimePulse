@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { listMonitors } from "../api/monitors";
 import { createStatusPage, deleteStatusPage, listStatusPages } from "../api/statusPages";
+import { useConfirm } from "../context/ConfirmContext";
 import type { ApiMonitor, ApiStatusPage } from "../api/types";
 
 const inputClass =
@@ -25,6 +26,8 @@ export function StatusPagesPage() {
   const [selectedMonitorIds, setSelectedMonitorIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const confirm = useConfirm();
 
   const refresh = useCallback(async () => {
     const [pagesData, monitorsData] = await Promise.all([listStatusPages(), listMonitors()]);
@@ -62,10 +65,23 @@ export function StatusPagesPage() {
     }
   }
 
-  async function handleDelete(id: string): Promise<void> {
-    if (!confirm("¿Borrar esta status page? La URL pública dejará de funcionar.")) return;
-    await deleteStatusPage(id);
-    await refresh();
+  async function handleDelete(id: string, pageTitle: string): Promise<void> {
+    const confirmed = await confirm({
+      title: `¿Borrar la status page "${pageTitle}"?`,
+      description: "Su URL pública dejará de funcionar inmediatamente. Esta acción no se puede deshacer.",
+    });
+    if (!confirmed) return;
+
+    setError(null);
+    setDeletingId(id);
+    try {
+      await deleteStatusPage(id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "No se pudo borrar la status page");
+    } finally {
+      setDeletingId(null);
+    }
   }
 
   return (
@@ -84,11 +100,15 @@ export function StatusPagesPage() {
         {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
 
         <Field label="Slug (parte de la URL, ej. 'mi-empresa')">
+          {/* En `pattern` el guion va escapado: Chrome compila el patrón con la
+              flag `v`, y ahí un `-` suelto al final de una clase de caracteres
+              es un error de sintaxis — el navegador descartaba el patrón entero
+              (con un error en consola) y dejaba de validar el slug. */}
           <input
             required
             value={slug}
             onChange={(e) => setSlug(e.target.value.toLowerCase())}
-            pattern="[a-z0-9-]+"
+            pattern="[a-z0-9\-]+"
             placeholder="mi-empresa"
             className={inputClass}
           />
@@ -148,10 +168,11 @@ export function StatusPagesPage() {
               </a>
             </div>
             <button
-              onClick={() => void handleDelete(page.id)}
-              className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10"
+              onClick={() => void handleDelete(page.id, page.title)}
+              disabled={deletingId === page.id}
+              className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
             >
-              Borrar
+              {deletingId === page.id ? "Borrando…" : "Borrar"}
             </button>
           </li>
         ))}

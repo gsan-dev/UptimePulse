@@ -1729,3 +1729,199 @@ curl -X POST http://localhost:3000/status-pages -H "Content-Type: application/js
 
 ### Próximo paso (Fase 4)
 Equipos y roles (invitar miembros, admin/editor/solo-lectura aplicado en cada endpoint), diseño de checks multi-región (la pieza más "sistemas distribuidos" del proyecto, requiere un ADR de quorum/consenso antes de implementar), y planes de suscripción con límites reales aplicados.
+
+---
+
+## 2026-09-21 — Bug real reportado por el usuario: "no puedo eliminar los canales de webhooks"
+
+### Objetivo
+El usuario reportó, usando la app de verdad en el navegador: crea un canal de notificación (Discord/webhook) y luego el botón "Borrar" no hace nada. Investigar la causa raíz y corregirla — no solo en el borrado de canales, sino en cualquier sitio donde el mismo patrón pudiera estar fallando.
+
+### Diagnóstico
+Primer paso: reproducir el borrado de un canal directamente contra la API con `curl`, sin pasar por el frontend — **funcionó perfectamente** (`204 No Content`), incluso con el canal activado en un monitor (para descartar un problema de `ON DELETE CASCADE`). Esto descartó de entrada un bug en la lógica de negocio del backend.
+
+Segundo paso, la pregunta clave: *¿qué hace el navegador de forma diferente a un `curl` normal?* Un `fetch()` real desde el frontend manda las cabeceras que `rawFetch()` (`apps/web/src/api/client.ts`) le pone siempre, cabeceras que un `curl -X DELETE ... -H "Authorization: ..."` simple no manda a menos que se le pidan explícitamente. Reproduciendo la petición DELETE con `-H "Content-Type: application/json"` (que es justo lo que `rawFetch` pone en **toda** petición, tenga cuerpo o no):
+
+```
+HTTP/1.1 400 Bad Request
+{"statusCode":400,"code":"FST_ERR_CTP_EMPTY_JSON_BODY","error":"Bad Request","message":"Body cannot be empty when content-type is set to 'application/json'"}
+```
+
+Ahí estaba: Fastify rechaza cualquier petición que declare `Content-Type: application/json` con el cuerpo vacío. `rawFetch` ponía ese header siempre, incluso en peticiones sin `body` (todo `DELETE`, los `POST` de pausar/reanudar, etc.). El error viajaba hasta el frontend, pero como `handleDelete` (y varios manejadores parecidos) no tenían `try/catch`, la excepción se perdía como una promesa rechazada sin capturar — sin mensaje de error, sin nada visible. El botón "Borrar" parecía "no hacer nada" porque, literalmente, nadie estaba escuchando el porqué.
+
+**Alcance real del bug**, comprobado explícitamente uno por uno (no solo por inspección de código): afectaba a **toda** petición sin cuerpo de la aplicación —
+- `DELETE /monitors/:id`, `POST /monitors/:id/pause|resume`
+- `DELETE /notification-channels/:id`, `POST`/`DELETE /monitors/:id/notification-channels/:channelId`
+- `DELETE /status-pages/:id`, `DELETE /monitors/:id/maintenance-windows/:windowId`
+- **`POST /auth/refresh`** — el mecanismo que renueva la sesión cuando caduca el access token (cada 15 minutos). Este es el hallazgo más serio: significa que, en teoría, cualquier sesión activa más de 15 minutos sin recargar la página podía empezar a fallar en cascada (cada petición devolvería 401, el intento de refresh fallaría con este mismo 400, y el usuario se quedaría "desconectado" sin ningún aviso claro).
+
+**Por qué ninguna verificación anterior de esta sesión lo detectó:** todas las pruebas de las Fases 1 a 3 usaron `curl` para verificar los endpoints, y `curl` **no** manda `Content-Type` a menos que se le pida explícitamente (con `-H` o `-d`). Verificar "el endpoint responde bien a una petición limpia" no es lo mismo que verificar "el frontend construye la petición correctamente" — dos preguntas distintas que esta sesión había estado tratando como una sola. Es una lección de proceso, no solo un bug puntual.
+
+### Qué se hizo
+- **`apps/web/src/api/client.ts`**: `rawFetch()` ahora solo pone `Content-Type: application/json` cuando `options.body !== undefined`. Una condición de una línea, pero es la causa raíz de todo lo anterior.
+- **Manejo de errores añadido donde antes se perdían en silencio** (mismo patrón en los cuatro sitios, todos con el mismo defecto: llamar a una función que puede lanzar sin `try/catch` alrededor):
+  - `MonitorDetailPage.tsx`: `handleTogglePause()` y `handleDelete()`.
+  - `NotificationChannelsPage.tsx`: `handleDelete()`.
+  - `StatusPagesPage.tsx`: `handleDelete()`.
+  - `MonitorChannelsSection.tsx`: `handleToggle()` (ya tenía `try/finally`, le faltaba el `catch`).
+
+### Verificación completa
+1. **Backend aislado, sin el bug del frontend de por medio:** `DELETE /notification-channels/:id` vía `curl` sin `Content-Type` → `204`, incluso con el canal activado en un monitor real (para descartar cualquier problema de cascada de borrado).
+2. **Reproducción exacta del bug:** la misma petición, esta vez con `-H "Content-Type: application/json"` (replicando lo que `rawFetch` mandaba antes del fix) → `400 FST_ERR_CTP_EMPTY_JSON_BODY`, confirmado también contra `DELETE /monitors/:id` y `POST /auth/refresh` (no era exclusivo de los canales).
+3. **Corrección aplicada, verificada con una petición `fetch()` real** (Node, mismo motor que un navegador) replicando exactamente la forma corregida de `rawFetch` (sin `Content-Type` cuando no hay `body`):
+   - `DELETE /notification-channels/:id` → `204 No Content`.
+   - `POST /auth/refresh` sin cookie → `401 {"error":"No hay refresh token"}` — el error de *negocio* correcto (falta la cookie), ya no el `400` de *transporte* de antes. Confirma que el mecanismo de renovar sesión, roto para cualquier sesión de más de 15 minutos, ya funciona.
+4. `tsc --noEmit` y `eslint` sobre `apps/web` limpios tras los cambios; `vite build` de producción correcto.
+5. **Limpieza:** todos los usuarios/canales/monitores de prueba usados para reproducir el bug, borrados (los 2 canales reales del usuario — `#general` y `Discord`, creados por él mismo probando la funcionalidad — se dejaron completamente intactos, nunca se tocaron).
+
+No se re-probó individualmente cada una de las rutas afectadas (pause/resume, maintenance-windows, status-pages) porque el bug y su corrección viven en un único punto compartido (`rawFetch`, usado por *todas* las llamadas de `apiFetch`) — probar el mecanismo general con dos casos representativos (un `DELETE` y un `POST`) es suficiente para confirmar la corrección de la causa raíz, no haría falta repetir la misma prueba endpoint por endpoint.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# Antes del fix, esto reproducía el 400 (con el código actual ya no debería):
+curl -i -X DELETE "http://localhost:3000/notification-channels/UN_ID_DE_CANAL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json"
+# Debería dar 204 (o 404 si el canal no existe/no es tuyo), nunca 400 FST_ERR_CTP_EMPTY_JSON_BODY.
+
+# En el navegador: crea un canal en /channels, bórralo con el botón "Borrar".
+# Debería desaparecer de la lista al instante, sin recargar la página.
+```
+
+### Pendiente / notas
+- Ningún otro `handleX` de la aplicación quedó revisado exhaustivamente en busca del mismo patrón (llamar a algo que puede lanzar, sin `try/catch`) — se corrigieron los que tocaban directamente el bug reportado y los que comparten el mismo patrón obvio, no se hizo una auditoría completa de todos los componentes.
+- Lección de proceso anotada para el resto del proyecto: al verificar una funcionalidad que el frontend consume, replicar la forma exacta en que el cliente real construye la petición (cabeceras incluidas), no solo comprobar que el servidor responde bien a una petición "limpia" hecha a mano.
+
+### Próximo paso
+Retomar la Fase 4 (equipos/roles, checks multi-región, planes de suscripción) cuando el usuario confirme que esto queda resuelto.
+
+---
+
+## 2026-09-21 — El botón "Borrar" seguía sin hacer nada: segunda causa, encontrada con un navegador real
+
+### Objetivo
+El usuario reportó *"me sigue ocurriendo el mismo problema"* después de la
+corrección anterior (la del `Content-Type`). Encontrar la causa **real** del
+síntoma "creo un canal y luego no puedo eliminarlo", esta vez sin dar nada por
+supuesto.
+
+### Decisiones
+- **Dejar de verificar solo contra la API.** La corrección anterior se validó
+  con `fetch()`/`curl` contra el backend y era correcta, pero el síntoma
+  persistía: señal inequívoca de que el fallo vivía en el navegador, donde
+  ninguna de las verificaciones hechas hasta ahora llegaba.
+- **Instalar Playwright y conducir un Chromium de verdad** contra la app de
+  desarrollo. Se instaló en el directorio temporal de la sesión, no en el
+  repositorio, para no añadir una dependencia de ~100 MB al proyecto sin
+  haberlo hablado.
+- **Sustituir `window.confirm()` por un diálogo propio** en vez de intentar
+  detectar cuándo falla: un diálogo renderizado por la propia app funciona en
+  todos los entornos por construcción, y además es accesible por teclado.
+- **Añadir una regla de ESLint** que prohíba `confirm`/`alert`/`prompt` en
+  `apps/web`, para que el patrón no pueda reaparecer sin que salte el linter.
+
+### Qué se hizo
+1. **Descartado el backend.** Script que reproduce lo que hace el navegador
+   (preflight CORS `OPTIONS` incluido, que es lo que manda Chrome antes de un
+   `DELETE` con cabecera `Authorization`): preflight `204`, `DELETE` `204`, y
+   el canal desaparecía de verdad de la base de datos. El backend estaba bien.
+2. **Localizada la causa en el cliente.** Los tres borrados empezaban por
+   `if (!confirm("¿Borrar…?")) return;`. `confirm()` es un diálogo del
+   navegador y hay entornos donde no se muestra y devuelve `false` en
+   silencio: el navegador integrado de VS Code (Simple Browser) y otras
+   webviews, Chrome con "impedir que esta página cree más diálogos" marcado,
+   iframes con `sandbox` sin `allow-modals`, pestañas en segundo plano. En
+   esos casos la función salía en su primera línea: sin llamada a la API, sin
+   error, sin rastro en consola.
+3. **Mecanismo demostrado aisladamente**, ejecutando el código viejo tal cual
+   dentro de un navegador con los diálogos bloqueados: `window.confirm()`
+   devuelve `false` → "salió sin hacer nada" → "¿llegó a llamar a la API?:
+   false".
+4. **Corrección:** nuevo `apps/web/src/context/ConfirmContext.tsx`
+   (`ConfirmProvider` + `useConfirm()`, que devuelve una promesa `boolean`),
+   montado en `App.tsx`, y usado en `NotificationChannelsPage`,
+   `StatusPagesPage` y `MonitorDetailPage`. Los botones de borrar muestran
+   "Borrando…" mientras la petición está en vuelo.
+5. **Red de seguridad:** regla `no-restricted-globals` para
+   `confirm`/`alert`/`prompt` en `apps/web`, comprobada con un archivo de
+   prueba que efectivamente la hace fallar (y luego eliminado).
+6. **Bug extra encontrado por el camino.** La prueba con navegador real
+   capturó un error de consola que no era visible de ninguna otra forma:
+   `Pattern attribute value [a-z0-9-]+ is not a valid regular expression`.
+   Chrome compila el `pattern` de un `<input>` con la flag `v`, donde un `-`
+   suelto al final de una clase de caracteres es un error de sintaxis — el
+   navegador descartaba el patrón entero y **el slug de las status pages no se
+   estaba validando en el formulario**. Corregido a `[a-z0-9\-]+`.
+
+### Comandos ejecutados
+```bash
+# Playwright + Chromium, instalados en el directorio temporal de la sesión
+npm install playwright@latest && npx playwright install chromium
+
+node repro-delete.mjs     # backend: preflight OPTIONS + DELETE reales -> 204/204
+node prove-confirm.mjs    # demuestra que confirm() devuelve false sin mostrarse
+node ui-full-test.mjs     # batería completa en Chromium real
+
+npx tsc --noEmit -p apps/web
+npx eslint apps/web/src
+npx vite build
+```
+
+### Verificación completa
+Batería en **Chromium real**, con los diálogos nativos bloqueados (el
+comportamiento del entorno donde le falla al usuario) — **12 de 12 OK**:
+
+| Acción | Resultado |
+|---|---|
+| Registro + login desde la UI | OK |
+| Crear canal | OK |
+| Crear monitor | OK |
+| Abrir detalle del monitor | OK |
+| Activar canal en el monitor (`POST` sin cuerpo) | OK, **comprobado tras recargar** (persistió en la API, no solo en React) |
+| Desactivar canal (`DELETE` sin cuerpo) | OK, comprobado tras recargar |
+| Pausar monitor (`POST` sin cuerpo) | OK |
+| Reanudar monitor (`POST` sin cuerpo) | OK |
+| Crear status page | OK |
+| Borrar status page (`DELETE` + confirmación) | OK |
+| Borrar monitor (`DELETE` + confirmación) | OK |
+| **Borrar canal** (`DELETE` + confirmación) | **OK** |
+
+Además: ningún intento de abrir un `confirm()` nativo, cero errores de
+consola y ninguna respuesta HTTP >= 400 salvo el `401` esperado de
+`/auth/refresh` al cargar la app sin sesión iniciada. `tsc --noEmit`, `eslint`
+y `vite build` limpios. API `{"status":"ok"}`, web dev server `200`, los tres
+contenedores de Docker sanos.
+
+### Limpieza
+Los 5 usuarios y 5 organizaciones de prueba creados durante el diagnóstico,
+eliminados. El monitor y el canal de prueba que quedaron de una ejecución
+fallida se borraron **vía API** (no con `DELETE` en SQL) para que BullMQ
+eliminara también su job scheduler y no quedaran jobs huérfanos en Redis.
+Estado final de la base de datos: 1 usuario (`gdev@outlook.es`), 1
+organización, 2 monitores (`temp-test`, `BlackJack`) y 1 canal — todos del
+usuario, ninguno tocado.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# En el navegador, en /channels: pulsa "Borrar" en un canal.
+# Ahora debe aparecer un diálogo DENTRO de la página (no uno del navegador)
+# y, al confirmar, el canal desaparece de la lista al instante.
+
+# El linter ya impide volver a usar los diálogos nativos:
+npx eslint apps/web/src   # confirm()/alert()/prompt() dan error
+```
+
+### Pendiente / notas
+- Playwright quedó instalado solo en el directorio temporal de la sesión, no
+  en el repositorio. Si se quiere dejar una suite de pruebas end-to-end
+  permanente (recomendable, visto lo visto), hay que añadirlo como
+  `devDependency` y decidir dónde viven los tests — no se hizo por iniciativa
+  propia para no meter una dependencia grande sin hablarlo.
+- La corrección anterior (la del `Content-Type`) sigue siendo necesaria y
+  correcta: arreglaba `/auth/refresh` y el resto de peticiones sin cuerpo.
+  Eran dos bugs distintos con el mismo síntoma visible.
+- Sigue sin revisarse de forma exhaustiva el resto de componentes en busca de
+  otros patrones que fallen en silencio.
+
+### Próximo paso
+Retomar la Fase 4 (equipos/roles, checks multi-región, planes de suscripción).

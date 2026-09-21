@@ -35,7 +35,17 @@ interface RequestOptions extends Omit<RequestInit, "body"> {
 
 async function rawFetch(path: string, options: RequestOptions = {}): Promise<Response> {
   const headers = new Headers(options.headers);
-  headers.set("Content-Type", "application/json");
+  // Solo si de verdad hay cuerpo: Fastify rechaza con 400
+  // (FST_ERR_CTP_EMPTY_JSON_BODY) cualquier petición que declare
+  // "Content-Type: application/json" con el cuerpo vacío — algo que pasaba
+  // en TODAS las peticiones sin body de esta app (DELETE, pause/resume,
+  // attach/detach de canales, /auth/refresh y /auth/logout) porque este
+  // header se ponía siempre, sin comprobar si había algo que enviar. El
+  // fallo llegaba como un 400 silencioso (nada lo mostraba en la UI), lo que
+  // hacía parecer que, por ejemplo, borrar un canal "no hacía nada".
+  if (options.body !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
   if (accessToken) {
     headers.set("Authorization", `Bearer ${accessToken}`);
   }
