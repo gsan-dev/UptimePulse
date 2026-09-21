@@ -57,6 +57,13 @@
       "when": 1789948675318,
       "tag": "0007_ssl_and_notification_channel_name",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789968999306,
+      "tag": "0008_users_username_and_status_page_slug_per_org",
+      "breakpoints": true
     }
   ]
 }

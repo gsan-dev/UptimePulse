@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { listMonitors } from "../api/monitors";
 import { createStatusPage, deleteStatusPage, listStatusPages } from "../api/statusPages";
+import { useAuth } from "../context/AuthContext";
 import { useConfirm } from "../context/ConfirmContext";
 import type { ApiMonitor, ApiStatusPage } from "../api/types";
 
@@ -19,6 +20,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 export function StatusPagesPage() {
+  const { user } = useAuth();
   const [pages, setPages] = useState<ApiStatusPage[] | null>(null);
   const [monitors, setMonitors] = useState<ApiMonitor[]>([]);
   const [slug, setSlug] = useState("");
@@ -93,13 +95,14 @@ export function StatusPagesPage() {
       <h1 className="mt-4 mb-6 text-2xl font-semibold text-white">Status pages públicas</h1>
       <p className="mb-6 text-sm text-gray-400">
         Comparte el estado de los monitores que elijas en una URL pública, sin login, sin exponer el resto de tu
-        cuenta.
+        cuenta. Todas tus páginas cuelgan de tu nombre de usuario (<code>/status/{user?.username}/…</code>), así que
+        el slug solo tiene que ser único entre las tuyas.
       </p>
 
       <form onSubmit={(e) => void handleSubmit(e)} className="mb-8 space-y-4 rounded-xl border border-white/10 bg-white/5 p-6">
         {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
 
-        <Field label="Slug (parte de la URL, ej. 'mi-empresa')">
+        <Field label={`Slug — la URL será /status/${user?.username ?? "…"}/${slug || "mi-empresa"}`}>
           {/* En `pattern` el guion va escapado: Chrome compila el patrón con la
               flag `v`, y ahí un `-` suelto al final de una clase de caracteres
               es un error de sintaxis — el navegador descartaba el patrón entero
@@ -159,12 +162,12 @@ export function StatusPagesPage() {
             <div>
               <p className="font-medium text-white">{page.title}</p>
               <a
-                href={`/status/${page.slug}`}
+                href={`/status/${user?.username}/${page.slug}`}
                 target="_blank"
                 rel="noreferrer"
                 className="text-sm text-emerald-400 hover:underline"
               >
-                /status/{page.slug}
+                /status/{user?.username}/{page.slug}
               </a>
             </div>
             <button

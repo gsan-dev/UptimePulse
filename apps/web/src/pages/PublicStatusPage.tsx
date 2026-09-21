@@ -41,14 +41,16 @@ function DailyHistoryBar({ history }: { history: { date: string; status: DailySt
 // sesión, sin sidebar, sin enlaces a /monitors — una página aislada pensada
 // para compartirse con quien NO tiene cuenta.
 export function PublicStatusPage() {
-  const { slug } = useParams<{ slug: string }>();
+  // /status/:username/:slug — el username delimita el espacio de nombres
+  // (dos usuarios pueden tener el mismo slug), ver ADR en TASK.md.
+  const { username, slug } = useParams<{ username: string; slug: string }>();
   const [data, setData] = useState<PublicStatusPageData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!slug) return;
+    if (!username || !slug) return;
     let cancelled = false;
-    getPublicStatusPage(slug)
+    getPublicStatusPage(username, slug)
       .then((result) => {
         if (!cancelled) setData(result);
       })
@@ -58,7 +60,7 @@ export function PublicStatusPage() {
     return () => {
       cancelled = true;
     };
-  }, [slug]);
+  }, [username, slug]);
 
   if (error) {
     return (

@@ -8,6 +8,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uuid,
 } from "drizzle-orm/pg-core";
 
@@ -46,6 +47,13 @@ export const organizations = pgTable("organizations", {
 export const users = pgTable("users", {
   id: uuid("id").defaultRandom().primaryKey(),
   email: text("email").notNull().unique(),
+  // Identificador público del usuario (minúsculas, números y guiones). Es lo
+  // que aparece en las URLs propias de cada usuario, por ejemplo
+  // /status/<username>/<slug> — así dos usuarios pueden usar el mismo slug
+  // sin pisarse. Los usuarios anteriores a esta columna lo recibieron
+  // derivado de su email (ver migración 0008) y pueden cambiarlo en /me.
+  username: text("username").notNull().unique(),
+  fullName: text("full_name"),
   passwordHash: text("password_hash"),
   oauthProvider: text("oauth_provider"),
   oauthId: text("oauth_id"),
@@ -173,15 +181,22 @@ export const maintenanceWindows = pgTable("maintenance_windows", {
 
 // --- Status pages públicas ---
 
-export const statusPages = pgTable("status_pages", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  organizationId: uuid("organization_id")
-    .notNull()
-    .references(() => organizations.id, { onDelete: "cascade" }),
-  slug: text("slug").notNull().unique(),
-  title: text("title").notNull(),
-  isPublic: boolean("is_public").notNull().default(true),
-});
+export const statusPages = pgTable(
+  "status_pages",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    // Único POR ORGANIZACIÓN, no global: la URL pública lleva delante el
+    // username del dueño (/status/<username>/<slug>), así que "status" puede
+    // existir a la vez para gdev y para gsan sin conflicto.
+    slug: text("slug").notNull(),
+    title: text("title").notNull(),
+    isPublic: boolean("is_public").notNull().default(true),
+  },
+  (table) => [unique("status_pages_organization_id_slug_unique").on(table.organizationId, table.slug)]
+);
 
 export const statusPageMonitors = pgTable(
   "status_page_monitors",

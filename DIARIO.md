@@ -1925,3 +1925,98 @@ npx eslint apps/web/src   # confirm()/alert()/prompt() dan error
 
 ### Próximo paso
 Retomar la Fase 4 (equipos/roles, checks multi-región, planes de suscripción).
+
+---
+
+## 2026-09-21 — Status pages por usuario (`/status/<username>/<slug>`) y registro con más datos
+
+### Objetivo
+Que cada usuario tenga su propio espacio de rutas: dos cuentas pueden crear una
+status page con el mismo slug y cada una vive en `/status/<su-username>/<slug>`.
+Y un formulario de registro que pida más información (nombre, username,
+confirmación de contraseña, organización).
+
+### Decisiones
+Ver la entrada ADR de hoy en TASK.md. Las más importantes: username legible en
+vez de id cifrado; reglas del username en `packages/shared` compartidas por API
+y formulario; slug único **por organización**; ruta antigua eliminada (sería
+ambigua); usuario inexistente y slug inexistente dan el mismo 404; los usuarios
+existentes reciben username desde su email y pueden cambiarlo en `/profile`.
+
+### Qué se hizo
+1. `packages/db`: `users.username` (único) y `users.full_name`; `status_pages`
+   pierde `UNIQUE(slug)` y gana `UNIQUE(organization_id, slug)`. Migración
+   `0008` generada con drizzle-kit y **editada a mano** para añadir la columna
+   nullable, rellenarla para los usuarios existentes (bloque `DO $$` en
+   PL/pgSQL: parte local del email saneada, sufijo numérico si choca) y solo
+   entonces ponerla `NOT NULL`.
+2. `packages/shared/src/username.ts`: regex, longitudes, reservados,
+   `getUsernameError()` / `normalizeUsername()`.
+3. `apps/api`: registro con `username`/`fullName`; login por `identifier`
+   (email o username); `GET /auth/username-available` (rate limit 60/min);
+   `PATCH /me`; status pages con unicidad por organización;
+   `GET /public/status/:username/:slug` (sustituye a `/:slug`).
+4. `apps/web`: `RegisterPage` nueva (disponibilidad en vivo, vista previa de
+   URL, confirmación de contraseña, organización opcional); `LoginPage` acepta
+   email o username; `ProfilePage` nueva en `/profile`; `StatusPagesPage`
+   muestra la URL completa con el username; `PublicStatusPage` lee
+   `:username/:slug`; el dashboard enlaza al perfil con `@username`.
+
+### Comandos ejecutados
+```bash
+cd packages/db && npx drizzle-kit generate --name users_username_and_status_page_slug_per_org
+# (edición manual de migrations/0008_*.sql para el backfill)
+npm run db:migrate
+npx tsc --noEmit -p apps/api && npx tsc --noEmit -p apps/web && npx tsc --noEmit -p apps/worker
+npx eslint apps/web/src apps/api/src packages/shared/src
+npx vite build
+node ui-username-test.mjs     # Chromium real, 14 comprobaciones
+```
+
+### Verificación completa
+- **SQL tras migrar:** `gdev@outlook.es → gdev`, `gsanchezdom@proton.me →
+  gsanchezdom`; índice `status_pages_organization_id_slug_unique` presente y
+  `status_pages_slug_unique` eliminado.
+- **API con curl:** `username-available` → `gdev` ocupado, `Nuevo_Usuario`
+  formato inválido, `admin` reservado, `libre-123` disponible;
+  `/public/status/status` (ruta vieja) → 404; `/public/status/gdev/status` →
+  la página real "Whitebox test"; `/public/status/gsanchezdom/status` y
+  `/public/status/nadie/status` → el mismo 404.
+- **Chromium real (Playwright), 14/14:** validaciones del formulario (formato,
+  ocupado, contraseñas), registro de dos usuarios en sesiones separadas, ambos
+  crean el slug `status` (que además ya tiene gdev), las tres páginas se
+  sirven cada una con su título, un usuario no puede repetir su propio slug,
+  login por username, cambio de username en el perfil actualiza el enlace y
+  la URL vieja pasa a 404, y no se puede robar el username de otro. Sin
+  diálogos nativos, sin errores de consola inesperados.
+- `tsc` en api/web/worker, `eslint` y `vite build`: limpios.
+
+### Limpieza
+4 usuarios y 4 organizaciones de prueba (`e2e-alpha-*`, `e2e-beta-*`, de dos
+ejecuciones) borrados por SQL (sin monitores, así que sin jobs en BullMQ que
+limpiar). Quedan solo las tres cuentas reales del usuario: `gdev`,
+`gsanchezdom` y `gsan-dev` (esta última la creó él mismo con el formulario
+nuevo durante la verificación) con sus dos status pages.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. Tu página de siempre, ahora bajo tu username:
+#    http://localhost:5173/status/gdev/status
+# 2. Regístrate con otra cuenta y crea una status page con slug "status":
+#    te la aceptará y vivirá en /status/<tu-otro-username>/status
+# 3. Entra en /profile y cambia el username: el enlace en /status-pages cambia
+#    al instante y el antiguo deja de funcionar.
+# 4. En /login puedes entrar con "gdev" en vez del email.
+```
+
+### Pendiente / notas
+- **Fase 4.1 (equipos):** la resolución pública asume una organización por
+  usuario. Con varias, el espacio de nombres debería pasar a la organización
+  (`organizations.slug`) — anotado en `public-status.ts` y en el ADR.
+- No hay redirección de URLs antiguas al cambiar el username (decisión
+  consciente; el perfil lo avisa).
+- La cuenta `gsanchezdom` tiene un username derivado del email; si quieres
+  `gsan`, cámbialo desde `/profile` con esa cuenta.
+
+### Próximo paso
+Fase 4 (equipos/roles, multi-región, planes) cuando lo confirmes.

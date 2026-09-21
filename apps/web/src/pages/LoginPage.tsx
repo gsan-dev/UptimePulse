@@ -6,7 +6,7 @@ import { useAuth } from "../context/AuthContext";
 export function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
-  const [email, setEmail] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -16,7 +16,7 @@ export function LoginPage() {
     setError(null);
     setIsSubmitting(true);
     try {
-      await login(email, password);
+      await login(identifier, password);
       navigate("/monitors");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión");
@@ -34,15 +34,16 @@ export function LoginPage() {
         <h1 className="text-xl font-semibold text-white">Iniciar sesión</h1>
         {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
         <div className="space-y-1">
-          <label className="text-sm text-gray-400" htmlFor="email">
-            Email
+          <label className="text-sm text-gray-400" htmlFor="identifier">
+            Email o nombre de usuario
           </label>
           <input
-            id="email"
-            type="email"
+            id="identifier"
+            type="text"
+            autoComplete="username"
             required
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            value={identifier}
+            onChange={(e) => setIdentifier(e.target.value)}
             className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-500"
           />
         </div>

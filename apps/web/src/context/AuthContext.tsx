@@ -1,12 +1,23 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { fetchMe, login as apiLogin, logout as apiLogout, register as apiRegister, silentRefresh } from "../api/auth";
+import {
+  fetchMe,
+  login as apiLogin,
+  logout as apiLogout,
+  register as apiRegister,
+  silentRefresh,
+  updateMe,
+  type RegisterInput,
+  type UpdateProfileInput,
+} from "../api/auth";
 import type { ApiUser } from "../api/types";
 
 interface AuthContextValue {
   user: ApiUser | null;
   isLoading: boolean;
-  login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string) => Promise<void>;
+  /** `identifier` puede ser el email o el nombre de usuario. */
+  login: (identifier: string, password: string) => Promise<void>;
+  register: (input: RegisterInput) => Promise<void>;
+  updateProfile: (input: UpdateProfileInput) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -38,12 +49,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  async function login(email: string, password: string): Promise<void> {
-    setUser(await apiLogin(email, password));
+  async function login(identifier: string, password: string): Promise<void> {
+    setUser(await apiLogin(identifier, password));
   }
 
-  async function register(email: string, password: string): Promise<void> {
-    setUser(await apiRegister(email, password));
+  async function register(input: RegisterInput): Promise<void> {
+    setUser(await apiRegister(input));
+  }
+
+  async function updateProfile(input: UpdateProfileInput): Promise<void> {
+    setUser(await updateMe(input));
   }
 
   async function logout(): Promise<void> {
@@ -51,7 +66,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setUser(null);
   }
 
-  return <AuthContext.Provider value={{ user, isLoading, login, register, logout }}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={{ user, isLoading, login, register, updateProfile, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
 }
 
 export function useAuth(): AuthContextValue {

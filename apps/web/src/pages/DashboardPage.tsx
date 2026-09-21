@@ -53,7 +53,12 @@ export function DashboardPage() {
       <header className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-white">Monitores</h1>
-          <p className="text-sm text-gray-400">{user?.email}</p>
+          <p className="text-sm text-gray-400">
+            {user?.fullName ?? user?.email}{" "}
+            <Link to="/profile" className="text-gray-500 hover:text-emerald-400">
+              @{user?.username}
+            </Link>
+          </p>
         </div>
         <div className="flex gap-3">
           <Link

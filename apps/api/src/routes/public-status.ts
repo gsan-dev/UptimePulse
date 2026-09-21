@@ -1,10 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
-import { checks, db, monitors, statusPageMonitors, statusPages } from "@uptimepulse/db";
+import { checks, db, monitors, organizationMembers, statusPageMonitors, statusPages, users } from "@uptimepulse/db";
+import { normalizeUsername } from "@uptimepulse/shared";
 import { getMonitorDailyHistory, getMonitorMetrics } from "../lib/metrics.js";
 
-const slugParamSchema = z.object({ slug: z.string().min(1).max(60) });
+const paramsSchema = z.object({
+  username: z.string().min(1).max(60),
+  slug: z.string().min(1).max(60),
+});
 
 const HISTORY_DAYS = 90;
 
@@ -27,17 +31,39 @@ async function getLastCheckStatus(monitorId: string): Promise<"up" | "down" | nu
  * único endpoint de toda la API alcanzable sin JWT.
  */
 export async function publicStatusRoutes(app: FastifyInstance): Promise<void> {
+  // La URL pública es /status/<username>/<slug>: el username delimita el
+  // espacio de nombres, así que el mismo slug puede existir para varios
+  // usuarios. Se resuelve username -> usuario -> su organización principal
+  // (misma simplificación que getPrimaryOrganizationId: una organización por
+  // usuario hasta la Fase 4) -> status page con ese slug en esa organización.
+  // Un username inexistente y un slug inexistente responden IGUAL (404 sin
+  // distinguir) para no permitir enumerar qué usernames existen desde fuera.
   app.get(
-    "/public/status/:slug",
+    "/public/status/:username/:slug",
     { config: { rateLimit: { max: 30, timeWindow: "1 minute" } } },
     async (request, reply) => {
-      const parsedParams = slugParamSchema.safeParse(request.params);
+      const parsedParams = paramsSchema.safeParse(request.params);
       if (!parsedParams.success) {
-        return reply.code(400).send({ error: "slug inválido" });
+        return reply.code(400).send({ error: "URL inválida" });
+      }
+      const username = normalizeUsername(parsedParams.data.username);
+
+      const [owner] = await db
+        .select({ organizationId: organizationMembers.organizationId })
+        .from(users)
+        .innerJoin(organizationMembers, eq(organizationMembers.userId, users.id))
+        .where(eq(users.username, username))
+        .limit(1);
+      if (!owner) {
+        return reply.code(404).send({ error: "Página no encontrada" });
       }
 
       const page = await db.query.statusPages.findFirst({
-        where: and(eq(statusPages.slug, parsedParams.data.slug), eq(statusPages.isPublic, true)),
+        where: and(
+          eq(statusPages.organizationId, owner.organizationId),
+          eq(statusPages.slug, parsedParams.data.slug),
+          eq(statusPages.isPublic, true)
+        ),
       });
       if (!page) {
         return reply.code(404).send({ error: "Página no encontrada" });

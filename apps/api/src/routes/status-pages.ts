@@ -68,9 +68,14 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(403).send({ error: "El usuario no pertenece a ninguna organización" });
     }
 
-    const existing = await db.query.statusPages.findFirst({ where: eq(statusPages.slug, parsed.data.slug) });
+    // El slug solo tiene que ser único dentro de ESTA organización: la URL
+    // pública lleva delante el username del dueño (/status/<username>/<slug>),
+    // así que otro usuario puede tener exactamente el mismo slug.
+    const existing = await db.query.statusPages.findFirst({
+      where: and(eq(statusPages.organizationId, organizationId), eq(statusPages.slug, parsed.data.slug)),
+    });
     if (existing) {
-      return reply.code(409).send({ error: "Ese slug ya está en uso, prueba con otro" });
+      return reply.code(409).send({ error: "Ya tienes una status page con ese slug, prueba con otro" });
     }
 
     const ownedMonitorIds = await filterOwnedMonitorIds(organizationId, parsed.data.monitorIds);

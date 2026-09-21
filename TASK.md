@@ -167,8 +167,8 @@ Con 2.1 a 2.4 cerrados, UptimePulse pasó de los enfoques deliberadamente simple
 
 ### 3.3 Status pages públicas ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
 - [x] Modelo ya creado en Fase 0 (`status_pages`, `status_page_monitors`) — sin migración nueva, solo empezar a usarlo.
-- [x] **(ADR)** Enrutado: ruta bajo el dominio propio (`/status/:slug`), no subdominio — ver ADR completo en TASK.md.
-- [x] Endpoint público (sin auth) que sirve el estado agregado de los monitores marcados como visibles (`GET /public/status/:slug`), sin exponer `target` ni ningún otro dato de la cuenta.
+- [x] **(ADR)** Enrutado: ruta bajo el dominio propio (`/status/:slug`), no subdominio — ver ADR completo en TASK.md. **Actualizado 2026-09-21:** la ruta pasó a `/status/:username/:slug` (espacio de nombres por usuario, ver ADR al final).
+- [x] Endpoint público (sin auth) que sirve el estado agregado de los monitores marcados como visibles (`GET /public/status/:slug`, **desde 2026-09-21 `GET /public/status/:username/:slug`**), sin exponer `target` ni ningún otro dato de la cuenta.
 - [x] Frontend: layout completamente distinto (`PublicStatusPage.tsx`, sin sidebar ni cabecera de sesión), con banner de estado general y barras de histórico de 90 días por servicio (estilo Stripe/GitHub Status), agregadas sobre `checks_hourly` día a día.
 - [x] Rate limiting de este endpoint público (`@fastify/rate-limit`, 30 peticiones/minuto, el único endpoint de toda la API sin JWT).
 - **Hecho cuando:** una URL pública muestra el estado de los monitores seleccionados sin requerir login y sin exponer datos de otros monitores de la cuenta. **Verificado con peticiones HTTP reales sin ningún header de autenticación:** `GET /public/status/:slug` devolvió el título, estado general y el histórico de 90 días del monitor incluido — confirmado que la respuesta **no contiene el campo `target`** (grep sobre el JSON). Una página con `isPublic: false` no es accesible por esta ruta (filtrada en la propia consulta SQL). Un slug inexistente devuelve 404. El límite de 30 peticiones/minuto se disparó de verdad tras una ráfaga de 35 peticiones seguidas (las últimas 8 devolvieron 429), confirmado con las cabeceras `X-RateLimit-*` de la respuesta.
@@ -602,3 +602,72 @@ solo queda verificado si se ejecuta **en un navegador real**, porque hay fallos
 que viven enteros en el lado del cliente y son invisibles desde `curl`. A
 partir de aquí, cualquier funcionalidad con interfaz se comprueba también con
 Playwright, no solo con peticiones a la API.
+
+### 2026-09-21 — Status pages con espacio de nombres por usuario (`/status/:username/:slug`) y registro completo
+**Pedido por el usuario:** que los slugs de las status pages sean independientes
+por usuario (dos usuarios pueden tener el mismo slug y cada uno lo ve en su
+propia ruta, `/status/gdev/status` y `/status/gsan/status`), y que el registro
+pida más información.
+
+**Decisiones:**
+- **Username como espacio de nombres, no un id cifrado.** El usuario lo
+  proponía como alternativa; se descartó porque una URL con un id opaco no
+  es legible ni memorable, y el objetivo de una status page es compartirla.
+  El username es público por definición (aparece en la URL), así que no se
+  filtra nada que no se fuera a mostrar igualmente.
+- **Nueva columna `users.username`** (única, minúsculas, `[a-z0-9]` con
+  guiones internos, 3–30 caracteres, lista corta de nombres reservados) y
+  `users.full_name`. Las reglas viven en `packages/shared/src/username.ts`
+  y las usan **a la vez** la API (validación real, zod `superRefine`) y el
+  formulario (aviso inmediato) — una sola fuente de verdad, imposible que el
+  navegador acepte lo que la API rechaza.
+- **Migración 0008 con backfill:** los usuarios que ya existían reciben el
+  username derivado de la parte local de su email (`gdev@outlook.es` →
+  `gdev`), con sufijo numérico si chocara. Por eso existe `PATCH /me` y la
+  página `/profile`: quien no eligió su username puede cambiarlo. El
+  formulario avisa de que cambiarlo cambia la URL de todas sus status pages
+  (los enlaces antiguos dejan de funcionar; no se guardan redirecciones —
+  decisión consciente para no complicar el modelo por ahora).
+- **Unicidad del slug: `UNIQUE (organization_id, slug)`** en vez de global.
+  La resolución pública es username → usuario → **organización principal**
+  (misma simplificación que `getPrimaryOrganizationId`) → página. **Aviso
+  para la Fase 4.1 (equipos):** cuando un usuario pueda estar en varias
+  organizaciones, el espacio de nombres tendrá que moverse a la organización
+  (un `organizations.slug`) o la ruta deberá decidir qué organización del
+  usuario mostrar. Está anotado en el propio código.
+- **Ruta antigua `/public/status/:slug` eliminada**, no mantenida en
+  paralelo: con slugs repetibles entre usuarios ya no identifica una página
+  de forma única, así que sería ambigua. Los enlaces antiguos (`/status/status`)
+  dejan de funcionar; la única página existente pasa a `/status/gdev/status`.
+- **Username inexistente y slug inexistente responden el mismo 404** para que
+  la ruta pública no sirva para enumerar qué usernames existen. El endpoint
+  `GET /auth/username-available` sí lo revela (es su función, como en
+  cualquier formulario de registro), y por eso lleva su propio rate limit
+  (60/min) como único otro endpoint sin JWT que consulta la base de datos.
+- **Login por email o username** (`identifier` en vez de `email`): si el
+  username es la identidad pública del usuario, es natural poder entrar con
+  él.
+- **Formulario de registro:** nombre completo, username (con `@` delante,
+  comprobación de disponibilidad en vivo con 400 ms de retardo y vista previa
+  de la URL resultante), email, contraseña + confirmación, nombre de la
+  organización (opcional; por defecto "Organización de <nombre>"). El botón se
+  deshabilita mientras el username sea inválido/ocupado o las contraseñas no
+  coincidan. Si la comprobación en vivo falla (red, rate limit) el formulario
+  **no** se bloquea: la API vuelve a validar al enviar.
+
+**Verificación (Chromium real vía Playwright, 14/14 OK, sin diálogos nativos
+ni errores inesperados):** username con espacios deshabilita el botón ·
+username `gdev` (ocupado) avisa · contraseñas distintas avisan · registro
+completo de A desde la UI · A crea la página `status` (el mismo slug que ya
+tiene gdev) · `/status/<A>/status` la sirve · registro de B en otra sesión ·
+B crea `status` también · B no puede repetir su propio slug (409 con mensaje
+visible) · **las tres páginas `status` (gdev, A, B) sirven cada una su
+contenido** · login con username en sesión nueva · A cambia su username en
+`/profile` y el enlace de su status page cambia · A no puede coger el
+username de B (409 visible) · URL nueva de A funciona y la antigua da 404.
+Además, contra la API directamente: ruta antigua → 404; usuario desconocido
+y "mismo slug en otro usuario" → 404 idénticos. `tsc` (api, web, worker),
+`eslint` y `vite build` limpios. Migración aplicada con `db:migrate`;
+backfill comprobado en SQL (`gdev`, `gsanchezdom`). Datos de prueba
+eliminados; los tres usuarios reales (incluida la cuenta `@gsan-dev` que el
+usuario creó con el formulario nuevo mientras se verificaba) intactos.

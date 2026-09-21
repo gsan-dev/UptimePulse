@@ -21,8 +21,10 @@ export interface PublicStatusPageData {
   monitors: PublicStatusMonitor[];
 }
 
-export async function getPublicStatusPage(slug: string): Promise<PublicStatusPageData> {
-  const response = await fetch(`${API_BASE}/public/status/${encodeURIComponent(slug)}`);
+export async function getPublicStatusPage(username: string, slug: string): Promise<PublicStatusPageData> {
+  const response = await fetch(
+    `${API_BASE}/public/status/${encodeURIComponent(username)}/${encodeURIComponent(slug)}`
+  );
   const data = await response.json();
   if (!response.ok) {
     throw new Error((data as { error?: string })?.error ?? `Error ${response.status}`);
