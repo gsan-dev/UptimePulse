@@ -2,6 +2,7 @@ import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepuls
 import { createLogger } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { runHttpCheck } from "./http-check.js";
+import { runPingCheck } from "./ping-check.js";
 import { runTcpCheck } from "./tcp-check.js";
 import type { CheckOutcome } from "./types.js";
 
@@ -44,16 +45,7 @@ async function runSingleAttempt(monitor: MonitorToCheck): Promise<CheckOutcome> 
   if (monitor.type === "tcp") {
     return runTcpCheck({ target: monitor.target, timeoutMs: monitor.timeoutMs });
   }
-  // ping: pendiente (requiere ICMP real o invocar el "ping" del sistema
-  // operativo; ver nota en DIARIO.md/TASK.md, Fase 1.3). De momento se
-  // registra como "down" con un mensaje explícito en vez de fallar en
-  // silencio o fingir que funciona.
-  return {
-    status: "down",
-    responseTimeMs: null,
-    httpStatus: null,
-    errorMessage: "Los checks de tipo 'ping' todavía no están implementados",
-  };
+  return runPingCheck({ target: monitor.target, timeoutMs: monitor.timeoutMs });
 }
 
 /**

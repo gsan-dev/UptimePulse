@@ -2301,3 +2301,86 @@ curl -s http://localhost:3000/plans | python -m json.tool
 ### Próximo paso
 Fase 5 (seguridad, observabilidad, tests, CI/CD, documentación final).
 `PROGRESO-FASE4.md` se elimina: todo su contenido está ya en TASK.md y aquí.
+
+---
+
+## 2026-09-21 — Checks de tipo `ping` (ICMP) implementados en el worker
+
+### Objetivo
+Cerrar el pendiente de la Fase 1.3: los monitores `ping` se guardaban
+siempre como `down` con "todavía no están implementados". Ahora se ejecuta
+un echo ICMP real.
+
+### Decisiones
+Ver ADR "Checks `ping`" en TASK.md: se invoca el `ping` del sistema con
+`execFile` (sin shell), `up` solo si la salida trae `TTL=` o `time=`/
+`tiempo=`, latencia la que imprime `ping`, y validación estricta del
+target (`isValidPingTarget`, compartida por API y worker).
+
+### Qué se hizo
+1. **Worker:** `apps/worker/src/lib/ping-check.ts` (nuevo) con argumentos
+   por plataforma, timeout del proceso = timeout del monitor + 2 s, y
+   mensajes normalizados ("No se pudo resolver el nombre de dominio (DNS)",
+   "Host inalcanzable", "Sin respuesta ICMP en Nms", "Timeout…").
+   `run-check.ts` lo usa en lugar del stub; mantiene los 3 reintentos.
+2. **server-utils:** `isValidPingTarget(target)` en `target.ts` (IP v4/v6
+   o hostname RFC 1123; nunca algo que empiece por `-`).
+3. **API:** `pingMonitorSchema.target` pasa de `min(1)` a
+   `trim().refine(isValidPingTarget)` → 400 "Indica solo el host o la IP
+   (sin http://, ruta ni puerto)".
+4. **Web:** la opción del formulario pasa de "Ping (el worker todavía no lo
+   ejecuta…)" a "Ping (ICMP)" y la etiqueta del campo a "Host o IP".
+
+### Comandos ejecutados
+```bash
+ping -n 1 -w 3000 1.1.1.1 ; ping -n 1 -w 1000 192.0.2.1 ; ping -n 1 -w 2000 ::1   # ver formato real
+npx tsc --noEmit -p packages/server-utils && npx tsc --noEmit -p apps/worker && npx tsc --noEmit -p apps/api && npx tsc --noEmit -p apps/web
+npx eslint packages/server-utils/src apps/worker/src apps/api/src/routes/monitors.ts apps/web/src/pages/NewMonitorPage.tsx
+npx tsx ping-unit.mts    # 7 casos llamando a runPingCheck directamente
+node ping-test.mjs       # 8 comprobaciones API → cola → worker → BD
+node ui-ping-test.mjs    # 6 comprobaciones en Chromium
+```
+
+### Verificación completa
+- **`runPingCheck` directo (7/7):** `1.1.1.1` → up 15 ms · `::1` → up 1 ms
+  (IPv6 sin TTL en Windows) · `2606:4700:4700::1111` sin ruta IPv6 → down
+  "Host inalcanzable" (exit 0, por eso no vale el exit code) · dominio
+  `.invalid` → "No se pudo resolver el nombre de dominio (DNS)" · `198.51.100.1`
+  → "Sin respuesta ICMP en 2000ms" · `-c 999 1.1.1.1` y `1.1.1.1:53` →
+  rechazados sin ejecutar nada.
+- **API + worker real (8/8):** `http://1.1.1.1`, `1.1.1.1:53`, `-c 999 …`,
+  `1.1.1.1; whoami` → 400 · `127.0.0.1` → 422 anti-SSRF · 1.1.1.1 → check
+  `up` con `responseTimeMs=19` · 198.51.100.1 → `down` "Sin respuesta ICMP
+  en 3000ms" (≈3 s por intento × 3) e incidente abierto con esa causa ·
+  `consolidatedStatus` y `regions` correctos · lista `{"ping-up":"up",
+  "ping-down":"down"}`.
+- **Chromium (6/6):** opción "Ping (ICMP)" y etiqueta "Host o IP" · target
+  con esquema → error de validación visible · monitor creado desde el
+  formulario → "Operativo" en la lista por WebSocket sin recargar · detalle
+  "PING · 1.1.1.1", 81 ms, gráfico y tabla de checks (captura).
+- `tsc` ×4, `eslint`: limpios. La API no recargó sola el cambio en
+  `routes/monitors.ts` (watcher de tsx parado); se reinició a mano.
+
+### Limpieza
+Monitores de prueba borrados vía API (0 schedulers huérfanos: 3 = tus 3
+monitores); usuarios `e2e-ping-*`/`e2e-pingui-*` (6) y sus organizaciones
+borrados en SQL. Quedan tu usuario, 1 organización y 3 monitores.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# En /monitors/new: tipo "Ping (ICMP)", host 1.1.1.1 → "Operativo" en segundos.
+# Con host 198.51.100.1 (TEST-NET-2, nunca responde) → "Caído" tras ~12 s
+# (3 intentos × timeout) y un incidente "Sin respuesta ICMP en 5000ms".
+```
+
+### Pendiente / notas
+- Verificado solo en Windows; en Linux/macOS los argumentos siguen la
+  documentación de `ping` (Linux `-W` en segundos) pero no se ha ejecutado.
+- En contenedores mínimos (`node:alpine`/distroless) `ping` puede no
+  existir: el check devuelve "El comando 'ping' no está disponible en el
+  worker". Instalar `iputils-ping` en la imagen del worker.
+- `ping` de Windows ignora `-w` para la resolución DNS; por eso el timeout
+  del proceso lleva 2 s de margen.
+
+### Próximo paso
+Commit de todo lo pendiente y Fase 5.

@@ -83,7 +83,7 @@ Objetivo: un usuario se registra, crea un monitor HTTP, un worker lo comprueba c
 - **Hecho cuando:** puedes crear/editar/pausar/borrar un monitor vía API y un intento de monitorizar `http://localhost` o `http://169.254.169.254` es rechazado con un error claro. **Verificado con 19 pruebas HTTP reales**, incluyendo: creación válida, bloqueo de `localhost`/`169.254.169.254`/IP privada literal/dominio TCP privado, bloqueo por **resolución DNS real** (`localtest.me` → `127.0.0.1`, no solo coincidencia de texto), límite de intervalo mínimo del plan, límite máximo de 5 monitores, aislamiento entre organizaciones (usuario B no puede ver ni listar monitores de A, 404 sin filtrar datos), y ciclo de vida completo (crear/leer/listar/editar/pausar/reanudar/borrar).
 
 ### 1.3 Worker simple (checks HTTP) ✅ (2026-09-20, ver [DIARIO.md](DIARIO.md))
-- [x] Proceso independiente (`apps/worker`) que cada X segundos consulta monitores activos cuyo próximo check toque. Implementado también para **TCP**, no solo HTTP (el tipo `ping` queda pendiente, ver nota).
+- [x] Proceso independiente (`apps/worker`) que cada X segundos consulta monitores activos cuyo próximo check toque. Implementado también para **TCP**, no solo HTTP. El tipo **`ping` (ICMP)** quedó pendiente en su día y se completó el 2026-09-21 invocando el `ping` del sistema (ver ADR abajo): verificado con 1.1.1.1 → `up` con la latencia real del echo (19 ms), 198.51.100.1 → `down` "Sin respuesta ICMP en 3000ms" con incidente abierto, y desde el formulario en Chromium.
 - [x] Ejecuta el request con timeout configurado, guarda el resultado en `checks`.
 - [x] Reintentos antes de marcar como "down" (hasta 3 intentos con 1s de espera) para evitar falsos positivos (README §2.2).
 - [x] Manejo de errores de red distinto de errores de código de estado (timeout vs. status inesperado vs. DNS failure vs. conexión rechazada) — guardado en `error_message` con un mensaje distinto para cada caso.
@@ -831,3 +831,31 @@ bajar, y una página de precios que lee los planes del backend.
   hardcodeado: cambiar un límite en `plans` cambia la página.
 - Se eliminó el plan `free-manual` que quedaba de la verificación manual de
   la Fase 1.2 (documentada en DIARIO.md); ninguna organización lo usaba.
+
+### 2026-09-21 — Checks `ping`: se invoca el `ping` del sistema, no ICMP nativo
+**Decisión:** el worker ejecuta el binario `ping` del sistema operativo
+(`execFile`, sin shell) con un único echo y el timeout del monitor, y decide
+`up`/`down` parseando la salida, no por el exit code.
+
+**Por qué:** un echo ICMP desde Node necesita sockets raw (root/CAP_NET_RAW
+en Linux, administrador en Windows) o una dependencia nativa que compilar
+en cada plataforma; el binario `ping` ya es setuid/privilegiado donde hace
+falta y existe en cualquier imagen base. El exit code no sirve: en Windows
+un "Host de destino inaccesible" enviado por el propio router devuelve 0,
+igual que "error en la transmisión" cuando no hay ruta IPv6. Solo una
+respuesta de echo real trae `TTL=` (IPv4) o `time=`/`tiempo=` (Windows no
+imprime TTL en IPv6), así que ese es el criterio de `up`; la latencia que
+se guarda es la que imprime `ping`, no la del proceso.
+
+**Seguridad:** como el target del usuario acaba siendo un argumento de un
+proceso, `isValidPingTarget` (en `packages/server-utils`) solo admite una IP
+(v4/v6, `net.isIP`) o un hostname RFC 1123 y rechaza todo lo que empiece por
+`-`; lo aplican la API al crear/editar (400) y el worker justo antes de
+ejecutar (defensa en profundidad). Sin shell no hay expansión de `;`, `|`
+ni comillas. El anti-SSRF de siempre sigue delante (127.0.0.1 → 422).
+
+**Plataformas:** `-n 1 -w <ms>` en Windows, `-c 1 -W <s>` en Linux (segundos
+enteros, redondeando hacia arriba), `-c 1 -W <ms>` en macOS. Mensajes de
+error normalizados (DNS, inalcanzable, sin respuesta) a partir de la salida
+en inglés y en español. Verificado solo en Windows en esta sesión; Linux y
+macOS por la documentación de sus `ping` (queda anotado en TODO.md).

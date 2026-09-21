@@ -2,7 +2,12 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { eq, and, or, isNull, inArray, desc, sql } from "drizzle-orm";
 import { z } from "zod";
 import { checks, db, incidents, maintenanceWindows, monitorNotificationChannels, monitors, notificationChannels } from "@uptimepulse/db";
-import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepulse/server-utils";
+import {
+  assertPublicHost,
+  extractHostname,
+  isValidPingTarget,
+  SsrfBlockedError,
+} from "@uptimepulse/server-utils";
 import { env } from "../env.js";
 import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
 import { countOrganizationMonitors, getOrganizationPlanLimits } from "../lib/plans.js";
@@ -40,7 +45,11 @@ const tcpMonitorSchema = z.object({
 const pingMonitorSchema = z.object({
   ...baseFields,
   type: z.literal("ping"),
-  target: z.string().min(1),
+  // Host o IP sin esquema ni puerto (se pasa tal cual al `ping` del sistema).
+  target: z
+    .string()
+    .trim()
+    .refine(isValidPingTarget, "Indica solo el host o la IP (sin http://, ruta ni puerto)"),
 });
 
 const createMonitorSchema = z.discriminatedUnion("type", [

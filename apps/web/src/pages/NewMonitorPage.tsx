@@ -75,11 +75,11 @@ export function NewMonitorPage() {
           >
             <option value="http">HTTP</option>
             <option value="tcp">TCP</option>
-            <option value="ping">Ping (el worker todavía no lo ejecuta, ver TASK.md)</option>
+            <option value="ping">Ping (ICMP)</option>
           </select>
         </Field>
 
-        <Field label={type === "tcp" ? "Host:puerto" : "URL / host"}>
+        <Field label={type === "tcp" ? "Host:puerto" : type === "ping" ? "Host o IP" : "URL"}>
           <input
             required
             value={target}
