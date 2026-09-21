@@ -1,11 +1,16 @@
 import { useState, type FormEvent } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { useAuth } from "../context/AuthContext";
 
 export function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  // Solo rutas internas: evita que un enlace externo use ?next= para
+  // redirigir a otro dominio tras el login.
+  const rawNext = searchParams.get("next");
+  const next = rawNext && rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/monitors";
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -17,7 +22,7 @@ export function LoginPage() {
     setIsSubmitting(true);
     try {
       await login(identifier, password);
-      navigate("/monitors");
+      navigate(next);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión");
     } finally {
@@ -69,7 +74,7 @@ export function LoginPage() {
         </button>
         <p className="text-center text-sm text-gray-400">
           ¿No tienes cuenta?{" "}
-          <Link to="/register" className="text-emerald-400 hover:underline">
+          <Link to={rawNext ? `/register?next=${encodeURIComponent(next)}` : "/register"} className="text-emerald-400 hover:underline">
             Regístrate
           </Link>
         </p>

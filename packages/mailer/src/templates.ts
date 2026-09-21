@@ -60,3 +60,38 @@ function escapeHtml(value: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 }
+
+export interface InvitationForEmail {
+  organizationName: string;
+  invitedByName: string;
+  role: string;
+  acceptUrl: string;
+  expiresAt: Date;
+}
+
+const ROLE_LABEL: Record<string, string> = {
+  admin: "administrador",
+  editor: "editor",
+  readonly: "solo lectura",
+};
+
+export function organizationInvitationEmail(invitation: InvitationForEmail): EmailContent {
+  const role = ROLE_LABEL[invitation.role] ?? invitation.role;
+  const expires = invitation.expiresAt.toLocaleDateString("es-ES", { day: "numeric", month: "long", year: "numeric" });
+  return {
+    subject: `${invitation.invitedByName} te invita a "${invitation.organizationName}" en UptimePulse`,
+    text: [
+      `${invitation.invitedByName} te ha invitado a unirte a la organización "${invitation.organizationName}" en UptimePulse con rol de ${role}.`,
+      "",
+      `Acepta la invitación aquí: ${invitation.acceptUrl}`,
+      "",
+      `El enlace caduca el ${expires}. Si no esperabas esta invitación, ignora este mensaje.`,
+    ].join("\n"),
+    html: `
+      <p><strong>${invitation.invitedByName}</strong> te ha invitado a unirte a la organización
+      <strong>${invitation.organizationName}</strong> en UptimePulse con rol de <strong>${role}</strong>.</p>
+      <p><a href="${invitation.acceptUrl}">Aceptar la invitación</a></p>
+      <p style="color:#666;font-size:12px">El enlace caduca el ${expires}. Si no esperabas esta invitación, ignora este mensaje.</p>
+    `,
+  };
+}

@@ -12,12 +12,20 @@ import {
   resumeMonitor,
   updateMonitor,
 } from "../api/monitors";
-import type { ApiCheck, ApiIncident, ApiMonitor, ApiMonitorMetrics, ApiTimeseriesPoint, UptimeRange } from "../api/types";
+import type {
+  ApiCheck,
+  ApiIncident,
+  ApiMonitorDetail,
+  ApiMonitorMetrics,
+  ApiTimeseriesPoint,
+  UptimeRange,
+} from "../api/types";
 import { MonitorChannelsSection } from "../components/MonitorChannelsSection";
 import { RangeSelector } from "../components/RangeSelector";
 import { ResponseTimeChart } from "../components/ResponseTimeChart";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
 import { useConfirm } from "../context/ConfirmContext";
+import { useOrganization } from "../context/OrganizationContext";
 import { useRealtime } from "../context/RealtimeContext";
 import { useToast } from "../context/ToastContext";
 
@@ -38,7 +46,8 @@ export function MonitorDetailPage() {
   const { subscribe } = useRealtime();
   const { showToast } = useToast();
   const confirm = useConfirm();
-  const [monitor, setMonitor] = useState<ApiMonitor | null>(null);
+  const { canEdit } = useOrganization();
+  const [monitor, setMonitor] = useState<ApiMonitorDetail | null>(null);
   const [checks, setChecks] = useState<ApiCheck[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
@@ -52,7 +61,10 @@ export function MonitorDetailPage() {
   const refresh = useCallback(async () => {
     if (!id) return;
     try {
-      const [monitorData, checksData] = await Promise.all([getMonitor(id), listMonitorChecks(id, CHECKS_LIMIT)]);
+      const [monitorData, checksData] = await Promise.all([
+        getMonitor(id),
+        listMonitorChecks(id, CHECKS_LIMIT),
+      ]);
       setMonitor(monitorData);
       setChecks(checksData);
       setError(null);
@@ -97,7 +109,13 @@ export function MonitorDetailPage() {
       void refresh();
       void refreshRangeData();
       showToast(
-        `${event.name} ahora está ${event.status === "up" ? "operativo ✅" : "caído 🔴"}`,
+        `${event.name} ahora está ${
+          event.status === "up"
+            ? "operativo ✅"
+            : event.status === "degraded"
+              ? `degradado 🟡 (caído desde ${event.downRegions.join(", ")})`
+              : "caído 🔴"
+        }`,
         event.status
       );
     });
@@ -113,7 +131,10 @@ export function MonitorDetailPage() {
   async function handleTogglePause(): Promise<void> {
     if (!monitor) return;
     try {
-      setMonitor(monitor.isPaused ? await resumeMonitor(monitor.id) : await pauseMonitor(monitor.id));
+      const updated = monitor.isPaused
+        ? await resumeMonitor(monitor.id)
+        : await pauseMonitor(monitor.id);
+      setMonitor({ ...updated, regions: monitor.regions });
       setError(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo pausar/reanudar el monitor");
@@ -124,7 +145,8 @@ export function MonitorDetailPage() {
     if (!monitor) return;
     const confirmed = await confirm({
       title: `¿Borrar el monitor "${monitor.name}"?`,
-      description: "Se borrarán también su historial de checks e incidentes. Esta acción no se puede deshacer.",
+      description:
+        "Se borrarán también su historial de checks e incidentes. Esta acción no se puede deshacer.",
     });
     if (!confirmed) return;
     try {
@@ -138,7 +160,11 @@ export function MonitorDetailPage() {
   async function handleSaveEdit(): Promise<void> {
     if (!monitor) return;
     try {
-      setMonitor(await updateMonitor(monitor.id, { name: editName, intervalSeconds: editInterval }));
+      const updated = await updateMonitor(monitor.id, {
+        name: editName,
+        intervalSeconds: editInterval,
+      });
+      setMonitor({ ...updated, regions: monitor.regions });
       setIsEditing(false);
       setError(null);
     } catch (err) {
@@ -177,16 +203,44 @@ export function MonitorDetailPage() {
         <StatusBadge status={monitorDisplayStatus(monitor)} />
       </header>
 
-      {error && <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
+      {error && (
+        <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>
+      )}
 
       <div className="mb-6 grid grid-cols-3 gap-4">
         <Stat label="Intervalo" value={`${monitor.intervalSeconds}s`} />
         <Stat label="Timeout" value={`${monitor.timeoutMs}ms`} />
         <Stat
           label="Último tiempo de respuesta"
-          value={monitor.lastCheck?.responseTimeMs != null ? `${monitor.lastCheck.responseTimeMs}ms` : "—"}
+          value={
+            monitor.lastCheck?.responseTimeMs != null
+              ? `${monitor.lastCheck.responseTimeMs}ms`
+              : "—"
+          }
         />
       </div>
+
+      {/* Fase 4.2: desde qué regiones se ve el monitor. Con una sola región
+          configurada no aporta nada y se omite. */}
+      {monitor.regions.length > 1 && (
+        <div className="mb-6 rounded-lg border border-white/10 bg-white/5 p-3">
+          <p className="mb-2 text-xs text-gray-400">
+            Estado por región (quórum: {Math.floor(monitor.regions.length / 2) + 1} de{" "}
+            {monitor.regions.length} regiones para marcar caída)
+          </p>
+          <ul className="flex flex-wrap gap-4">
+            {monitor.regions.map((snapshot) => (
+              <li key={snapshot.region} className="flex items-center gap-2 text-sm">
+                <span className="font-mono text-gray-300">{snapshot.region}</span>
+                <StatusBadge status={snapshot.status ?? "pending"} />
+                {snapshot.responseTimeMs != null && (
+                  <span className="text-xs text-gray-500">{snapshot.responseTimeMs}ms</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {monitor.type === "http" && monitor.target.startsWith("https://") && (
         <div className="mb-6">
@@ -201,58 +255,62 @@ export function MonitorDetailPage() {
         </div>
       )}
 
-      <div className="mb-6 flex flex-wrap items-center gap-3">
-        <button
-          onClick={() => void handleTogglePause()}
-          className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-200 hover:bg-white/5"
-        >
-          {monitor.isPaused ? "Reanudar" : "Pausar"}
-        </button>
-
-        {isEditing ? (
-          <>
-            <label htmlFor="edit-interval" className="text-sm text-gray-400">
-              Intervalo (s):
-            </label>
-            <input
-              id="edit-interval"
-              type="number"
-              min={30}
-              value={editInterval}
-              onChange={(e) => setEditInterval(Number(e.target.value))}
-              className="w-24 rounded-md border border-white/10 bg-black/30 px-2 py-1 text-white"
-            />
-            <button
-              onClick={() => void handleSaveEdit()}
-              className="rounded-md bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-500"
-            >
-              Guardar
-            </button>
-            <button
-              onClick={() => setIsEditing(false)}
-              className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
-            >
-              Cancelar
-            </button>
-          </>
-        ) : (
+      {/* Fase 4.1: con rol de solo lectura no se enseñan las acciones (la
+          API las rechazaría con 403 igualmente). */}
+      {canEdit && (
+        <div className="mb-6 flex flex-wrap items-center gap-3">
           <button
-            onClick={() => setIsEditing(true)}
+            onClick={() => void handleTogglePause()}
             className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-200 hover:bg-white/5"
           >
-            Editar
+            {monitor.isPaused ? "Reanudar" : "Pausar"}
           </button>
-        )}
 
-        <button
-          onClick={() => void handleDelete()}
-          className="ml-auto rounded-md border border-red-500/30 px-4 py-2 text-sm text-red-400 hover:bg-red-500/10"
-        >
-          Borrar
-        </button>
-      </div>
+          {isEditing ? (
+            <>
+              <label htmlFor="edit-interval" className="text-sm text-gray-400">
+                Intervalo (s):
+              </label>
+              <input
+                id="edit-interval"
+                type="number"
+                min={30}
+                value={editInterval}
+                onChange={(e) => setEditInterval(Number(e.target.value))}
+                className="w-24 rounded-md border border-white/10 bg-black/30 px-2 py-1 text-white"
+              />
+              <button
+                onClick={() => void handleSaveEdit()}
+                className="rounded-md bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-500"
+              >
+                Guardar
+              </button>
+              <button
+                onClick={() => setIsEditing(false)}
+                className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
+              >
+                Cancelar
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => setIsEditing(true)}
+              className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-200 hover:bg-white/5"
+            >
+              Editar
+            </button>
+          )}
 
-      <MonitorChannelsSection monitorId={monitor.id} />
+          <button
+            onClick={() => void handleDelete()}
+            className="ml-auto rounded-md border border-red-500/30 px-4 py-2 text-sm text-red-400 hover:bg-red-500/10"
+          >
+            Borrar
+          </button>
+        </div>
+      )}
+
+      <MonitorChannelsSection monitorId={monitor.id} readOnly={!canEdit} />
 
       <div className="mb-3 flex items-center justify-between">
         <h2 className="text-lg font-medium text-white">Histórico</h2>
@@ -260,7 +318,10 @@ export function MonitorDetailPage() {
       </div>
 
       <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Stat label="Uptime" value={metrics?.uptimePercentage != null ? `${metrics.uptimePercentage}%` : "—"} />
+        <Stat
+          label="Uptime"
+          value={metrics?.uptimePercentage != null ? `${metrics.uptimePercentage}%` : "—"}
+        />
         <Stat
           label="Tiempo de respuesta medio"
           value={metrics?.avgResponseTimeMs != null ? `${metrics.avgResponseTimeMs}ms` : "—"}
@@ -284,6 +345,7 @@ export function MonitorDetailPage() {
           <thead className="text-gray-400">
             <tr>
               <th className="pb-2">Fecha</th>
+              {monitor.regions.length > 1 && <th className="pb-2">Región</th>}
               <th className="pb-2">Estado</th>
               <th className="pb-2">Tiempo de respuesta</th>
               <th className="pb-2">Detalle</th>
@@ -293,10 +355,15 @@ export function MonitorDetailPage() {
             {checks.map((check) => (
               <tr key={check.id}>
                 <td className="py-2 text-gray-300">{new Date(check.timestamp).toLocaleString()}</td>
+                {monitor.regions.length > 1 && (
+                  <td className="py-2 font-mono text-xs text-gray-400">{check.region}</td>
+                )}
                 <td className="py-2">
                   <StatusBadge status={check.status} />
                 </td>
-                <td className="py-2 text-gray-300">{check.responseTimeMs != null ? `${check.responseTimeMs}ms` : "—"}</td>
+                <td className="py-2 text-gray-300">
+                  {check.responseTimeMs != null ? `${check.responseTimeMs}ms` : "—"}
+                </td>
                 <td className="py-2 text-gray-400">{check.errorMessage ?? "—"}</td>
               </tr>
             ))}

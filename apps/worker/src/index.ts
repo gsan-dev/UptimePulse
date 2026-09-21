@@ -8,7 +8,7 @@ import { processCheckJob } from "./lib/process-check.js";
 const logger = createLogger("worker");
 
 const connection = createRedisConnection(env.redisUrl);
-const worker = createMonitorCheckWorker(connection, processCheckJob, env.concurrency);
+const worker = createMonitorCheckWorker(connection, env.region, processCheckJob, env.concurrency);
 
 worker.on("failed", (job, error) => {
   logger.error("job de check fallido", {
@@ -18,7 +18,13 @@ worker.on("failed", (job, error) => {
   });
 });
 
-logger.info("worker escuchando la cola de checks", { concurrency: env.concurrency, pid: process.pid });
+logger.info("worker escuchando la cola de checks", {
+  region: env.region,
+  regions: env.checkRegions,
+  quorum: Math.floor(env.checkRegions.length / 2) + 1,
+  concurrency: env.concurrency,
+  pid: process.pid,
+});
 
 let stopping = false;
 

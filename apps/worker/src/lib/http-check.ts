@@ -7,14 +7,29 @@ export interface HttpCheckInput {
   body: string | null;
   expectedStatus: number | null;
   timeoutMs: number;
+  /** Región del worker (Fase 4.2): se anuncia en el User-Agent. */
+  region: string;
+}
+
+function hasHeader(headers: Record<string, string> | null, name: string): boolean {
+  return Object.keys(headers ?? {}).some((key) => key.toLowerCase() === name.toLowerCase());
 }
 
 export async function runHttpCheck(input: HttpCheckInput): Promise<CheckOutcome> {
   const startedAt = Date.now();
+  // Identificarse como UptimePulse y desde qué región se comprueba es lo
+  // que hace cualquier servicio de monitorización serio (los logs del
+  // servidor vigilado lo agradecen) — y además permite probar el quórum sin
+  // infraestructura real: un servidor puede fallar solo para una región.
+  // Si el usuario configuró su propio User-Agent en el monitor, se respeta.
+  const headers: Record<string, string> = { ...(input.headers ?? {}) };
+  if (!hasHeader(input.headers, "user-agent")) {
+    headers["User-Agent"] = `UptimePulse/1.0 (+region=${input.region})`;
+  }
   try {
     const response = await fetch(input.target, {
       method: input.method,
-      headers: input.headers ?? undefined,
+      headers,
       body: input.body ?? undefined,
       signal: AbortSignal.timeout(input.timeoutMs),
     });

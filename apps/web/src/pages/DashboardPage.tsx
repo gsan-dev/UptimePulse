@@ -2,15 +2,18 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { getDashboardSummary, listMonitors } from "../api/monitors";
 import type { ApiDashboardSummary, ApiMonitor } from "../api/types";
+import { OrganizationSwitcher } from "../components/OrganizationSwitcher";
 import { Sparkline } from "../components/Sparkline";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
 import { SummaryHeader } from "../components/SummaryHeader";
 import { useAuth } from "../context/AuthContext";
+import { useOrganization } from "../context/OrganizationContext";
 import { useRealtime } from "../context/RealtimeContext";
 import { useToast } from "../context/ToastContext";
 
 export function DashboardPage() {
   const { user, logout } = useAuth();
+  const { canEdit } = useOrganization();
   const { subscribe } = useRealtime();
   const { showToast } = useToast();
   const [monitors, setMonitors] = useState<ApiMonitor[] | null>(null);
@@ -19,7 +22,10 @@ export function DashboardPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [monitorsData, summaryData] = await Promise.all([listMonitors(), getDashboardSummary()]);
+      const [monitorsData, summaryData] = await Promise.all([
+        listMonitors(),
+        getDashboardSummary(),
+      ]);
       setMonitors(monitorsData);
       setSummary(summaryData);
       setError(null);
@@ -38,7 +44,13 @@ export function DashboardPage() {
     return subscribe((event) => {
       void refresh();
       showToast(
-        `${event.name} ahora está ${event.status === "up" ? "operativo ✅" : "caído 🔴"}`,
+        `${event.name} ahora está ${
+          event.status === "up"
+            ? "operativo ✅"
+            : event.status === "degraded"
+              ? `degradado 🟡 (caído desde ${event.downRegions.join(", ")})`
+              : "caído 🔴"
+        }`,
         event.status
       );
     });
@@ -59,6 +71,9 @@ export function DashboardPage() {
               @{user?.username}
             </Link>
           </p>
+          <div className="mt-2">
+            <OrganizationSwitcher />
+          </div>
         </div>
         <div className="flex gap-3">
           <Link
@@ -73,12 +88,14 @@ export function DashboardPage() {
           >
             Canales
           </Link>
-          <Link
-            to="/monitors/new"
-            className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500"
-          >
-            + Nuevo monitor
-          </Link>
+          {canEdit && (
+            <Link
+              to="/monitors/new"
+              className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500"
+            >
+              + Nuevo monitor
+            </Link>
+          )}
           <button
             onClick={() => void logout()}
             className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
@@ -88,7 +105,9 @@ export function DashboardPage() {
         </div>
       </header>
 
-      {error && <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
+      {error && (
+        <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>
+      )}
 
       {monitors !== null && monitors.length > 0 && (
         <SummaryHeader
@@ -126,9 +145,14 @@ export function DashboardPage() {
                   <p className="truncate text-sm text-gray-400">{monitor.target}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-6">
-                  <Sparkline points={sparklinePoints} hasDowntime={sparklinePoints.some((p) => p.downChecks > 0)} />
+                  <Sparkline
+                    points={sparklinePoints}
+                    hasDowntime={sparklinePoints.some((p) => p.downChecks > 0)}
+                  />
                   <span className="text-sm text-gray-400">
-                    {monitor.lastCheck?.responseTimeMs != null ? `${monitor.lastCheck.responseTimeMs} ms` : "—"}
+                    {monitor.lastCheck?.responseTimeMs != null
+                      ? `${monitor.lastCheck.responseTimeMs} ms`
+                      : "—"}
                   </span>
                   <StatusBadge status={monitorDisplayStatus(monitor)} />
                 </div>

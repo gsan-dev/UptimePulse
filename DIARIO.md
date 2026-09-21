@@ -2020,3 +2020,284 @@ nuevo durante la verificación) con sus dos status pages.
 
 ### Próximo paso
 Fase 4 (equipos/roles, multi-región, planes) cuando lo confirmes.
+
+---
+
+## 2026-09-21 — Fase 4.1: equipos y roles
+
+### Objetivo
+Que un usuario pueda invitar a otros a su organización por email, con roles
+(admin / editor / solo lectura) que la API aplique de verdad en cada endpoint.
+
+### Decisiones
+Ver el ADR "Fase 4.1" en TASK.md. Lo esencial: organización activa por
+cabecera `X-Organization-Id` (sin cabecera = la personal, así nada anterior
+cambia); "personal" = `organizations.owner_user_id` (el criterio "membresía
+más antigua" falló en la verificación); roles lineales con `requireRole`;
+tokens de invitación hasheados, de un solo uso, aceptables solo con el email
+correcto.
+
+### Qué se hizo
+1. **DB:** migración 0009 `organization_invitations`; migración 0010
+   `organizations.owner_user_id` con backfill.
+2. **API:** `plugins/auth.ts` gana `requireOrganization` (resuelve
+   `request.organization = { id, role }`) y `requireRole(min)`;
+   `lib/organizations.ts` reescrito (`getMembership`, `resolveOrganization`,
+   `roleSatisfies`); nuevo `routes/organizations.ts` (`GET /organizations`,
+   miembros, invitaciones, `GET /invitations/:token`, `POST
+   /invitations/:token/accept`); `routes/monitors|notification-channels|status-pages`
+   migradas a `request.organization` con `requireRole("editor")` en toda
+   escritura; `realtime.ts` acepta `auth.organizationId`; la API ahora usa
+   `@uptimepulse/mailer` (nueva plantilla `organizationInvitationEmail`) y
+   lee `APP_URL` + SMTP de `.env`.
+3. **Web:** `context/OrganizationContext.tsx` (lista de organizaciones,
+   activa en `localStorage`, `canEdit`/`isAdmin`), cabecera
+   `X-Organization-Id` en `client.ts` y en el handshake del socket,
+   `components/OrganizationSwitcher.tsx`, páginas `/team` y
+   `/invitations/:token`, `?next=` en login/registro (solo rutas internas) y
+   `?email=` prefijado en el registro; con rol de solo lectura se ocultan
+   los botones/formularios de escritura en dashboard, detalle de monitor,
+   canales y status pages.
+
+### Comandos ejecutados
+```bash
+cd packages/db && npx drizzle-kit generate --name organization_invitations && npm run db:migrate
+cd packages/db && npx drizzle-kit generate --name organizations_owner   # editada a mano (backfill) y aplicada
+npm install --workspace=apps/api                                          # @uptimepulse/mailer
+npx tsc --noEmit -p apps/api && npx tsc --noEmit -p apps/web && npx eslint apps/web/src apps/api/src && npx vite build
+node api-teams-test.mjs   # 22 comprobaciones contra la API (email leído de Mailpit)
+node ui-teams-test.mjs    # 12 comprobaciones en Chromium real
+```
+
+### Verificación completa
+- **API (22/22):** registro de owner y guest · owner es admin de su org ·
+  `X-Organization-Id` ajeno → 403 · no-miembro no invita (403) · owner invita
+  (201) · **email real en Mailpit** con enlace `/invitations/<token>` · `GET
+  /invitations/:token` sin sesión devuelve org/rol/email · aceptar con otra
+  cuenta → 403 · guest acepta (200) · el token ya no vale (404) · guest ve 2
+  organizaciones · readonly lee (200) pero `POST /monitors`,
+  `POST /notification-channels` y `PATCH` miembros → 403 · sin cabecera →
+  org personal (201) · aislamiento entre organizaciones · promovido a editor
+  crea (201) pero no invita (403) · el único admin no se degrada (409) ·
+  expulsado → 403 · monitores de prueba borrados vía API.
+- **Chromium real (12/12):** owner se registra (badge Administrador, enlace
+  Equipo) · invita desde `/team` · email en Mailpit · guest sin cuenta abre
+  el enlace, ve org y rol, "Crear cuenta" con el email prefijado · se
+  registra y vuelve solo a la invitación · acepta y aterriza en la org del
+  owner como solo lectura (sin "Nuevo monitor") · `/channels` muestra el
+  aviso y oculta el formulario · cambia a su org personal y recupera los
+  botones (persistente al recargar) · owner lo promueve a editor (persistente
+  al recargar) · guest vuelve a la org del owner con rol Editor y botón ·
+  el único admin no puede degradarse (mensaje visible) · owner lo quita y
+  guest cae a su org personal.
+- `tsc` api/web, `eslint`, `vite build`: limpios.
+
+### Limpieza
+Usuarios/organizaciones `e2e-owner-*` / `e2e-guest-*` de las cuatro
+ejecuciones (dos de API, dos de UI) borrados; 0 invitaciones en la tabla.
+Quedan las 3 cuentas reales, 3 organizaciones, sus monitores y páginas.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. En /monitors verás tu organización y tu rol junto a tu nombre, y un enlace "Equipo".
+# 2. En /team invita a un email (con Mailpit: http://localhost:8025 recibe el correo).
+# 3. Abre el enlace del correo en una ventana privada: podrás registrarte con ese
+#    email y aceptar; al entrar verás el selector de organización arriba.
+# 4. Con rol "Solo lectura" no hay botones de crear/borrar; la API responde 403 igualmente:
+curl -i -X POST http://localhost:3000/monitors -H "Authorization: Bearer $TOKEN_READONLY" \
+  -H "X-Organization-Id: $ORG" -H "Content-Type: application/json" \
+  -d '{"name":"x","type":"http","target":"https://example.com","intervalSeconds":300,"timeoutMs":5000}'
+```
+
+### Pendiente / notas
+- Las organizaciones de equipo no tienen URL pública propia (status pages
+  siguen bajo `/status/<username>/`), y las alertas por email van a todos los
+  miembros sin filtrar por rol.
+- `PROGRESO-FASE4.md` en la raíz lleva el estado paso a paso de la Fase 4
+  mientras dure; se borrará al cerrarla.
+
+### Próximo paso
+Fase 4.2: checks multi-región (ADR de quórum primero).
+
+---
+
+## 2026-09-21 — Fase 4.2: checks multi-región con quórum
+
+### Objetivo
+Que cada monitor se compruebe desde varias regiones y que un fallo visto por
+una sola región no lo marque como caído si otra lo ve operativo — probado con
+dos procesos worker reales, sin infraestructura multi-datacenter.
+
+### Decisiones
+Ver el ADR "Fase 4.2" en TASK.md: cola BullMQ por región; quórum de mayoría
+estricta `floor(R/2)+1` aplicado al estado instantáneo (up/degraded/down) y a
+la apertura de incidentes (N fallos consecutivos por región, ≥Q regiones);
+evaluación en transacción con `FOR UPDATE`; solo cuentan regiones
+configuradas; evento WebSocket por cambio consolidado.
+
+### Qué se hizo
+1. **DB (migración 0011):** `checks.region` (default `local`) con índice
+   `(monitor_id, region, timestamp desc)`; enum `monitor_health` y
+   `monitors.consolidated_status`, rellenado desde el último check.
+2. **`packages/queue` reescrito:** `parseRegions`, `quorumFor`,
+   `queueNameForRegion` (`monitor-checks--<región>`), `RegionQueues`
+   (programa/quita en todas las regiones, recuerda regiones en Redis,
+   `removeQueuesForUnknownRegions`, `removeLegacyQueue`).
+3. **API:** `env.checkRegions` (`CHECK_REGIONS`), `queue.ts` → `regionQueues`,
+   reconcile con limpieza de colas viejas/retiradas, Bull Board con todas las
+   colas, `GET /monitors/:id` devuelve `regions` (último check por región
+   configurada), status page pública usa `consolidated_status` (nuevo valor
+   `degraded`).
+4. **Worker:** `env.region` (`WORKER_REGION`, validado contra
+   `CHECK_REGIONS`) y `env.checkRegions`; consume solo su cola; guarda
+   `region` en cada check; User-Agent `UptimePulse/1.0 (+region=<r>)`; nuevo
+   `lib/health.ts` (motor de quórum) sustituye a `lib/incidents.ts`;
+   `process-check.ts` emite el evento solo si cambia el consolidado y
+   notifica por incidente con las regiones en el mensaje.
+5. **Web:** `consolidatedStatus` manda en `monitorDisplayStatus`; badge y
+   toast "Degradado"; bloque "Estado por región" y columna "Región" en el
+   detalle (solo si hay >1 región); tipos del evento WebSocket con
+   `downRegions`; status page pública pinta `degraded`.
+6. `.env.example` documenta `CHECK_REGIONS` y `WORKER_REGION`.
+
+### Comandos ejecutados
+```bash
+cd packages/db && npx drizzle-kit generate --name checks_region_and_consolidated_status  # + backfill a mano
+npm run db:migrate
+# Verificación (temporal en .env): CHECK_REGIONS=eu-west,us-east  ALLOW_PRIVATE_MONITOR_TARGETS=true
+node region-target.mjs                       # servidor vigilado en :4100 que falla según el UA
+npm run dev:api
+WORKER_REGION=eu-west npm run dev:worker
+WORKER_REGION=us-east npm run dev:worker
+node multiregion-test.mjs                    # 12 comprobaciones (API + WebSocket + Mailpit)
+node ui-region-test.mjs                      # 5 comprobaciones en Chromium
+# Restaurado: CHECK_REGIONS=local, ALLOW_PRIVATE_MONITOR_TARGETS=false, api + 1 worker
+```
+
+### Verificación completa
+- **Arranque:** la API limpió la cola antigua `monitor-checks` y programó
+  5 monitores × 2 regiones; cada worker registró su región y `quorum: 2`.
+- **Quórum con dos workers reales (12/12):** ambas regiones OK → `up` ·
+  el servidor vigilado recibió UAs `(+region=eu-west)` y `(+region=us-east)` ·
+  **us-east falla 2 veces, eu-west no → `degraded`, sin incidente** (el
+  "hecho cuando") · las dos fallan → `down` al instante, sin incidente hasta
+  el 2º fallo de eu-west · incidente "Se esperaba un status < 400, se obtuvo
+  500 (visto desde: eu-west, us-east)" · recuperación → `up` + incidente
+  cerrado · eventos WebSocket `up→degraded[us-east] · degraded→down ·
+  down→up` (uno por cambio consolidado) · checks `{"eu-west":7,"us-east":7}` ·
+  monitor borrado vía API. Emails 🔴/🟢 en Mailpit con el texto de regiones.
+- **Chromium (5/5):** "Estado por región (quórum: 2 de 2)" con ambas
+  regiones; columna Región; al fallar us-east, toast "degradado 🟡 (caído
+  desde us-east)" en vivo y badge Degradado en cabecera; el dashboard lo
+  muestra Degradado tras recargar.
+- **Vuelta a una región:** la API eliminó las colas de `eu-west`/`us-east`
+  ("colas de regiones retiradas eliminadas") y en Redis solo queda
+  `monitor-checks--local`; el worker `local` arranca con `quorum: 1`.
+- `tsc` api/web/worker, `eslint`, `vite build`: limpios.
+
+### Limpieza
+Usuarios `e2e-region-*`/`e2e-regionui-*` y sus organizaciones borrados;
+monitores de prueba borrados vía API. Los monitores reales del usuario
+conservan 5+5 checks etiquetados `eu-west`/`us-east` de la prueba (son
+checks reales de sus targets; no cuentan para el quórum al no estar esas
+regiones configuradas). `.env` restaurado.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. En .env: CHECK_REGIONS=eu-west,us-east
+# 2. Reinicia la API y arranca DOS workers:
+WORKER_REGION=eu-west npm run dev:worker
+WORKER_REGION=us-east npm run dev:worker
+# 3. En el detalle de cualquier monitor verás "Estado por región (quórum: 2 de 2)"
+#    y la columna Región en los últimos checks. Bull Board (/admin/queues) muestra
+#    una cola por región.
+# 4. Vuelve a CHECK_REGIONS=local y reinicia: la API borra las colas sobrantes sola.
+```
+
+### Pendiente / notas
+- Uptime % y gráficos agregan todas las regiones; no hay uptime por región.
+- Una región configurada cuyo worker esté caído no cuenta como "down"
+  (sin evidencia); con R=2 eso impide declarar caída hasta que vuelva. Es
+  la conservadora por diseño; con 3 regiones se tolera una muerta.
+
+### Próximo paso
+Fase 4.3: planes de suscripción (límites reales de canales, segundo plan,
+página de precios, cambio de plan simulado — ADR Stripe).
+
+---
+
+## 2026-09-21 — Fase 4.3: planes de suscripción (límites reales, precios, cambio simulado)
+
+### Objetivo
+Que el plan de la organización limite de verdad (monitores, intervalo,
+tipos de canal), con una página de precios conectada al backend y un cambio
+de plan — simulado, sin Stripe, por decisión razonada (ADR en TASK.md).
+
+### Decisiones
+Ver ADR "Fase 4.3" en TASK.md: Stripe simulado (no verificable sin claves),
+errores 422 con objeto `limit`, rebaja bloqueada si sobran monitores,
+canales existentes conservados al bajar, plan `pro` como segundo plan.
+
+### Qué se hizo
+1. **DB (migración 0012):** `plans.price_cents_monthly`; seed del plan
+   `pro` (50 monitores, 60 s, `["email","discord","slack","webhook","sms"]`,
+   900 cts). Eliminado el plan huérfano `free-manual` de la Fase 1.2.
+2. **API:** `lib/plans.ts` devuelve también `planName` y
+   `allowedChannels` y expone `countOrganizationMonitors`/`listPlans`;
+   `POST /notification-channels` aplica `allowedChannels`; los 422 de
+   monitores incluyen `limit`; nuevo `routes/plans.ts` con `GET /plans`
+   (público, rate limit), `GET /organizations/:id` (plan + uso) y
+   `POST /organizations/:id/plan` (admin, simulado, 409 si sobran monitores).
+3. **Web:** `api/plans.ts`, `pages/PricingPage.tsx` (pública; con sesión
+   marca el plan actual, uso y permite cambiar si eres admin),
+   `components/PlanLimitError.tsx` (`FormError` con enlace "Ver planes"
+   cuando el error trae `limit`), usado en nuevo monitor y canales; la
+   cabecera muestra "Plan: <nombre>" enlazando a `/pricing`.
+
+### Comandos ejecutados
+```bash
+cd packages/db && npx drizzle-kit generate --name plans_price_and_pro   # + seed a mano
+npm run db:migrate
+npx tsc --noEmit -p apps/api && npx tsc --noEmit -p apps/web && npx eslint apps/web/src apps/api/src && npx vite build
+node api-plans-test.mjs   # 15 comprobaciones
+node ui-plans-test.mjs    # 7 comprobaciones en Chromium
+```
+
+### Verificación completa
+- **API (15/15):** `GET /plans` público con free y pro · detalle de org
+  (plan free, uso 0) · intervalo 60 s → 422 · 5 monitores → 201 · el 6º →
+  422 con `limit.current=5` · Discord → 422 "permite: email" · uso 5/5 ·
+  plan inexistente → 404 · cambio a pro → 200 · 6º monitor con 60 s → 201 ·
+  Discord → 201 · rebaja con 6 monitores → 409 "borra 1 antes de cambiar" ·
+  rebaja tras borrar → 200 · el canal Discord sigue existiendo en free.
+- **Chromium (7/7):** `/pricing` sin sesión (planes, "9,00 €/mes", "Hasta 5
+  monitores", "Crear cuenta") · cabecera "Plan: free" · 6º monitor desde el
+  formulario → mensaje del plan + enlace "Ver planes" · Discord en free →
+  mensaje + enlace que lleva a `/pricing` · "Tu plan actual" en free y "usa
+  5 de 5 monitores" · cambio a pro con el diálogo propio → "Tu plan actual"
+  en pro, "usa 5 de 50", cabecera "Plan: pro" · el 6º monitor ya se crea.
+- `tsc` api/web, `eslint`, `vite build`: limpios.
+
+### Limpieza
+Usuarios `e2e-plan-*`/`e2e-planui-*` y sus organizaciones borrados;
+monitores de prueba borrados vía API. Estado final: 3 usuarios, 3
+organizaciones, 5 monitores, 2 canales, 0 invitaciones, planes `free`,`pro`.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+curl -s http://localhost:3000/plans | python -m json.tool
+# En la app: cabecera "Plan: free" → /pricing. Intenta crear un canal de Discord
+# en /channels: verás el error del plan con el enlace "Ver planes". Cambia a pro
+# (simulado) y vuelve a intentarlo.
+```
+
+### Pendiente / notas
+- **Stripe:** pasos concretos para integrarlo cuando haya claves de test,
+  en el ADR de TASK.md.
+- Tus organizaciones reales siguen en `free`: si quieres crear más canales
+  de Discord, cambia a `pro` desde `/pricing` (es gratis: no hay pago real).
+- SMS (Twilio) sigue pospuesto (decisión de la Fase 3.2).
+
+### Próximo paso
+Fase 5 (seguridad, observabilidad, tests, CI/CD, documentación final).
+`PROGRESO-FASE4.md` se elimina: todo su contenido está ya en TASK.md y aquí.

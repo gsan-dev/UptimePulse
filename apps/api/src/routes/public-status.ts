@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { and, desc, eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
-import { checks, db, monitors, organizationMembers, statusPageMonitors, statusPages, users } from "@uptimepulse/db";
+import { db, monitors, organizationMembers, statusPageMonitors, statusPages, users } from "@uptimepulse/db";
 import { normalizeUsername } from "@uptimepulse/shared";
 import { getMonitorDailyHistory, getMonitorMetrics } from "../lib/metrics.js";
 
@@ -12,15 +12,6 @@ const paramsSchema = z.object({
 
 const HISTORY_DAYS = 90;
 
-async function getLastCheckStatus(monitorId: string): Promise<"up" | "down" | null> {
-  const [last] = await db
-    .select({ status: checks.status })
-    .from(checks)
-    .where(eq(checks.monitorId, monitorId))
-    .orderBy(desc(checks.timestamp))
-    .limit(1);
-  return last?.status ?? null;
-}
 
 /**
  * Sin autenticación a propósito (Fase 3.3): cualquiera con el slug puede
@@ -79,16 +70,17 @@ export async function publicStatusRoutes(app: FastifyInstance): Promise<void> {
           const monitor = await db.query.monitors.findFirst({ where: eq(monitors.id, link.monitorId) });
           if (!monitor) return null;
 
-          const [metrics90d, dailyHistory, lastStatus] = await Promise.all([
+          const [metrics90d, dailyHistory] = await Promise.all([
             getMonitorMetrics(monitor.id, "90d"),
             getMonitorDailyHistory(monitor.id, HISTORY_DAYS),
-            getLastCheckStatus(monitor.id),
           ]);
 
           return {
             id: monitor.id,
             name: link.displayName ?? monitor.name,
-            currentStatus: monitor.isPaused ? "paused" : (lastStatus ?? "pending"),
+            // Fase 4.2: estado consolidado entre regiones (puede ser
+            // "degraded"), no el último check crudo.
+            currentStatus: monitor.isPaused ? "paused" : (monitor.consolidatedStatus ?? "pending"),
             uptimePercentage90d: metrics90d.uptimePercentage,
             dailyHistory,
           };

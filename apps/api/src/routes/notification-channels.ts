@@ -4,9 +4,9 @@ import { z } from "zod";
 import { db, notificationChannels } from "@uptimepulse/db";
 import { assertPublicHost, SsrfBlockedError } from "@uptimepulse/server-utils";
 import { sendChannelNotification, type NotificationChannelType } from "@uptimepulse/notify-channels";
-import { requireAuth } from "../plugins/auth.js";
-import { getPrimaryOrganizationId } from "../lib/organizations.js";
+import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
 import { env } from "../env.js";
+import { getOrganizationPlanLimits } from "../lib/plans.js";
 
 // "sms" queda fuera a propósito (Fase 3.2: sin credenciales de Twilio para
 // probarlo de verdad esta sesión) y "email" no se gestiona como canal aquí
@@ -48,16 +48,28 @@ async function findOwnedChannel(organizationId: string, channelId: string) {
 
 export async function notificationChannelRoutes(app: FastifyInstance): Promise<void> {
   app.addHook("preHandler", requireAuth);
+  // Fase 4.1: resuelve la organización activa (X-Organization-Id o la
+  // personal) y el rol del usuario en ella. Las rutas que escriben exigen
+  // además rol "editor" o superior; las de lectura valen con "readonly".
+  app.addHook("preHandler", requireOrganization);
 
-  app.post("/notification-channels", async (request, reply) => {
+  app.post("/notification-channels", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsed = createChannelSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.code(403).send({ error: "El usuario no pertenece a ninguna organización" });
+    const organizationId = request.organization!.id;
+
+    // Fase 4.3: el plan decide qué tipos de canal se pueden crear. Los
+    // canales ya existentes no se tocan al cambiar de plan (solo se limita
+    // crear nuevos), así nadie pierde configuración por una rebaja.
+    const limits = await getOrganizationPlanLimits(organizationId);
+    if (!limits.allowedChannels.includes(parsed.data.type)) {
+      return reply.code(422).send({
+        error: `Tu plan "${limits.planName}" no incluye canales de tipo ${parsed.data.type} (permite: ${limits.allowedChannels.join(", ")})`,
+        limit: { kind: "allowedChannels", plan: limits.planName, allowed: limits.allowedChannels },
+      });
     }
 
     try {
@@ -78,24 +90,21 @@ export async function notificationChannelRoutes(app: FastifyInstance): Promise<v
   });
 
   app.get("/notification-channels", async (request, reply) => {
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.send([]);
-    }
+    const organizationId = request.organization!.id;
     const rows = await db.query.notificationChannels.findMany({
       where: eq(notificationChannels.organizationId, organizationId),
     });
     return reply.send(rows);
   });
 
-  app.delete("/notification-channels/:id", async (request, reply) => {
+  app.delete("/notification-channels/:id", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = idParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: "El id debe ser un UUID válido" });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const channel = organizationId ? await findOwnedChannel(organizationId, parsedParams.data.id) : null;
+    const organizationId = request.organization!.id;
+    const channel = await findOwnedChannel(organizationId, parsedParams.data.id);
     if (!channel) {
       return reply.code(404).send({ error: "Canal no encontrado" });
     }
@@ -110,14 +119,14 @@ export async function notificationChannelRoutes(app: FastifyInstance): Promise<v
   // Envía un mensaje de prueba real por el canal — usa exactamente el mismo
   // camino de envío que el worker usará de verdad (packages/notify-channels),
   // así "probar" prueba lo mismo que se disparará ante una caída real.
-  app.post("/notification-channels/:id/test", async (request, reply) => {
+  app.post("/notification-channels/:id/test", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = idParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: "El id debe ser un UUID válido" });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const channel = organizationId ? await findOwnedChannel(organizationId, parsedParams.data.id) : null;
+    const organizationId = request.organization!.id;
+    const channel = await findOwnedChannel(organizationId, parsedParams.data.id);
     if (!channel) {
       return reply.code(404).send({ error: "Canal no encontrado" });
     }

@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { getUsernameError, normalizeUsername } from "@uptimepulse/shared";
 import { checkUsernameAvailability } from "../api/auth";
 import { ApiError } from "../api/client";
@@ -77,9 +77,14 @@ function useUsernameAvailability(username: string): UsernameState {
 export function RegisterPage() {
   const { register } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const rawNext = searchParams.get("next");
+  const next = rawNext && rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/monitors";
   const [fullName, setFullName] = useState("");
   const [username, setUsername] = useState("");
-  const [email, setEmail] = useState("");
+  // Prefijado desde una invitación (Fase 4.1): la invitación solo se puede
+  // aceptar con una cuenta de ese email.
+  const [email, setEmail] = useState(searchParams.get("email") ?? "");
   const [password, setPassword] = useState("");
   const [passwordConfirm, setPasswordConfirm] = useState("");
   const [organizationName, setOrganizationName] = useState("");
@@ -111,7 +116,7 @@ export function RegisterPage() {
         password,
         organizationName: organizationName.trim() || undefined,
       });
-      navigate("/monitors");
+      navigate(next);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo completar el registro");
     } finally {
@@ -252,7 +257,7 @@ export function RegisterPage() {
         </button>
         <p className="text-center text-sm text-gray-400">
           ¿Ya tienes cuenta?{" "}
-          <Link to="/login" className="text-emerald-400 hover:underline">
+          <Link to={rawNext ? `/login?next=${encodeURIComponent(next)}` : "/login"} className="text-emerald-400 hover:underline">
             Inicia sesión
           </Link>
         </p>

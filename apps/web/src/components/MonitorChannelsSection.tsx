@@ -15,7 +15,7 @@ const TYPE_LABELS: Record<string, string> = {
  * persiste al instante (sin botón "Guardar" aparte) contra
  * POST/DELETE /monitors/:id/notification-channels/:channelId.
  */
-export function MonitorChannelsSection({ monitorId }: { monitorId: string }) {
+export function MonitorChannelsSection({ monitorId, readOnly = false }: { monitorId: string; readOnly?: boolean }) {
   const [channels, setChannels] = useState<ApiNotificationChannel[] | null>(null);
   const [attachedIds, setAttachedIds] = useState<Set<string>>(new Set());
   const [pendingId, setPendingId] = useState<string | null>(null);
@@ -84,7 +84,7 @@ export function MonitorChannelsSection({ monitorId }: { monitorId: string }) {
                   <input
                     type="checkbox"
                     checked={isAttached}
-                    disabled={pendingId === channel.id}
+                    disabled={readOnly || pendingId === channel.id}
                     onChange={() => void handleToggle(channel.id, isAttached)}
                   />
                   Activado

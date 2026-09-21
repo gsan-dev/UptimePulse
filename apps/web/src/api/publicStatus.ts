@@ -3,7 +3,7 @@
 // token, refresh, AuthContext) — cualquier visitante sin cuenta la ve.
 const API_BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:3000";
 
-export type PublicMonitorStatus = "up" | "down" | "paused" | "pending";
+export type PublicMonitorStatus = "up" | "degraded" | "down" | "paused" | "pending";
 export type DailyStatus = "operational" | "degraded" | "outage" | "no-data";
 export type OverallStatus = "operational" | "degraded" | "outage";
 

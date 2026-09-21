@@ -183,23 +183,27 @@ Con 3.1 a 3.3 cerrados, UptimePulse alerta de certificados SSL a punto de caduca
 
 ## Fase 4 — Equipos, multi-región, planes
 
-### 4.1 Equipos y roles
-- [ ] Invitar miembros a una organización por email.
-- [ ] Roles: admin, editor, solo lectura — aplicar en middleware de autorización de cada endpoint.
-- **Hecho cuando:** un usuario con rol "solo lectura" puede ver monitores pero recibe 403 al intentar editarlos.
+### 4.1 Equipos y roles ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Invitar miembros a una organización por email. **Verificado:** el admin invita desde `/team`; el email sale de verdad por SMTP (Mailpit) con un enlace `/invitations/<token>`; el invitado sin cuenta lo abre, se registra con el email prefijado, vuelve solo a la invitación y la acepta. Token de un solo uso, hasheado en BD, caduca a los 7 días; solo lo puede aceptar una sesión con el mismo email.
+- [x] Roles: admin, editor, solo lectura — aplicar en middleware de autorización de cada endpoint. **Verificado:** `requireOrganization` + `requireRole` en `apps/api/src/plugins/auth.ts`; todas las rutas de escritura de monitores, canales, ventanas y status pages exigen `editor`; miembros/invitaciones exigen `admin`. Organización activa vía cabecera `X-Organization-Id` (y en el handshake del WebSocket), con selector en la cabecera del dashboard.
+- **Hecho cuando:** un usuario con rol "solo lectura" puede ver monitores pero recibe 403 al intentar editarlos. **Verificado contra la API (22/22):** readonly `GET /monitors` → 200, `POST /monitors` → 403 "Tu rol en esta organización es de solo lectura", `POST /notification-channels` → 403, cambiar roles → 403; promovido a editor → `POST /monitors` 201 pero invitar → 403; el único admin no puede degradarse ni salir (409); expulsado → 403; `X-Organization-Id` de una organización ajena → 403; aislamiento entre organizaciones comprobado. **Y en Chromium real (12/12):** el flujo completo de invitación por email, la UI de solo lectura (sin botones de crear/borrar, aviso visible), cambio de organización en el selector (persistente al recargar), promoción a editor reflejada en la UI, expulsión.
 
-### 4.2 (diseño) Checks multi-región
-- [ ] Decidir arquitectura antes de implementar: ¿workers desplegados en distintas regiones que reportan a la misma DB central? ¿Cómo se decide "down" cuando una región falla y otra no (quorum, ej. 2 de 3 regiones deben fallar)?
-- [ ] Documentar la decisión de quorum/consenso en un ADR — esta es la pieza más "sistemas distribuidos" del proyecto y la que más justifica su valor de portfolio.
-- [ ] Etiquetar cada check con la región de origen (`checks.region`).
-- [ ] UI: mostrar desde qué región(es) se detectó la caída.
-- **Hecho cuando:** con al menos 2 regiones simuladas (pueden ser 2 procesos worker con distinta env var de región, sin infra real multi-datacenter), un fallo en una sola región no marca el monitor como caído si la otra región lo ve operativo.
+### 4.2 Checks multi-región ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Decidir arquitectura antes de implementar. **Decidido:** workers en distintas regiones contra la misma base de datos central y el mismo Redis; **una cola BullMQ por región** (`monitor-checks--<región>`), un job scheduler por (monitor, región); cada worker consume solo la cola de su `WORKER_REGION`. Ver ADR abajo.
+- [x] Documentar la decisión de quorum/consenso en un ADR. **Ver "Fase 4.2" en el registro de decisiones:** quórum = mayoría estricta `floor(R/2)+1`, aplicado a dos preguntas distintas (estado instantáneo y apertura de incidente), evaluado en transacción con `SELECT … FOR UPDATE`.
+- [x] Etiquetar cada check con la región de origen (`checks.region`). **Verificado:** migración 0011; los checks de la prueba quedaron guardados como `{"eu-west":7,"us-east":7}`; el servidor vigilado recibió `User-Agent: UptimePulse/1.0 (+region=eu-west)` y `(+region=us-east)`.
+- [x] UI: mostrar desde qué región(es) se detectó la caída. **Verificado en Chromium:** bloque "Estado por región (quórum: 2 de 2)" en el detalle, columna "Región" en últimos checks, badge ámbar "Degradado" en detalle y dashboard, toast "degradado 🟡 (caído desde us-east)" en vivo; el incidente y el email dicen "(visto desde: eu-west, us-east)".
+- **Hecho cuando:** con al menos 2 regiones simuladas, un fallo en una sola región no marca el monitor como caído si la otra región lo ve operativo. **Verificado con DOS procesos worker reales** (`WORKER_REGION=eu-west` y `us-east`, `CHECK_REGIONS=eu-west,us-east`) contra un servidor local que falla solo para la región del User-Agent (12/12): ambas OK → `up`; **us-east falla 2 veces seguidas y eu-west no → `degraded`, SIN incidente**; las dos fallan → `down` al instante pero sin incidente hasta que eu-west acumula 2 fallos → incidente "(visto desde: eu-west, us-east)"; recuperación → `up` e incidente cerrado; eventos WebSocket exactamente `up→degraded[us-east] · degraded→down · down→up` (uno por cambio consolidado, no por check); emails 🔴/🟢 en Mailpit.
 
-### 4.3 Planes de suscripción
-- [ ] Modelo `plans` ya creado en Fase 0; aplicar límites reales (nº monitores, intervalo mínimo, canales disponibles) al crear/editar monitores y canales.
-- [ ] (diseño) decidir si se integra Stripe de verdad (checkout + webhooks de facturación) o se simula el estado de plan manualmente — para portfolio, una integración real de Stripe en modo test suma valor.
-- [ ] Página de precios conectada a los planes reales del backend (no solo estática, README §3.1).
-- **Hecho cuando:** un usuario en plan Free no puede crear un monitor por encima de su límite ni bajar el intervalo por debajo del mínimo permitido; el error se lo dice explícitamente.
+### 4.3 Planes de suscripción ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md)) — Stripe simulado
+- [x] Modelo `plans` ya creado en Fase 0; aplicar límites reales (nº monitores, intervalo mínimo, canales disponibles) al crear/editar monitores y canales. **Verificado contra la API:** en free, intervalo 60 s → 422; el 6º monitor → 422 (`limit.current=5`); canal Discord → 422 "no incluye canales de tipo discord (permite: email)"; los tres errores llevan un objeto `limit` estructurado además del mensaje. Segundo plan `pro` (50 monitores, 60 s, todos los canales, 9 €/mes) en la migración 0012.
+- [x] (diseño) Stripe real vs. simulado. **Decidido: simulado** (`POST /organizations/:id/plan`, solo admin) — ver ADR abajo. Reglas que sí se aplican aunque no haya pago: no se puede bajar a un plan cuyo límite de monitores ya se supera (409 explicando cuántos borrar); los canales existentes se conservan al bajar (solo se bloquea crear nuevos).
+- [x] Página de precios conectada a los planes reales del backend. **Verificado en Chromium:** `/pricing` sin sesión lista los planes de `GET /plans` con precio y límites; con sesión marca "Tu plan actual", muestra "usa 5 de 5 monitores" y el admin cambia de plan con el diálogo propio; la cabecera pasa de "Plan: free" a "Plan: pro".
+- **Hecho cuando:** un usuario en plan Free no puede crear un monitor por encima de su límite ni bajar el intervalo por debajo del mínimo permitido; el error se lo dice explícitamente. **Verificado (API 15/15, Chromium 7/7):** el 6º monitor y el intervalo de 60 s dan 422 con el mensaje exacto del plan; en la UI el error aparece en el formulario con el enlace "Ver planes"; tras cambiar a pro el mismo monitor se crea (201) y con 60 s.
+
+---
+
+## 🎉 Fase 4 completa (equipos/roles, multi-región con quórum, planes) — Stripe simulado, SMS sigue pendiente
 
 ---
 
@@ -671,3 +675,159 @@ y "mismo slug en otro usuario" → 404 idénticos. `tsc` (api, web, worker),
 backfill comprobado en SQL (`gdev`, `gsanchezdom`). Datos de prueba
 eliminados; los tres usuarios reales (incluida la cuenta `@gsan-dev` que el
 usuario creó con el formulario nuevo mientras se verificaba) intactos.
+
+### 2026-09-21 — Fase 4.1: equipos y roles (organización activa, invitaciones, middleware de roles)
+**Contexto:** hasta aquí cada usuario tenía exactamente una organización y
+todas las rutas la resolvían implícitamente con `getPrimaryOrganizationId`.
+Con equipos un usuario puede estar en varias, con roles distintos en cada una.
+
+**Decisiones:**
+- **Organización activa por cabecera (`X-Organization-Id`), no en el JWT ni
+  en la URL.** En el JWT obligaría a reemitir el token al cambiar de
+  organización (y el refresh de 7 días arrastraría la antigua); en la URL
+  (`/orgs/:id/monitors`) habría que reescribir todas las rutas y enlaces
+  existentes. La cabecera la pone el cliente HTTP en un único sitio
+  (`client.ts`) y el WebSocket la manda en el handshake; sin cabecera se usa
+  la personal, así que todo lo anterior sigue funcionando sin cambios.
+- **"Personal" = `organizations.owner_user_id`, no "la membresía más
+  antigua".** El primer intento usaba la más antigua y la verificación lo
+  tumbó: al aceptar una invitación a una organización creada antes que la
+  propia, esa pasaba a ser la "personal" y el usuario creaba monitores en la
+  equivocada sin cabecera. Migración 0010 añade la columna con backfill (cada
+  organización previa tenía un único miembro admin: su dueño).
+- **Jerarquía de roles lineal** (readonly < editor < admin) aplicada con un
+  único `requireRole(min)` por ruta, en vez de una matriz permiso-por-acción:
+  tres roles no justifican un sistema de permisos granular, y el middleware
+  deja explícito en cada ruta qué exige.
+- **Invitaciones con token aleatorio hasheado (sha256) en BD**, 7 días de
+  caducidad, un solo uso, y aceptación solo con sesión cuyo email coincide.
+  El enlace del email no basta por sí solo para entrar con otra cuenta. Una
+  invitación pendiente al mismo email se reemplaza, no se acumula. Si el
+  email no se puede enviar, la invitación se borra y se devuelve 502 (no
+  queda una fila "fantasma" que el admin cree enviada).
+- **`GET /invitations/:token` es público** (el invitado puede no tener
+  cuenta) y solo revela organización, rol y email destino; con rate limit.
+- **Una organización nunca se queda sin admin** (409 al degradar o quitar al
+  último).
+- **Cambiar de organización recarga la página** (`window.location.assign`)
+  en vez de re-renderizar: garantiza que ningún componente, lista o socket
+  conserva datos de la organización anterior. Más tosco, más seguro.
+- **La UI oculta lo que el rol no permite** (botones de crear/borrar, formularios),
+  pero la autorización real vive solo en la API: ocultar es cortesía, no seguridad.
+- **Pendiente anotado:** las organizaciones de equipo no tienen URL pública
+  propia; `/status/<username>/<slug>` sigue resolviendo a la organización
+  personal del usuario. Requeriría `organizations.slug` (ver Fase 4.2/4.3 o
+  posterior). Las alertas por email siguen yendo a todos los miembros,
+  independientemente del rol.
+
+**Verificación:** ver checklist de 4.1 arriba (22 comprobaciones contra la
+API con el email real leído de Mailpit; 12 en Chromium real). `tsc` en
+api/web, `eslint`, `vite build` limpios. Datos de prueba eliminados; datos
+reales intactos.
+
+### 2026-09-21 — Fase 4.2: checks multi-región y quórum
+**Pregunta de diseño:** con workers en varias regiones, ¿cómo se decide que un
+monitor está caído cuando una región falla y otra no?
+
+**Arquitectura elegida: una cola por región, misma base de datos.**
+- Alternativas descartadas: (a) *una sola cola y que cada worker etiquete
+  el check con su región* — no garantiza que cada región compruebe cada
+  monitor (el worker más rápido se llevaría todos los jobs) ni permite
+  saber qué región "calla"; (b) *un job por monitor con fan-out interno a
+  N regiones por HTTP* — obliga a que los workers se expongan entre sí y
+  añade un punto único de fallo. Con una cola por región
+  (`monitor-checks--<región>`; BullMQ prohíbe `:` en nombres de cola) cada
+  worker solo ve trabajo de su región y la API programa cada monitor en
+  todas (`RegionQueues`). Con `CHECK_REGIONS=local` (por defecto) el sistema
+  es idéntico al anterior.
+- Regiones retiradas de la configuración: la API guarda en Redis el set de
+  regiones conocidas y al arrancar hace `obliterate()` de las colas que ya no
+  están; si no, sus job schedulers seguirían encolando checks sin consumidor.
+  Lo mismo con la cola anterior a esta fase (`monitor-checks` a secas).
+  **Verificado:** al volver a `local` la API registró "colas de regiones
+  retiradas eliminadas: eu-west, us-east" y en Redis solo quedó
+  `monitor-checks--local`.
+
+**Quórum: mayoría estricta, `Q = floor(R/2)+1`.** R=1 → 1 (comportamiento de
+siempre), R=2 → 2, R=3 → 2, R=5 → 3. Se aplica el MISMO quórum a dos
+preguntas que conviene no mezclar (ya se separaron en la Fase 2.2):
+1. **Estado instantáneo** (`monitors.consolidated_status`: up | degraded |
+   down): último check de cada región configurada. `down` si ≥Q regiones lo
+   ven caído, `degraded` si alguna pero <Q, `up` si ninguna. Es lo que ven
+   dashboard, detalle, status page y el evento WebSocket, que ahora se emite
+   **por cambio consolidado** y no por cada check crudo (con dos regiones,
+   cada check crudo de una región que discrepa produciría ruido).
+2. **Incidente:** una región "está fallando" si sus últimos N checks son
+   down (N = `INCIDENT_FAILURE_THRESHOLD`, como antes). Se abre incidente si
+   ≥Q regiones están fallando; `started_at` = el Q-ésimo inicio de racha
+   más antiguo (el instante en que se alcanzó el quórum); `cause_summary`
+   lista las regiones. Se cierra cuando el estado instantáneo deja de ser
+   `down`.
+- **Por qué mayoría y no "cualquiera" ni "todas":** "cualquiera" convierte
+  un problema de red local de una región en una alerta (justo lo que la
+  multi-región quiere evitar); "todas" hace que una región muerta oculte
+  una caída real para siempre. La mayoría tolera `floor((R-1)/2)` regiones
+  rotas o mintiendo. Con R=2 coincide con "todas" — es el precio de tener
+  solo dos; con tres regiones se obtiene tolerancia a una.
+- **Solo cuentan regiones configuradas.** Una región con checks antiguos
+  pero ya no en `CHECK_REGIONS` no participa (ni en el quórum ni en la UI).
+  Una región configurada que todavía no ha comprobado el monitor no cuenta
+  como caída (no hay evidencia) — se expone como `silentRegions`.
+- **Serialización con `SELECT … FOR UPDATE`** sobre la fila del monitor:
+  dos workers (dos regiones) pueden terminar un check del mismo monitor a
+  la vez; sin bloqueo ambos leerían el mismo estado previo y podrían abrir
+  dos incidentes o emitir dos transiciones idénticas.
+- **User-Agent con región** (`UptimePulse/1.0 (+region=<r>)`, salvo que el
+  usuario configure el suyo): lo que hace cualquier monitorizador serio y,
+  de paso, lo que permitió verificar el quórum sin infraestructura real (un
+  servidor local que falla solo para una región).
+
+**Consecuencias:** el uptime % y los gráficos agregan checks de todas las
+regiones (un monitor con 2 regiones tiene el doble de checks por intervalo;
+es lo esperado). `checks_hourly` no distingue región (pendiente si algún día
+se quiere uptime por región). El histórico previo se marcó `region='local'`
+y el consolidado se rellenó desde el último check (migración 0011).
+
+### 2026-09-21 — Fase 4.3: planes — Stripe simulado, no integrado
+**Decisión:** el cambio de plan es un endpoint directo (`POST
+/organizations/:id/plan`, solo admin) sin pasarela de pago, en vez de una
+integración real de Stripe.
+
+**Por qué:** la regla del proyecto es que nada se da por hecho sin haberlo
+ejecutado de verdad, y una integración de Stripe (Checkout + webhook
+`checkout.session.completed` + firma del webhook) no se puede verificar sin
+claves de una cuenta de Stripe en modo test, que no existen en esta sesión.
+Integrarla "a ciegas" produciría exactamente el tipo de código "debería
+funcionar" que se ha evitado en todas las fases. Aun así, lo que sí importa
+del dominio se aplica ya: límites reales por plan en la API (no solo en la
+UI), bloqueo de rebajas con exceso de monitores, conservación de canales al
+bajar, y una página de precios que lee los planes del backend.
+
+**Cómo encajaría Stripe cuando haya claves (para quien lo retome):**
+1. `plans.stripe_price_id` (columna nueva) y `organizations.stripe_customer_id`.
+2. `POST /organizations/:id/plan` pasa a crear una Checkout Session
+   (`mode: "subscription"`, `line_items: [{ price: plan.stripe_price_id }]`,
+   `client_reference_id: organizationId`) y devuelve su `url`; la página de
+   precios redirige ahí en vez de aplicar el cambio.
+3. `POST /webhooks/stripe` (sin JWT, verificando `Stripe-Signature` con el
+   secret del endpoint) aplica el cambio de plan en
+   `checkout.session.completed` y lo revierte a free en
+   `customer.subscription.deleted`. Es el webhook, no el cliente, quien
+   cambia `organizations.plan_id`.
+4. El endpoint actual se conserva solo para `free` (bajar) y para
+   desarrollo (`NODE_ENV !== "production"`), así la simulación sigue
+   sirviendo para probar los límites sin tarjeta.
+
+**Otras decisiones de 4.3:**
+- Los errores de límite devuelven, además del mensaje, un objeto `limit`
+  (`kind`, `plan`, `max`/`minIntervalSeconds`/`allowed`, `current`) para que
+  el frontend distinga "límite del plan" de "error de validación" y enlace
+  a `/pricing` sin analizar el texto.
+- `free` conserva exactamente los valores de la Fase 0.3 (5 monitores,
+  5 min, solo email); `pro` = 50 / 1 min / todos los canales / 9 €/mes.
+  Cifras de portfolio, no de negocio. `price_cents_monthly` en céntimos
+  para evitar decimales.
+- La página de precios ordena por precio y no tiene ningún dato
+  hardcodeado: cambiar un límite en `plans` cambia la página.
+- Se eliminó el plan `free-manual` que quedaba de la verificación manual de
+  la Fase 1.2 (documentada en DIARIO.md); ninguna organización lo usaba.

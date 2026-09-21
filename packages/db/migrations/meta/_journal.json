@@ -64,6 +64,34 @@
       "when": 1789968999306,
       "tag": "0008_users_username_and_status_page_slug_per_org",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789970181729,
+      "tag": "0009_organization_invitations",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789970467252,
+      "tag": "0010_organizations_owner",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789970991340,
+      "tag": "0011_checks_region_and_consolidated_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789971853601,
+      "tag": "0012_plans_price_and_pro",
+      "breakpoints": true
     }
   ]
 }

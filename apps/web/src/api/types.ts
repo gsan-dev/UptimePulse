@@ -30,6 +30,16 @@ export interface ApiMonitorLastCheck {
 // (ver withLastCheck en routes/monitors.ts) a partir del último check.
 export type ApiMonitor = Serialized<Monitor> & { lastCheck: ApiMonitorLastCheck | null };
 
+// Fase 4.2: último check de cada región configurada (solo en GET /monitors/:id).
+// status null = esa región todavía no ha comprobado este monitor.
+export interface ApiRegionSnapshot {
+  region: string;
+  status: CheckStatus | null;
+  responseTimeMs: number | null;
+  timestamp: string | null;
+}
+export type ApiMonitorDetail = ApiMonitor & { regions: ApiRegionSnapshot[] };
+
 export type UptimeRange = "24h" | "7d" | "30d" | "90d";
 
 // Refleja MonitorMetrics de apps/api/src/lib/metrics.ts (Fase 2.2/2.4).

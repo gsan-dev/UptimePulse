@@ -27,6 +27,19 @@ export function getAccessToken(): string | null {
   return accessToken;
 }
 
+// Organización activa (Fase 4.1): la elegida en el selector de la cabecera.
+// Va en cada petición como `X-Organization-Id`; sin ella la API usa la
+// organización personal del usuario, así que null = "la mía".
+let activeOrganizationId: string | null = null;
+
+export function setActiveOrganizationId(id: string | null): void {
+  activeOrganizationId = id;
+}
+
+export function getActiveOrganizationId(): string | null {
+  return activeOrganizationId;
+}
+
 interface RequestOptions extends Omit<RequestInit, "body"> {
   body?: unknown;
   /** Evita el reintento automático de refresh (usado por /auth/refresh y /auth/logout, para no entrar en bucle). */
@@ -48,6 +61,9 @@ async function rawFetch(path: string, options: RequestOptions = {}): Promise<Res
   }
   if (accessToken) {
     headers.set("Authorization", `Bearer ${accessToken}`);
+  }
+  if (activeOrganizationId) {
+    headers.set("X-Organization-Id", activeOrganizationId);
   }
 
   return fetch(`${API_BASE}${path}`, {

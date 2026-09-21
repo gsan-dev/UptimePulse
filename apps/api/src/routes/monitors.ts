@@ -1,15 +1,13 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { eq, and, or, isNull, desc, sql } from "drizzle-orm";
+import { eq, and, or, isNull, inArray, desc, sql } from "drizzle-orm";
 import { z } from "zod";
 import { checks, db, incidents, maintenanceWindows, monitorNotificationChannels, monitors, notificationChannels } from "@uptimepulse/db";
 import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepulse/server-utils";
-import { scheduleMonitorCheck, unscheduleMonitorCheck } from "@uptimepulse/queue";
 import { env } from "../env.js";
-import { requireAuth } from "../plugins/auth.js";
-import { getPrimaryOrganizationId } from "../lib/organizations.js";
-import { getOrganizationPlanLimits } from "../lib/plans.js";
+import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
+import { countOrganizationMonitors, getOrganizationPlanLimits } from "../lib/plans.js";
 import { getMonitorMetrics, getMonitorTimeseries, getOrganizationSummary, rangeToInterval, UPTIME_RANGES } from "../lib/metrics.js";
-import { monitorCheckQueue } from "../queue.js";
+import { regionQueues } from "../queue.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] as const;
 
@@ -154,34 +152,57 @@ async function withLastCheck<T extends { id: string }>(monitor: T) {
   return { ...monitor, lastCheck: await getLastCheck(monitor.id) };
 }
 
+// Fase 4.2: último check de cada región configurada — para que el detalle
+// muestre "desde dónde" se ve caído un monitor. Solo regiones de
+// CHECK_REGIONS: una región retirada puede tener checks antiguos que ya no
+// cuentan para el quórum, y aquí tampoco deben aparecer como si contaran.
+async function getRegionSnapshots(monitorId: string) {
+  const rows = await db
+    .selectDistinctOn([checks.region], {
+      region: checks.region,
+      status: checks.status,
+      responseTimeMs: checks.responseTimeMs,
+      timestamp: checks.timestamp,
+    })
+    .from(checks)
+    .where(and(eq(checks.monitorId, monitorId), inArray(checks.region, env.checkRegions)))
+    .orderBy(checks.region, desc(checks.timestamp));
+  const byRegion = new Map(rows.map((row) => [row.region, row]));
+  return env.checkRegions.map((region) => byRegion.get(region) ?? { region, status: null, responseTimeMs: null, timestamp: null });
+}
+
 export async function monitorRoutes(app: FastifyInstance): Promise<void> {
   app.addHook("preHandler", requireAuth);
+  // Fase 4.1: resuelve la organización activa (X-Organization-Id o la
+  // personal) y el rol del usuario en ella. Las rutas que escriben exigen
+  // además rol "editor" o superior; las de lectura valen con "readonly".
+  app.addHook("preHandler", requireOrganization);
 
-  app.post("/monitors", async (request, reply) => {
+  app.post("/monitors", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsed = createMonitorSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
     }
     const input = parsed.data;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.code(403).send({ error: "El usuario no pertenece a ninguna organización" });
-    }
+    const organizationId = request.organization!.id;
 
     const limits = await getOrganizationPlanLimits(organizationId);
     if (input.intervalSeconds < limits.minIntervalSeconds) {
       return reply
         .code(422)
-        .send({ error: `Tu plan exige un intervalo mínimo de ${limits.minIntervalSeconds} segundos` });
+        .send({
+          error: `Tu plan "${limits.planName}" exige un intervalo mínimo de ${limits.minIntervalSeconds} segundos`,
+          limit: { kind: "minInterval", plan: limits.planName, minIntervalSeconds: limits.minIntervalSeconds },
+        });
     }
 
-    const [{ count: currentCount }] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(monitors)
-      .where(eq(monitors.organizationId, organizationId));
+    const currentCount = await countOrganizationMonitors(organizationId);
     if (currentCount >= limits.maxMonitors) {
-      return reply.code(422).send({ error: `Tu plan permite un máximo de ${limits.maxMonitors} monitores` });
+      return reply.code(422).send({
+        error: `Tu plan "${limits.planName}" permite un máximo de ${limits.maxMonitors} monitores`,
+        limit: { kind: "maxMonitors", plan: limits.planName, max: limits.maxMonitors, current: currentCount },
+      });
     }
 
     try {
@@ -210,16 +231,13 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       })
       .returning();
 
-    await scheduleMonitorCheck(monitorCheckQueue, monitor.id, monitor.intervalSeconds);
+    await regionQueues.scheduleMonitorCheck(monitor.id, monitor.intervalSeconds);
 
     return reply.code(201).send(monitor);
   });
 
   app.get("/monitors", async (request, reply) => {
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.send([]);
-    }
+    const organizationId = request.organization!.id;
     const rows = await db.query.monitors.findMany({ where: eq(monitors.organizationId, organizationId) });
     const withStatus = await Promise.all(rows.map(withLastCheck));
     return reply.send(withStatus);
@@ -229,12 +247,12 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     const id = parseId(request, reply);
     if (!id) return;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
-    return reply.send(await withLastCheck(monitor));
+    return reply.send({ ...(await withLastCheck(monitor)), regions: await getRegionSnapshots(monitor.id) });
   });
 
   app.get("/monitors/:id/checks", async (request, reply) => {
@@ -246,8 +264,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: queryParsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -266,7 +284,7 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(serialized);
   });
 
-  app.patch("/monitors/:id", async (request, reply) => {
+  app.patch("/monitors/:id", { preHandler: requireRole("editor") }, async (request, reply) => {
     const id = parseId(request, reply);
     if (!id) return;
 
@@ -276,18 +294,21 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     }
     const patch = parsed.data;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const existing = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const existing = await findOwnedMonitor(organizationId, id);
     if (!existing) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
 
     if (patch.intervalSeconds !== undefined) {
-      const limits = await getOrganizationPlanLimits(organizationId!);
+      const limits = await getOrganizationPlanLimits(organizationId);
       if (patch.intervalSeconds < limits.minIntervalSeconds) {
         return reply
           .code(422)
-          .send({ error: `Tu plan exige un intervalo mínimo de ${limits.minIntervalSeconds} segundos` });
+          .send({
+          error: `Tu plan "${limits.planName}" exige un intervalo mínimo de ${limits.minIntervalSeconds} segundos`,
+          limit: { kind: "minInterval", plan: limits.planName, minIntervalSeconds: limits.minIntervalSeconds },
+        });
       }
     }
 
@@ -308,56 +329,56 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     // activo — si está pausado, no hay que reactivarlo de rebote por editar
     // otro campo cualquiera.
     if (patch.intervalSeconds !== undefined && !updated.isPaused) {
-      await scheduleMonitorCheck(monitorCheckQueue, updated.id, updated.intervalSeconds);
+      await regionQueues.scheduleMonitorCheck(updated.id, updated.intervalSeconds);
     }
 
     return reply.send(updated);
   });
 
-  app.delete("/monitors/:id", async (request, reply) => {
+  app.delete("/monitors/:id", { preHandler: requireRole("editor") }, async (request, reply) => {
     const id = parseId(request, reply);
     if (!id) return;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const existing = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const existing = await findOwnedMonitor(organizationId, id);
     if (!existing) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
 
     await db.delete(monitors).where(eq(monitors.id, id));
-    await unscheduleMonitorCheck(monitorCheckQueue, id);
+    await regionQueues.unscheduleMonitorCheck(id);
 
     return reply.code(204).send();
   });
 
-  app.post("/monitors/:id/pause", async (request, reply) => {
+  app.post("/monitors/:id/pause", { preHandler: requireRole("editor") }, async (request, reply) => {
     const id = parseId(request, reply);
     if (!id) return;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const existing = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const existing = await findOwnedMonitor(organizationId, id);
     if (!existing) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
 
     const [updated] = await db.update(monitors).set({ isPaused: true }).where(eq(monitors.id, id)).returning();
-    await unscheduleMonitorCheck(monitorCheckQueue, id);
+    await regionQueues.unscheduleMonitorCheck(id);
 
     return reply.send(updated);
   });
 
-  app.post("/monitors/:id/resume", async (request, reply) => {
+  app.post("/monitors/:id/resume", { preHandler: requireRole("editor") }, async (request, reply) => {
     const id = parseId(request, reply);
     if (!id) return;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const existing = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const existing = await findOwnedMonitor(organizationId, id);
     if (!existing) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
 
     const [updated] = await db.update(monitors).set({ isPaused: false }).where(eq(monitors.id, id)).returning();
-    await scheduleMonitorCheck(monitorCheckQueue, updated.id, updated.intervalSeconds);
+    await regionQueues.scheduleMonitorCheck(updated.id, updated.intervalSeconds);
 
     return reply.send(updated);
   });
@@ -373,8 +394,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: queryParsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -391,8 +412,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: queryParsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -404,10 +425,7 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
   // (Fase 2.4): uptime medio global + incidentes activos + una sparkline de
   // 24h por monitor, en una sola petición.
   app.get("/monitors/summary", async (request, reply) => {
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.send({ avgUptimePercentage: null, activeIncidents: 0, sparklines: {} });
-    }
+    const organizationId = request.organization!.id;
 
     const orgMonitors = await db.query.monitors.findMany({ where: eq(monitors.organizationId, organizationId) });
 
@@ -428,8 +446,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: queryParsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -465,8 +483,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     const id = parseId(request, reply);
     if (!id) return;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -480,7 +498,7 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(rows);
   });
 
-  app.post("/monitors/:id/maintenance-windows", async (request, reply) => {
+  app.post("/monitors/:id/maintenance-windows", { preHandler: requireRole("editor") }, async (request, reply) => {
     const id = parseId(request, reply);
     if (!id) return;
 
@@ -489,8 +507,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: parsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -508,13 +526,13 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(201).send(window);
   });
 
-  app.delete("/monitors/:id/maintenance-windows/:windowId", async (request, reply) => {
+  app.delete("/monitors/:id/maintenance-windows/:windowId", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = parseIdAndWindowId(request, reply);
     if (!parsedParams) return;
     const { id, windowId } = parsedParams;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -536,8 +554,8 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     const id = parseId(request, reply);
     if (!id) return;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -550,13 +568,13 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(rows.map((row) => row.channelId));
   });
 
-  app.post("/monitors/:id/notification-channels/:channelId", async (request, reply) => {
+  app.post("/monitors/:id/notification-channels/:channelId", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = parseIdAndChannelId(request, reply);
     if (!parsedParams) return;
     const { id, channelId } = parsedParams;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
@@ -578,13 +596,13 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(204).send();
   });
 
-  app.delete("/monitors/:id/notification-channels/:channelId", async (request, reply) => {
+  app.delete("/monitors/:id/notification-channels/:channelId", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = parseIdAndChannelId(request, reply);
     if (!parsedParams) return;
     const { id, channelId } = parsedParams;
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    const organizationId = request.organization!.id;
+    const monitor = await findOwnedMonitor(organizationId, id);
     if (!monitor) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }

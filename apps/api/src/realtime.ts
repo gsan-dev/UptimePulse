@@ -4,7 +4,7 @@ import { createAdapter } from "@socket.io/redis-adapter";
 import { createRedisConnection } from "@uptimepulse/queue";
 import { createLogger } from "@uptimepulse/shared";
 import { verifyAccessToken } from "./lib/tokens.js";
-import { getPrimaryOrganizationId } from "./lib/organizations.js";
+import { resolveOrganization } from "./lib/organizations.js";
 import { env } from "./env.js";
 
 const logger = createLogger("api");
@@ -44,11 +44,16 @@ export function attachRealtime(httpServer: HttpServer): AppSocketServer {
     }
     try {
       const payload = verifyAccessToken(token);
-      const organizationId = await getPrimaryOrganizationId(payload.sub);
-      if (!organizationId) {
-        return next(new Error("El usuario no pertenece a ninguna organización"));
+      // Fase 4.1: el cliente indica la organización activa en el handshake
+      // (equivale a la cabecera X-Organization-Id del resto de la API); sin
+      // ella, la personal. Así el socket solo recibe eventos de la
+      // organización que el usuario está viendo.
+      const requested = socket.handshake.auth?.organizationId as string | undefined;
+      const membership = await resolveOrganization(payload.sub, requested);
+      if (!membership) {
+        return next(new Error("No perteneces a esa organización"));
       }
-      socket.data.organizationId = organizationId;
+      socket.data.organizationId = membership.organizationId;
       next();
     } catch {
       next(new Error("Token inválido o caducado"));

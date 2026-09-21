@@ -5,8 +5,11 @@ import { useAuth } from "./AuthContext";
 export interface MonitorStatusChangedEvent {
   monitorId: string;
   name: string;
-  status: "up" | "down";
-  previousStatus: "up" | "down" | null;
+  // Fase 4.2: estado consolidado entre regiones (puede ser "degraded").
+  status: "up" | "degraded" | "down";
+  previousStatus: "up" | "degraded" | "down" | null;
+  downRegions: string[];
+  region: string;
   responseTimeMs: number | null;
   timestamp: string;
 }

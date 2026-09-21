@@ -2,8 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { db, monitors, statusPageMonitors, statusPages } from "@uptimepulse/db";
-import { requireAuth } from "../plugins/auth.js";
-import { getPrimaryOrganizationId } from "../lib/organizations.js";
+import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
 
 const slugSchema = z
   .string()
@@ -56,17 +55,18 @@ async function replaceStatusPageMonitors(statusPageId: string, monitorIds: strin
 
 export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
   app.addHook("preHandler", requireAuth);
+  // Fase 4.1: resuelve la organización activa (X-Organization-Id o la
+  // personal) y el rol del usuario en ella. Las rutas que escriben exigen
+  // además rol "editor" o superior; las de lectura valen con "readonly".
+  app.addHook("preHandler", requireOrganization);
 
-  app.post("/status-pages", async (request, reply) => {
+  app.post("/status-pages", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsed = createStatusPageSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.code(403).send({ error: "El usuario no pertenece a ninguna organización" });
-    }
+    const organizationId = request.organization!.id;
 
     // El slug solo tiene que ser único dentro de ESTA organización: la URL
     // pública lleva delante el username del dueño (/status/<username>/<slug>),
@@ -96,10 +96,7 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/status-pages", async (request, reply) => {
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    if (!organizationId) {
-      return reply.send([]);
-    }
+    const organizationId = request.organization!.id;
     const rows = await db.query.statusPages.findMany({ where: eq(statusPages.organizationId, organizationId) });
     return reply.send(rows);
   });
@@ -110,8 +107,8 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: "El id debe ser un UUID válido" });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const page = organizationId ? await findOwnedStatusPage(organizationId, parsedParams.data.id) : null;
+    const organizationId = request.organization!.id;
+    const page = await findOwnedStatusPage(organizationId, parsedParams.data.id);
     if (!page) {
       return reply.code(404).send({ error: "Página no encontrada" });
     }
@@ -124,7 +121,7 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ ...page, monitorIds: links.map((link) => link.monitorId) });
   });
 
-  app.patch("/status-pages/:id", async (request, reply) => {
+  app.patch("/status-pages/:id", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = idParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: "El id debe ser un UUID válido" });
@@ -135,8 +132,8 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: parsed.error.flatten() });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const page = organizationId ? await findOwnedStatusPage(organizationId, parsedParams.data.id) : null;
+    const organizationId = request.organization!.id;
+    const page = await findOwnedStatusPage(organizationId, parsedParams.data.id);
     if (!page) {
       return reply.code(404).send({ error: "Página no encontrada" });
     }
@@ -148,21 +145,21 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
         : [page];
 
     if (monitorIds !== undefined) {
-      const ownedMonitorIds = await filterOwnedMonitorIds(organizationId!, monitorIds);
+      const ownedMonitorIds = await filterOwnedMonitorIds(organizationId, monitorIds);
       await replaceStatusPageMonitors(page.id, ownedMonitorIds);
     }
 
     return reply.send(updated);
   });
 
-  app.delete("/status-pages/:id", async (request, reply) => {
+  app.delete("/status-pages/:id", { preHandler: requireRole("editor") }, async (request, reply) => {
     const parsedParams = idParamSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(400).send({ error: "El id debe ser un UUID válido" });
     }
 
-    const organizationId = await getPrimaryOrganizationId(request.user!.id);
-    const page = organizationId ? await findOwnedStatusPage(organizationId, parsedParams.data.id) : null;
+    const organizationId = request.organization!.id;
+    const page = await findOwnedStatusPage(organizationId, parsedParams.data.id);
     if (!page) {
       return reply.code(404).send({ error: "Página no encontrada" });
     }

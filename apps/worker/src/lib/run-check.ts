@@ -38,6 +38,7 @@ async function runSingleAttempt(monitor: MonitorToCheck): Promise<CheckOutcome> 
       body: monitor.body,
       expectedStatus: monitor.expectedStatus,
       timeoutMs: monitor.timeoutMs,
+      region: env.region,
     });
   }
   if (monitor.type === "tcp") {

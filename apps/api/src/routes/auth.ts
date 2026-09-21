@@ -88,7 +88,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       const freePlan = await tx.query.plans.findFirst({ where: eq(plans.name, "free") });
       const [org] = await tx
         .insert(organizations)
-        .values({ name: organizationName ?? `Organización de ${fullName}`, planId: freePlan?.id })
+        .values({ name: organizationName ?? `Organización de ${fullName}`, planId: freePlan?.id, ownerUserId: newUser.id })
         .returning();
       await tx.insert(organizationMembers).values({
         userId: newUser.id,

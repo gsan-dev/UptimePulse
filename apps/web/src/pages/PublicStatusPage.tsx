@@ -22,6 +22,7 @@ const DAILY_COLOR: Record<DailyStatus, string> = {
 
 const CURRENT_STATUS_LABEL: Record<string, { label: string; className: string }> = {
   up: { label: "Operativo", className: "text-emerald-400" },
+  degraded: { label: "Degradado", className: "text-amber-400" },
   down: { label: "Caído", className: "text-red-400" },
   paused: { label: "Pausado", className: "text-gray-400" },
   pending: { label: "Sin datos", className: "text-gray-500" },

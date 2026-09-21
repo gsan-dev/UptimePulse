@@ -9,7 +9,9 @@ import {
   type NotificationChannelType,
   type TestChannelResult,
 } from "../api/channels";
+import { FormError } from "../components/PlanLimitError";
 import { useConfirm } from "../context/ConfirmContext";
+import { useOrganization } from "../context/OrganizationContext";
 import type { ApiNotificationChannel } from "../api/types";
 
 const inputClass =
@@ -37,11 +39,12 @@ export function NotificationChannelsPage() {
   const [webhookUrl, setWebhookUrl] = useState("");
   const [url, setUrl] = useState("");
   const [secret, setSecret] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ApiError | string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [testResults, setTestResults] = useState<Record<string, TestChannelResult | "pending">>({});
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const confirm = useConfirm();
+  const { canEdit } = useOrganization();
 
   const refresh = useCallback(async () => {
     try {
@@ -68,7 +71,7 @@ export function NotificationChannelsPage() {
       setSecret("");
       await refresh();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "No se pudo crear el canal");
+      setError(err instanceof ApiError ? err : "No se pudo crear el canal");
     } finally {
       setIsSubmitting(false);
     }
@@ -77,7 +80,8 @@ export function NotificationChannelsPage() {
   async function handleDelete(id: string, channelName: string): Promise<void> {
     const confirmed = await confirm({
       title: `¿Borrar el canal "${channelName}"?`,
-      description: "Se desactivará en todos los monitores que lo tuvieran activado. Esta acción no se puede deshacer.",
+      description:
+        "Se desactivará en todos los monitores que lo tuvieran activado. Esta acción no se puede deshacer.",
     });
     if (!confirmed) return;
 
@@ -103,7 +107,10 @@ export function NotificationChannelsPage() {
     } catch (err) {
       setTestResults((prev) => ({
         ...prev,
-        [id]: { ok: false, error: err instanceof ApiError ? err.message : "No se pudo probar el canal" },
+        [id]: {
+          ok: false,
+          error: err instanceof ApiError ? err.message : "No se pudo probar el canal",
+        },
       }));
     }
   }
@@ -116,77 +123,101 @@ export function NotificationChannelsPage() {
 
       <h1 className="mt-4 mb-6 text-2xl font-semibold text-white">Canales de notificación</h1>
       <p className="mb-6 text-sm text-gray-400">
-        Email siempre se envía a los miembros de la organización cuando un monitor cambia de estado. Estos canales son
-        adicionales — actívalos por monitor desde su página de detalle.
+        Email siempre se envía a los miembros de la organización cuando un monitor cambia de estado.
+        Estos canales son adicionales — actívalos por monitor desde su página de detalle.
       </p>
 
-      <form onSubmit={(e) => void handleSubmit(e)} className="mb-8 space-y-4 rounded-xl border border-white/10 bg-white/5 p-6">
-        {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
+      {!canEdit && (
+        <p className="mb-6 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+          Tu rol en esta organización es de solo lectura: puedes ver, pero no crear ni borrar.
+        </p>
+      )}
+      {canEdit && (
+        <form
+          onSubmit={(e) => void handleSubmit(e)}
+          className="mb-8 space-y-4 rounded-xl border border-white/10 bg-white/5 p-6"
+        >
+          <FormError error={error} />
 
-        <Field label="Tipo">
-          <select value={type} onChange={(e) => setType(e.target.value as NotificationChannelType)} className={inputClass}>
-            <option value="discord">Discord</option>
-            <option value="slack">Slack</option>
-            <option value="webhook">Webhook genérico (con firma HMAC)</option>
-          </select>
-        </Field>
+          <Field label="Tipo">
+            <select
+              value={type}
+              onChange={(e) => setType(e.target.value as NotificationChannelType)}
+              className={inputClass}
+            >
+              <option value="discord">Discord</option>
+              <option value="slack">Slack</option>
+              <option value="webhook">Webhook genérico (con firma HMAC)</option>
+            </select>
+          </Field>
 
-        <Field label="Nombre (para distinguirlo en la lista)">
-          <input
-            required
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder={type === "discord" ? "Discord #alertas" : type === "slack" ? "Slack #incidentes" : "Mi endpoint"}
-            className={inputClass}
-          />
-        </Field>
-
-        {(type === "discord" || type === "slack") && (
-          <Field label="URL del webhook">
+          <Field label="Nombre (para distinguirlo en la lista)">
             <input
               required
-              type="url"
-              value={webhookUrl}
-              onChange={(e) => setWebhookUrl(e.target.value)}
-              placeholder={type === "discord" ? "https://discord.com/api/webhooks/..." : "https://hooks.slack.com/services/..."}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={
+                type === "discord"
+                  ? "Discord #alertas"
+                  : type === "slack"
+                    ? "Slack #incidentes"
+                    : "Mi endpoint"
+              }
               className={inputClass}
             />
           </Field>
-        )}
 
-        {type === "webhook" && (
-          <>
-            <Field label="URL de destino">
+          {(type === "discord" || type === "slack") && (
+            <Field label="URL del webhook">
               <input
                 required
                 type="url"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                placeholder="https://tu-servidor.com/webhooks/uptimepulse"
+                value={webhookUrl}
+                onChange={(e) => setWebhookUrl(e.target.value)}
+                placeholder={
+                  type === "discord"
+                    ? "https://discord.com/api/webhooks/..."
+                    : "https://hooks.slack.com/services/..."
+                }
                 className={inputClass}
               />
             </Field>
-            <Field label="Secreto (para firmar el payload con HMAC-SHA256)">
-              <input
-                required
-                minLength={8}
-                value={secret}
-                onChange={(e) => setSecret(e.target.value)}
-                placeholder="al menos 8 caracteres"
-                className={inputClass}
-              />
-            </Field>
-          </>
-        )}
+          )}
 
-        <button
-          type="submit"
-          disabled={isSubmitting}
-          className="w-full rounded-md bg-emerald-600 px-3 py-2 font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
-        >
-          {isSubmitting ? "Creando…" : "Crear canal"}
-        </button>
-      </form>
+          {type === "webhook" && (
+            <>
+              <Field label="URL de destino">
+                <input
+                  required
+                  type="url"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://tu-servidor.com/webhooks/uptimepulse"
+                  className={inputClass}
+                />
+              </Field>
+              <Field label="Secreto (para firmar el payload con HMAC-SHA256)">
+                <input
+                  required
+                  minLength={8}
+                  value={secret}
+                  onChange={(e) => setSecret(e.target.value)}
+                  placeholder="al menos 8 caracteres"
+                  className={inputClass}
+                />
+              </Field>
+            </>
+          )}
+
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="w-full rounded-md bg-emerald-600 px-3 py-2 font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {isSubmitting ? "Creando…" : "Crear canal"}
+          </button>
+        </form>
+      )}
 
       {channels === null && <p className="text-gray-400">Cargando…</p>}
 
@@ -204,7 +235,9 @@ export function NotificationChannelsPage() {
               <div className="flex items-center justify-between gap-3">
                 <div>
                   <p className="font-medium text-white">{channel.name}</p>
-                  <p className="text-sm text-gray-400">{TYPE_LABELS[channel.type as NotificationChannelType]}</p>
+                  <p className="text-sm text-gray-400">
+                    {TYPE_LABELS[channel.type as NotificationChannelType]}
+                  </p>
                 </div>
                 <div className="flex shrink-0 gap-2">
                   <button
@@ -214,18 +247,22 @@ export function NotificationChannelsPage() {
                   >
                     {result === "pending" ? "Probando…" : "Probar conexión"}
                   </button>
-                  <button
-                    onClick={() => void handleDelete(channel.id, channel.name)}
-                    disabled={deletingId === channel.id}
-                    className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
-                  >
-                    {deletingId === channel.id ? "Borrando…" : "Borrar"}
-                  </button>
+                  {canEdit && (
+                    <button
+                      onClick={() => void handleDelete(channel.id, channel.name)}
+                      disabled={deletingId === channel.id}
+                      className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+                    >
+                      {deletingId === channel.id ? "Borrando…" : "Borrar"}
+                    </button>
+                  )}
                 </div>
               </div>
               {result && result !== "pending" && (
                 <p className={`mt-2 text-sm ${result.ok ? "text-emerald-400" : "text-red-400"}`}>
-                  {result.ok ? `✅ Conexión correcta${result.detail ? ` (${result.detail})` : ""}` : `❌ ${result.error}`}
+                  {result.ok
+                    ? `✅ Conexión correcta${result.detail ? ` (${result.detail})` : ""}`
+                    : `❌ ${result.error}`}
                 </p>
               )}
             </li>

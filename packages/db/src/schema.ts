@@ -1,6 +1,7 @@
 import {
   bigint,
   boolean,
+  index,
   integer,
   jsonb,
   pgEnum,
@@ -17,6 +18,10 @@ import {
 export const orgRoleEnum = pgEnum("org_role", ["admin", "editor", "readonly"]);
 export const monitorTypeEnum = pgEnum("monitor_type", ["http", "tcp", "ping"]);
 export const checkStatusEnum = pgEnum("check_status", ["up", "down"]);
+// Estado consolidado de un monitor a partir de todas sus regiones (Fase
+// 4.2): "degraded" = alguna región lo ve caído pero no las suficientes para
+// el quórum. Ver apps/worker/src/lib/health.ts.
+export const monitorHealthEnum = pgEnum("monitor_health", ["up", "degraded", "down"]);
 export const channelTypeEnum = pgEnum("channel_type", [
   "email",
   "sms",
@@ -33,12 +38,21 @@ export const plans = pgTable("plans", {
   maxMonitors: integer("max_monitors").notNull(),
   minIntervalSeconds: integer("min_interval_seconds").notNull(),
   allowedChannels: jsonb("allowed_channels").notNull().$type<string[]>(),
+  // Fase 4.3: para la página de precios. En céntimos para no usar
+  // decimales; 0 = gratis. El orden de la página es por precio.
+  priceCentsMonthly: integer("price_cents_monthly").notNull().default(0),
 });
 
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
   planId: uuid("plan_id").references(() => plans.id),
+  // Quién la creó (Fase 4.1). La organización "personal" de un usuario es la
+  // que se creó en su registro; con equipos ya no vale "la más antigua de
+  // las que es miembro" (puede unirse a una más antigua que la suya), así
+  // que se guarda explícitamente. No es una FK con cascade: borrar el
+  // usuario no debe borrar una organización con más miembros.
+  ownerUserId: uuid("owner_user_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -74,6 +88,25 @@ export const organizationMembers = pgTable(
   (table) => [primaryKey({ columns: [table.userId, table.organizationId] })]
 );
 
+// --- Invitaciones a organizaciones (Fase 4.1) ---
+// El token solo se guarda hasheado (sha256): si se filtrara la base de datos
+// nadie podría aceptar invitaciones ajenas. El token en claro va únicamente
+// en el email. Una invitación es de un solo uso (accepted_at) y caduca.
+
+export const organizationInvitations = pgTable("organization_invitations", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  organizationId: uuid("organization_id")
+    .notNull()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  email: text("email").notNull(),
+  role: orgRoleEnum("role").notNull().default("readonly"),
+  tokenHash: text("token_hash").notNull().unique(),
+  invitedByUserId: uuid("invited_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // --- Monitores ---
 
 export const monitors = pgTable("monitors", {
@@ -102,6 +135,12 @@ export const monitors = pgTable("monitors", {
   // (el certificado se renovó) — así una alerta nunca se reenvía para el
   // mismo certificado, pero sí vuelve a dispararse para uno nuevo.
   sslLastAlertedThresholdDays: integer("ssl_last_alerted_threshold_days"),
+  // --- Multi-región (Fase 4.2) ---
+  // Lo mantiene el worker tras cada check aplicando el quórum entre
+  // regiones; null hasta el primer check. Antes el estado se derivaba del
+  // último check sin más, lo que con varias regiones ya no tiene sentido
+  // (el "último" sería el de la región que casualmente acabó antes).
+  consolidatedStatus: monitorHealthEnum("consolidated_status"),
 });
 
 // --- Checks (hypertable de TimescaleDB, ver migración 0002) ---
@@ -122,8 +161,16 @@ export const checks = pgTable(
     responseTimeMs: integer("response_time_ms"),
     httpStatus: integer("http_status"),
     errorMessage: text("error_message"),
+    // Región del worker que ejecutó el check (Fase 4.2). "local" es la
+    // única región cuando no se configura CHECK_REGIONS.
+    region: text("region").notNull().default("local"),
   },
-  (table) => [primaryKey({ columns: [table.id, table.timestamp] })]
+  (table) => [
+    primaryKey({ columns: [table.id, table.timestamp] }),
+    // "Último check de cada región de este monitor" y "últimos N checks de
+    // esta región" son las dos consultas del quórum, en cada check.
+    index("checks_monitor_region_timestamp_idx").on(table.monitorId, table.region, table.timestamp.desc()),
+  ]
 );
 
 // --- Incidentes ---

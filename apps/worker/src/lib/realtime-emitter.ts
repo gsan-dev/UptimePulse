@@ -13,8 +13,13 @@ const emitter = new Emitter(redisClient);
 export interface MonitorStatusChangedPayload {
   monitorId: string;
   name: string;
-  status: "up" | "down";
-  previousStatus: "up" | "down" | null;
+  // Fase 4.2: es el estado CONSOLIDADO entre regiones (puede ser
+  // "degraded"), no el resultado crudo del último check.
+  status: "up" | "degraded" | "down";
+  previousStatus: "up" | "degraded" | "down" | null;
+  /** Regiones que ven el monitor caído ahora mismo. */
+  downRegions: string[];
+  region: string;
   responseTimeMs: number | null;
   timestamp: string;
 }

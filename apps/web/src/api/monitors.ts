@@ -8,6 +8,7 @@ import type {
   ApiTimeseriesPoint,
   MonitorType,
   UptimeRange,
+  ApiMonitorDetail,
 } from "./types";
 
 export interface CreateMonitorInput {
@@ -29,8 +30,8 @@ export function listMonitors(): Promise<ApiMonitor[]> {
   return apiFetch<ApiMonitor[]>("/monitors");
 }
 
-export function getMonitor(id: string): Promise<ApiMonitor> {
-  return apiFetch<ApiMonitor>(`/monitors/${id}`);
+export function getMonitor(id: string): Promise<ApiMonitorDetail> {
+  return apiFetch<ApiMonitorDetail>(`/monitors/${id}`);
 }
 
 export function listMonitorChecks(id: string, limit = 20): Promise<ApiCheck[]> {
@@ -61,7 +62,10 @@ export function getMonitorMetrics(id: string, range: UptimeRange): Promise<ApiMo
   return apiFetch<ApiMonitorMetrics>(`/monitors/${id}/metrics?range=${range}`);
 }
 
-export function getMonitorTimeseries(id: string, range: UptimeRange): Promise<ApiTimeseriesPoint[]> {
+export function getMonitorTimeseries(
+  id: string,
+  range: UptimeRange
+): Promise<ApiTimeseriesPoint[]> {
   return apiFetch<ApiTimeseriesPoint[]>(`/monitors/${id}/timeseries?range=${range}`);
 }
 

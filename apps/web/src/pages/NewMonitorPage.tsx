@@ -2,6 +2,7 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { createMonitor } from "../api/monitors";
+import { FormError } from "../components/PlanLimitError";
 import type { MonitorType } from "../api/types";
 
 const inputClass =
@@ -24,7 +25,7 @@ export function NewMonitorPage() {
   const [intervalSeconds, setIntervalSeconds] = useState(300);
   const [timeoutMs, setTimeoutMs] = useState(5000);
   const [expectedStatus, setExpectedStatus] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ApiError | string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   async function handleSubmit(event: FormEvent): Promise<void> {
@@ -42,7 +43,7 @@ export function NewMonitorPage() {
       });
       navigate("/monitors");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "No se pudo crear el monitor");
+      setError(err instanceof ApiError ? err : "No se pudo crear el monitor");
     } finally {
       setIsSubmitting(false);
     }
@@ -51,15 +52,27 @@ export function NewMonitorPage() {
   return (
     <div className="mx-auto max-w-lg px-4 py-8">
       <h1 className="mb-6 text-2xl font-semibold text-white">Nuevo monitor</h1>
-      <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4 rounded-xl border border-white/10 bg-white/5 p-6">
-        {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
+      <form
+        onSubmit={(e) => void handleSubmit(e)}
+        className="space-y-4 rounded-xl border border-white/10 bg-white/5 p-6"
+      >
+        <FormError error={error} />
 
         <Field label="Nombre">
-          <input required value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />
+          <input
+            required
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className={inputClass}
+          />
         </Field>
 
         <Field label="Tipo">
-          <select value={type} onChange={(e) => setType(e.target.value as MonitorType)} className={inputClass}>
+          <select
+            value={type}
+            onChange={(e) => setType(e.target.value as MonitorType)}
+            className={inputClass}
+          >
             <option value="http">HTTP</option>
             <option value="tcp">TCP</option>
             <option value="ping">Ping (el worker todavía no lo ejecuta, ver TASK.md)</option>
@@ -71,7 +84,13 @@ export function NewMonitorPage() {
             required
             value={target}
             onChange={(e) => setTarget(e.target.value)}
-            placeholder={type === "http" ? "https://ejemplo.com" : type === "tcp" ? "ejemplo.com:443" : "ejemplo.com"}
+            placeholder={
+              type === "http"
+                ? "https://ejemplo.com"
+                : type === "tcp"
+                  ? "ejemplo.com:443"
+                  : "ejemplo.com"
+            }
             className={inputClass}
           />
         </Field>

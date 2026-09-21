@@ -1,26 +1,16 @@
-import { desc, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import type { Job } from "bullmq";
 import { checks, db, monitors } from "@uptimepulse/db";
 import type { MonitorCheckJobData } from "@uptimepulse/queue";
 import { createLogger } from "@uptimepulse/shared";
 import { runCheckWithRetries } from "./run-check.js";
 import { notifyTransition } from "./notifications.js";
-import { updateIncidentState } from "./incidents.js";
+import { evaluateMonitorHealth } from "./health.js";
 import { emitMonitorStatusChanged } from "./realtime-emitter.js";
 import { checkSslExpiry } from "./ssl-alerts.js";
 import { env } from "../env.js";
 
 const logger = createLogger("worker");
-
-async function getPreviousCheckStatus(monitorId: string): Promise<"up" | "down" | null> {
-  const [last] = await db
-    .select({ status: checks.status })
-    .from(checks)
-    .where(eq(checks.monitorId, monitorId))
-    .orderBy(desc(checks.timestamp))
-    .limit(1);
-  return last?.status ?? null;
-}
 
 /**
  * Procesa un job de la cola: ejecuta el check de un monitor y guarda el
@@ -34,15 +24,6 @@ export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<vo
   if (!monitor || monitor.isPaused) {
     return;
   }
-
-  // Se lee ANTES de insertar el nuevo check — es la única forma de saber si
-  // este check cambia el estado visible del monitor. Deliberadamente
-  // independiente del motor de incidentes (Fase 2.2): el dashboard debe
-  // reflejar el estado real de cada check al instante, mientras que abrir un
-  // incidente/alertar exige N caídas consecutivas. Son dos preguntas
-  // distintas ("¿qué está pasando ahora mismo?" vs. "¿es esto una caída de
-  // verdad?") que conviene no mezclar.
-  const previousStatus = await getPreviousCheckStatus(monitor.id);
 
   const outcome = await runCheckWithRetries({
     id: monitor.id,
@@ -63,48 +44,67 @@ export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<vo
       responseTimeMs: outcome.responseTimeMs,
       httpStatus: outcome.httpStatus,
       errorMessage: outcome.errorMessage,
+      region: env.region,
     })
     .returning();
 
   logger.info("check registrado", {
     monitorId: monitor.id,
     name: monitor.name,
+    region: env.region,
     status: outcome.status,
     responseTimeMs: outcome.responseTimeMs,
     errorMessage: outcome.errorMessage,
     pid: process.pid,
   });
 
+  // Motor de estado multi-región (Fase 4.2): consolida el último check de
+  // cada región con el quórum configurado y decide, en la misma transacción,
+  // si este check cambia el estado visible del monitor y si abre o cierra un
+  // incidente (N caídas consecutivas por región, ≥ quórum regiones, fuera de
+  // ventanas de mantenimiento). Sustituye a "estado = último check" (Fases
+  // 1-3), que con varias regiones dependería de cuál acabó antes.
+  const health = await evaluateMonitorHealth({
+    monitorId: monitor.id,
+    regions: env.checkRegions,
+    failureThreshold: env.incidentFailureThreshold,
+    checkTimestamp: savedCheck.timestamp,
+    errorMessage: outcome.errorMessage,
+  });
+
   // Tiempo real (Fase 2.3): el dashboard se entera al instante de un cambio
-  // de estado sin sondear — vía Redis, hasta la API, hasta el navegador.
-  if (previousStatus !== null && previousStatus !== outcome.status) {
+  // de estado consolidado sin sondear — vía Redis, hasta la API, hasta el
+  // navegador. Se emite solo cuando el consolidado cambia (no en cada check
+  // crudo): con dos regiones, que una lo vea caído mientras la otra no lo
+  // pone "degradado", y eso sí se notifica.
+  if (health.previous !== null && health.previous !== health.current) {
     emitMonitorStatusChanged(monitor.organizationId, {
       monitorId: monitor.id,
       name: monitor.name,
-      status: outcome.status,
-      previousStatus,
+      status: health.current,
+      previousStatus: health.previous,
+      downRegions: health.downRegions,
+      region: env.region,
       responseTimeMs: outcome.responseTimeMs,
       timestamp: savedCheck.timestamp.toISOString(),
     });
   }
 
-  // El motor de incidentes (Fase 2.2) decide si este check abre/cierra un
-  // incidente real (N caídas consecutivas, respetando ventanas de
-  // mantenimiento) — las notificaciones ahora se disparan por incidente, no
-  // por cada check "down" suelto, para no alertar por un único bache.
-  const transition = await updateIncidentState(
-    monitor.id,
-    outcome.status,
-    outcome.errorMessage,
-    savedCheck.timestamp,
-    env.incidentFailureThreshold
-  );
-
-  if (transition.opened || transition.closed) {
+  if (health.incidentOpened || health.incidentClosed) {
     try {
       await notifyTransition(
         { id: monitor.id, name: monitor.name, target: monitor.target, organizationId: monitor.organizationId },
-        outcome
+        {
+          ...outcome,
+          // Al cerrar un incidente el check que lo cierra puede ser "up" en
+          // esta región pero el consolidado es lo que manda; y al abrirlo,
+          // el mensaje incluye desde qué regiones se vio.
+          status: health.incidentOpened ? "down" : "up",
+          errorMessage:
+            health.incidentOpened && env.checkRegions.length > 1
+              ? `${outcome.errorMessage ?? "Caída"} (visto desde: ${health.failingRegions.join(", ")})`
+              : outcome.errorMessage,
+        }
       );
     } catch (error) {
       logger.error("no se pudo enviar la notificación de cambio de estado", {

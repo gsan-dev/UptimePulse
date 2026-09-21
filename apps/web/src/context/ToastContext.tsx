@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
 
-export type ToastTone = "up" | "down";
+export type ToastTone = "up" | "degraded" | "down";
 
 interface Toast {
   id: number;
@@ -35,7 +35,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             className={`pointer-events-auto rounded-md border px-4 py-3 text-sm shadow-lg backdrop-blur ${
               toast.tone === "down"
                 ? "border-red-500/30 bg-red-950/90 text-red-200"
-                : "border-emerald-500/30 bg-emerald-950/90 text-emerald-200"
+                : toast.tone === "degraded"
+                  ? "border-amber-500/30 bg-amber-950/90 text-amber-200"
+                  : "border-emerald-500/30 bg-emerald-950/90 text-emerald-200"
             }`}
           >
             {toast.message}
