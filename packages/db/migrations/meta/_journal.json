@@ -92,6 +92,13 @@
       "when": 1789971853601,
       "tag": "0012_plans_price_and_pro",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790025417130,
+      "tag": "0013_api_keys_name_prefix_scopes",
+      "breakpoints": true
     }
   ]
 }

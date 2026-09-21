@@ -1,5 +1,5 @@
 import net from "node:net";
-import type { CheckOutcome } from "./types.js";
+import type { CheckErrorKind, CheckOutcome } from "./types.js";
 
 export interface TcpCheckInput {
   target: string; // formato "host:puerto", validado al crear el monitor (Fase 1.2)
@@ -21,7 +21,13 @@ export function runTcpCheck(input: TcpCheckInput): Promise<CheckOutcome> {
     }
 
     socket.once("connect", () => {
-      finish({ status: "up", responseTimeMs: Date.now() - startedAt, httpStatus: null, errorMessage: null });
+      finish({
+        status: "up",
+        responseTimeMs: Date.now() - startedAt,
+        httpStatus: null,
+        errorMessage: null,
+        errorKind: null,
+      });
     });
 
     socket.once("timeout", () => {
@@ -30,6 +36,7 @@ export function runTcpCheck(input: TcpCheckInput): Promise<CheckOutcome> {
         responseTimeMs: Date.now() - startedAt,
         httpStatus: null,
         errorMessage: `Timeout tras ${input.timeoutMs}ms conectando a ${host}:${port}`,
+        errorKind: "timeout",
       });
     });
 
@@ -39,9 +46,18 @@ export function runTcpCheck(input: TcpCheckInput): Promise<CheckOutcome> {
         responseTimeMs: Date.now() - startedAt,
         httpStatus: null,
         errorMessage: describeSocketError(error),
+        errorKind: classifySocketError(error),
       });
     });
   });
+}
+
+function classifySocketError(error: NodeJS.ErrnoException): CheckErrorKind {
+  if (error.code === "ENOTFOUND" || error.code === "EAI_AGAIN") return "dns";
+  if (error.code === "ETIMEDOUT") return "timeout";
+  if (error.code === "ECONNREFUSED" || error.code === "EHOSTUNREACH" || error.code === "ECONNRESET")
+    return "connection";
+  return "other";
 }
 
 function describeSocketError(error: NodeJS.ErrnoException): string {

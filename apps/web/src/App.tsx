@@ -16,6 +16,7 @@ import { ProfilePage } from "./pages/ProfilePage";
 import { PublicStatusPage } from "./pages/PublicStatusPage";
 import { RegisterPage } from "./pages/RegisterPage";
 import { StatusPagesPage } from "./pages/StatusPagesPage";
+import { ApiKeysPage } from "./pages/ApiKeysPage";
 import { TeamPage } from "./pages/TeamPage";
 
 export default function App() {
@@ -42,6 +43,7 @@ export default function App() {
                   <Route path="/status-pages" element={<StatusPagesPage />} />
                   <Route path="/profile" element={<ProfilePage />} />
                   <Route path="/team" element={<TeamPage />} />
+                  <Route path="/api-keys" element={<ApiKeysPage />} />
                 </Route>
                 <Route path="*" element={<Navigate to="/monitors" replace />} />
               </Routes>

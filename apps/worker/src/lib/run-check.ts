@@ -40,6 +40,7 @@ async function runSingleAttempt(monitor: MonitorToCheck): Promise<CheckOutcome> 
       expectedStatus: monitor.expectedStatus,
       timeoutMs: monitor.timeoutMs,
       region: env.region,
+      allowPrivateTargets: env.allowPrivateMonitorTargets,
     });
   }
   if (monitor.type === "tcp") {
@@ -61,7 +62,13 @@ export async function runCheckWithRetries(monitor: MonitorToCheck): Promise<Chec
     });
   } catch (error) {
     if (error instanceof SsrfBlockedError) {
-      return { status: "down", responseTimeMs: null, httpStatus: null, errorMessage: error.message };
+      return {
+        status: "down",
+        responseTimeMs: null,
+        httpStatus: null,
+        errorMessage: error.message,
+        errorKind: "ssrf",
+      };
     }
     throw error;
   }
@@ -77,7 +84,11 @@ export async function runCheckWithRetries(monitor: MonitorToCheck): Promise<Chec
       return outcome;
     }
     lastOutcome = outcome;
-    logger.warn("intento de check fallido", { monitorId: monitor.id, attempt, error: outcome.errorMessage });
+    logger.warn("intento de check fallido", {
+      monitorId: monitor.id,
+      attempt,
+      error: outcome.errorMessage,
+    });
     if (attempt < MAX_ATTEMPTS) {
       await sleep(RETRY_DELAY_MS);
     }

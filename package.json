@@ -14,18 +14,25 @@
     "db:generate": "npm run db:generate --workspace=packages/db",
     "db:migrate": "npm run db:migrate --workspace=packages/db",
     "build": "npm run build --workspaces --if-present",
+    "typecheck": "tsc --noEmit -p packages/shared && tsc --noEmit -p packages/server-utils && tsc --noEmit -p packages/queue && tsc --noEmit -p packages/notify-channels && tsc --noEmit -p packages/mailer && tsc --noEmit -p packages/db && tsc --noEmit -p apps/api && tsc --noEmit -p apps/worker && tsc --noEmit -p apps/web && tsc --noEmit -p tsconfig.tools.json",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "test": "npm run test --workspaces --if-present"
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "playwright test"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^26.6.2",
+    "drizzle-orm": "^0.45.0",
     "eslint": "^9.13.0",
     "prettier": "^3.3.0",
     "typescript-eslint": "^8.13.0",
-    "drizzle-orm": "^0.45.0"
+    "vitest": "^5.0.1"
   }
 }

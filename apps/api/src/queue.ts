@@ -5,6 +5,7 @@ import { env } from "./env.js";
 // cuando se crea, edita, pausa, reanuda o borra — en TODAS las regiones
 // configuradas (Fase 4.2: una cola por región). El "consumidor" (que de
 // verdad ejecuta el check) es apps/worker, uno o más procesos por región.
-const connection = createRedisConnection(env.redisUrl);
+export const redisConnection = createRedisConnection(env.redisUrl);
+const connection = redisConnection;
 
 export const regionQueues = new RegionQueues(connection, env.checkRegions);

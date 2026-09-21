@@ -211,40 +211,43 @@ Con 3.1 a 3.3 cerrados, UptimePulse alerta de certificados SSL a punto de caduca
 
 Estas tareas no aparecían como fase propia en el README pero son necesarias antes de considerar el proyecto "terminado" o presentable en portfolio.
 
-### 5.1 Seguridad
-- [ ] Rate limiting en la API pública (por IP y por API key) — evita abuso.
-- [ ] Rate limiting de checks salientes por host de destino — evita que el propio UptimePulse actúe como herramienta de DDoS si un usuario configura muchos monitores agresivos contra el mismo target.
-- [ ] Revisión anti-SSRF también en TCP checks (no solo HTTP) y en redirecciones HTTP (una URL pública puede redirigir a una IP interna).
-- [ ] Gestión de API keys: hash al guardar, scopes, revocación.
-- [ ] Cabeceras de seguridad estándar (Helmet), CORS restringido a los orígenes reales del frontend.
-- [ ] Secrets (JWT secret, claves Twilio/Stripe/Resend) solo vía variables de entorno, nunca en el repo.
-- **Hecho cuando:** existe una checklist de seguridad revisada manualmente y sin secretos hardcodeados en el código fuente.
+### 5.1 Seguridad ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Rate limiting en la API pública (por IP y por API key). **Global 300/min** (`API_RATE_LIMIT_PER_MINUTE`) con contadores en Redis; con API key se cuenta por clave, no por IP. Login/registro 10/min por IP (pendiente desde la Fase 1.1). **Verificado:** el 11º login → 429; la petición nº 296 con una API key → 429 mientras el JWT desde la misma IP sigue en 200.
+- [x] Rate limiting de checks salientes por host de destino: 60/min por host sumando monitores, usuarios y regiones (`CHECK_MAX_PER_HOST_PER_MINUTE`, contador en Redis, `apps/worker/src/lib/host-rate-limit.ts`). Por encima, el check se salta (no cuenta como down) y se mide en `uptimepulse_checks_rate_limited_total`. **Verificado con cuota 3:** 6 checks encolados contra example.com → 3 ejecutados, 5 saltados (contando los 2 de la creación).
+- [x] Anti-SSRF en TCP (ya estaba: `extractHostname` + revalidación antes de cada check) y **en redirecciones HTTP**: el worker sigue los 3xx a mano (`redirect: "manual"`), revalida cada salto, máximo 5, solo http/https. **Verificado:** 302 → `http://127.0.0.1:3000/health` bloqueada ("Redirección bloqueada…", errorKind `ssrf`); 302 → `file:///etc/passwd` rechazada; bucle → "Demasiadas redirecciones"; `http://github.com` (301 → https) sigue dando up.
+- [x] API keys: `up_<64 hex>`, sha256 en BD, scopes `read`/`write` (→ rol readonly/editor, nunca admin), revocación inmediata, `last_used_at`, máximo 20 por organización; rutas `GET/POST/DELETE /organizations/:id/api-keys` (solo admin con sesión). **Verificado (API):** clave read lista monitores y no puede crear (403); clave write crea (201) pero no puede ver organizaciones, `/me` ni gestionar claves (403); `X-Organization-Id` se ignora; clave inexistente/revocada → 401.
+- [x] Helmet (sin CSP: la API sirve JSON; la CSP del frontend la pone nginx) y CORS restringido a `CORS_ORIGINS` (por defecto `APP_URL`; `*` rechazado en producción). **Verificado:** `Origin: https://evil.example` no recibe `Access-Control-Allow-Origin`.
+- [x] Secretos solo por entorno: `grep` de patrones de claves en `apps/` y `packages/` sin resultados; la API **se niega a arrancar en producción** con secretos `changeme…` o de menos de 32 caracteres (verificado). Twilio/Stripe no existen (SMS y Stripe siguen sin integrar).
+- **Hecho cuando:** existe una checklist de seguridad revisada manualmente y sin secretos hardcodeados en el código fuente. **[docs/SECURITY.md](docs/SECURITY.md)**, con lo que está hecho, lo que se decidió no hacer y cómo reproducir cada comprobación.
 
-### 5.2 Observabilidad del propio sistema
-- [ ] Logging estructurado (JSON) en API y worker, con correlación de request ID.
-- [ ] Métricas básicas (Prometheus/OpenTelemetry): jobs procesados, latencia de checks, tamaño de cola, errores por tipo.
-- [ ] Health-check endpoint propio (`/health`) para API y worker.
-- **Hecho cuando:** puedes ver en logs/métricas cuántos checks se han ejecutado en la última hora y cuántos han fallado por timeout vs. error de conexión.
+### 5.2 Observabilidad del propio sistema ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Logging estructurado JSON (ya existía desde la Fase 0.4) **con request id**: `X-Request-Id` (se respeta el del cliente si tiene forma de id, si no se genera) devuelto en cada respuesta y presente en la línea de log por petición (`método, ruta-plantilla, status, durationMs, ip, userId/apiKeyId`) y en los errores 500. **Verificado:** una petición con `x-request-id: obs-test-…` aparece en el log de la API con ese id.
+- [x] Métricas Prometheus (`prom-client`): API en `/metrics` (`uptimepulse_api_http_requests_total{method,route,status}`, histograma de duración, métricas de proceso); worker en `/metrics` de su propio servidor HTTP (`WORKER_HTTP_PORT`, 3001): `uptimepulse_checks_total{type,status,error_kind}`, `uptimepulse_check_duration_seconds`, `uptimepulse_checks_rate_limited_total`, `uptimepulse_checks_skipped_total`, `uptimepulse_jobs_failed_total`, `uptimepulse_incidents_total{action}`, `uptimepulse_queue_jobs{state}`. Opcionalmente protegidas con `METRICS_TOKEN`.
+- [x] `/health` real en API y worker: comprueban Postgres (`select 1`) y Redis (`ping`), 503 si falla alguno.
+- **Hecho cuando:** puedes ver cuántos checks se han ejecutado en la última hora y cuántos han fallado por timeout vs. error de conexión. **Verificado:** nuevo campo `errorKind` en cada check (`timeout|dns|connection|tls|unexpected_status|redirect|ssrf|invalid_target|other`) en el log JSON y como etiqueta `error_kind`; tras 5 monitores de prueba, `/metrics` del worker subió `{http,up}`, `{tcp,down,timeout}`, `{http,down,unexpected_status}` y `{ping,up}` por separado. Consulta PromQL: `increase(uptimepulse_checks_total{status="down"}[1h]) by (error_kind)`.
 
-### 5.3 Testing
-- [ ] Unit tests de lógica de negocio pura (cálculo de uptime %, detección de incidentes, validación anti-SSRF) — Vitest/Jest.
-- [ ] Integration tests de la API contra una DB de test (Testcontainers o DB dedicada).
-- [ ] E2E básico del flujo crítico (registro → crear monitor → ver estado) con Playwright.
-- **Hecho cuando:** `pnpm test` corre en CI y cubre al menos el cálculo de uptime, la detección de incidentes y la validación anti-SSRF.
+### 5.3 Testing ✅ (2026-09-22, ver [DIARIO.md](DIARIO.md))
+- [x] Unit tests (Vitest, proyecto `unit`, 87 tests en 8 archivos): anti-SSRF (`ssrf-guard.test.ts`, con `dns.lookup` simulado: 15 IPs privadas, públicas, rebinding, sin resolver), targets de ping, reglas de username, regiones/quórum/nombres de cola, firma HMAC del webhook (contra un receptor HTTP real), parseo de la salida de `ping` (Windows/Linux reales), redirecciones y clasificación de errores del check HTTP (fetch simulado), check TCP con sockets reales. `npm run test:unit` en ~1 s.
+- [x] Integration tests (proyecto `integration`, 17 tests en 4 archivos) contra una base **`uptimepulse_test`** que se crea y migra sola (`test/global-setup.ts`) y la base 1 de Redis: auth (registro, duplicados, login por email/username, refresh por cookie, `/me`, request id), monitores (job scheduler creado/borrado, anti-SSRF 422, ping inválido 400, límites del plan y subida a pro, aislamiento por organización y rol readonly, **uptime % y latencia media sobre `checks_hourly`** con 7 up/3 down → 70 % y 130 ms), API keys (scopes, revocación, cabecera ignorada), status pages públicas (404 idéntico, slug por organización, privadas), y el **motor de incidentes** `evaluateMonitorHealth` (1 región: incidente al 2º fallo con `startedAt` del primero y cierre al recuperar; 2 regiones: degradado sin incidente → caído con ambas → cierre al recuperar una; región silenciosa; ventana de mantenimiento). `npm run test:integration` en ~25 s.
+- [x] E2E con Playwright (`e2e/critical-flow.spec.ts`, Chromium real, diálogos nativos descartados): registro con comprobación de username → crear monitor → "Operativo" por WebSocket sin recargar → detalle con latencia → status page pública sin sesión → borrado con el diálogo propio → limpieza por API; `e2e/global-teardown.ts` borra el usuario. `npm run test:e2e` en ~7 s reutilizando los procesos locales; en CI los arranca `playwright.config.ts`.
+- **Hecho cuando:** `npm test` corre en CI y cubre al menos el cálculo de uptime, la detección de incidentes y la validación anti-SSRF. **`npm test` = 104 tests (unit + integración) verdes en local; un test roto a propósito hace salir con código 1 (comprobado); la CI ejecuta `npm test` y `npm run test:e2e` con TimescaleDB/Redis/Mailpit como servicios.**
 
-### 5.4 CI/CD
-- [ ] Pipeline (GitHub Actions) que en cada PR corre lint + tests + build de las 3 apps.
-- [ ] Build de imágenes Docker para API y worker.
-- [ ] Despliegue (Fly.io/Railway) automatizado desde `main`, o manual documentado paso a paso.
-- **Hecho cuando:** un PR con un test roto falla en CI antes de poder mergear.
+### 5.4 CI/CD ✅ (2026-09-22, ver [DIARIO.md](DIARIO.md)) — CI escrita y validada en local; no ejecutada en GitHub todavía
+- [x] `.github/workflows/ci.yml`: jobs `quality` (lint, `npm run typecheck` de los 9 proyectos TS, `vite build`, `npm audit` informativo), `test` (`npm test` con servicios TimescaleDB 2.30.1-pg16, Redis 7, Mailpit), `e2e` (Playwright con chromium, informe como artefacto si falla) y `docker` (matriz api/worker/web con `build-push-action`, caché de GHA; push a GHCR solo en `main`). Cada comando de la CI se ejecutó en local con éxito; el YAML se validó con js-yaml. **No se ha hecho push, así que no hay una ejecución real en GitHub Actions que enseñar.**
+- [x] Dockerfiles para API, worker y web (`apps/*/Dockerfile`, contexto raíz, multi-stage, usuario `node`, `HEALTHCHECK`; el worker instala `iputils-ping`; la web es nginx con SPA fallback y CSP). `docker-compose.prod.yml` con `migrate` como servicio previo a la API. **Verificado:** las 3 imágenes construyen (568/374/74 MB) y el stack completo arrancó en local con puertos alternativos: migraciones aplicadas, `/health` de API y worker `ok`, registro, monitores http y **ping ejecutado dentro del contenedor Linux como usuario `node`** (15 ms), Bull Board ausente con `NODE_ENV=production`, `/docs` 200, HSTS, y login + dashboard "Operativo" desde el nginx en Chromium. Stack, volúmenes e imágenes de prueba borrados después.
+- [x] Despliegue: [docs/DEPLOY.md](docs/DEPLOY.md) — Opción 1 (un servidor con `docker-compose.prod.yml` + Caddy, la verificada) y Opción 2 (Fly.io paso a paso, manual, **no ejecutada**: sin cuenta).
+- **Hecho cuando:** un PR con un test roto falla en CI antes de poder mergear. **Comprobado en local que `npm test` devuelve exit 1 con un test roto (y por tanto el job `test` falla); el bloqueo del merge requiere marcar `test` y `e2e` como checks obligatorios en la protección de rama de GitHub (paso manual en la web de GitHub, no automatizable desde el repo).**
 
-### 5.5 Documentación final
-- [ ] `README.md` de cada app (`apps/api`, `apps/worker`, `apps/web`) con instrucciones de arranque local.
-- [ ] Documentación de la API (OpenAPI/Swagger o similar).
-- [ ] Actualizar el README raíz con capturas reales del dashboard terminado (README §3.1 ya lo pide para la landing).
-- **Hecho cuando:** alguien ajeno al proyecto puede clonar el repo, seguir el README y levantar todo el stack en local sin preguntarte nada.
+### 5.5 Documentación final ✅ (2026-09-22, ver [DIARIO.md](DIARIO.md))
+- [x] `README.md` de cada app: [apps/api](apps/api/README.md), [apps/worker](apps/worker/README.md), [apps/web](apps/web/README.md) con arranque, estructura, variables y comprobaciones.
+- [x] OpenAPI 3.0 escrita a mano en [docs/openapi.yaml](docs/openapi.yaml) (39 rutas, esquemas, errores, rate limits) servida por la propia API en `/docs` (Swagger UI) y `/docs/json`; validada con `redocly lint` (0 errores; `redocly.yaml` desactiva la regla de `operationId`). Verificado en Chromium (captura `docs/screenshots/api-docs.png`).
+- [x] README raíz actualizado: estado del proyecto, **5 capturas reales** (dashboard, detalle, status page, planes, Swagger) tomadas con Playwright sobre un usuario de demostración borrado después, arranque en 5 comandos, stack real, roadmap con las 5 fases, estructura de carpetas real, enlaces a SECURITY/DEPLOY/TODO.
+- [x] Extra: página **API keys** en la web (`/api-keys`, solo admin) con creación (clave mostrada una vez + copiar), listado por prefijo y revocación con el diálogo propio. Verificado en Chromium (4/4).
+- **Hecho cuando:** alguien ajeno al proyecto puede clonar el repo, seguir el README y levantar todo el stack en local sin preguntarte nada. **Los 5 comandos del README son exactamente los que se han usado en esta sesión; `.env.example` funciona sin editar en desarrollo.**
 
 ---
+
+## 🎉 Fase 5 completa — el plan de TASK.md está cerrado (pendientes conscientes en TODO.md)
 
 ## Registro de decisiones de diseño (ADR ligero)
 
@@ -859,3 +862,89 @@ enteros, redondeando hacia arriba), `-c 1 -W <ms>` en macOS. Mensajes de
 error normalizados (DNS, inalcanzable, sin respuesta) a partir de la salida
 en inglés y en español. Verificado solo en Windows en esta sesión; Linux y
 macOS por la documentación de sus `ping` (queda anotado en TODO.md).
+
+### 2026-09-21 — Fase 5.1: API keys, cuota por host y redirecciones
+**API keys como "usuario de organización", no como usuario personal.** Una
+clave fija la organización y equivale a un rol (`read` → readonly, `write`
+→ editor), nunca admin: lo que administra personas (miembros, plan,
+invitaciones, otras claves) exige sesión de una persona
+(`requireUserSession`). Así una clave filtrada en un CI no puede invitar a
+nadie ni cambiar el plan. Revocar = borrar la fila (sin `revoked_at`): más
+simple, y la auditoría de "quién la creó" ya está en `created_by_user_id`
+y en el log JSON.
+
+**Cuota por host en el worker, no en la API.** Limitar "monitores por host
+por organización" en la API no protege al destino de varios usuarios
+distintos ni de varias regiones; la cuota tiene que contarse donde se
+ejecutan los checks y de forma global (Redis, ventana fija de 60 s). Un
+check saltado no se guarda: no es información sobre el monitor.
+
+**Redirecciones a mano.** `fetch` con `redirect: "follow"` haría la
+petición interna antes de que nadie la comprobara; con `manual` cada salto
+pasa por el mismo anti-SSRF que el target original. Coste: ~30 líneas y
+reproducir la semántica 301/302/303/307/308 de método y body.
+
+**Rate limit con contadores en Redis** (no en memoria) para que el límite
+sea el mismo con varias instancias de la API. El `errorResponseBuilder` de
+`@fastify/rate-limit` debe devolver un `Error` con `statusCode` (el plugin
+lo lanza); y el `setErrorHandler` global debe registrarse **antes** que las
+rutas, porque los plugins hijos lo copian al registrarse — hasta ahora los
+errores dentro de las rutas no pasaban por él (bug latente desde la Fase 1.1
+que apareció al probar el 429 por ruta).
+
+### 2026-09-21 — Fase 5.2: prom-client con registro propio y `errorKind`
+Registro propio de `prom-client` por proceso (no el global) para que los
+tests de integración puedan construir varios servidores sin "metric already
+registered". El worker expone `/health` y `/metrics` con `node:http` a
+secas: dos rutas no justifican Fastify en un consumidor de cola. La
+clasificación del error (`errorKind`) se añade al resultado del check y no
+a la tabla `checks`: sirve para métricas y logs, y el mensaje en español
+sigue siendo lo que ve el usuario.
+
+### 2026-09-22 — Fase 5.3: dos proyectos de Vitest y una base de datos de test
+**Unit e integración separados** (`vitest.config.ts`, `projects`): los
+unitarios corren en 1 s sin servicios; los de integración usan la API real
+(`buildServer()` + `app.inject()`, sin puerto) contra **`uptimepulse_test`**,
+creada y migrada por `test/global-setup.ts` con las mismas migraciones de
+producción, y la base 1 de Redis (limpiada al empezar y al terminar). Nunca
+tocan la base de desarrollo. Motivo: el cálculo de uptime vive en SQL
+(`checks_hourly`) y el motor de incidentes en una transacción con
+`FOR UPDATE`/`DISTINCT ON`: probarlos con mocks no probaría nada.
+
+**E2E en `e2e/` con `@playwright/test`** en vez de los scripts sueltos de
+sesiones anteriores: `playwright.config.ts` reutiliza los procesos locales
+y en CI los arranca. Chromium se instala en la caché estándar de Playwright
+(`npx playwright install chromium`), no en el repo.
+
+`AUTH_RATE_LIMIT_PER_MINUTE` se hizo configurable porque los tests de
+integración (todos desde 127.0.0.1) chocaban con el límite de 10/min.
+
+### 2026-09-22 — Fase 5.4: tsx en producción, un `migrate` como servicio
+**Las imágenes ejecutan TypeScript con tsx**, no un build de tsc: los
+paquetes del monorepo se consumen como fuente (`"main": "./src/index.ts"`),
+y compilar cada uno (con `project references`, `exports` dobles y rutas
+`.js`) añadiría complejidad sin beneficio medible para este tamaño. Coste:
+tsx (esbuild) pasa a `dependencies` de api y worker y la imagen es más
+grande de lo que sería con `dist/`. Si algún día importa el arranque en
+frío, es un cambio aislado en los Dockerfiles.
+
+**Migraciones como servicio `migrate`** (`service_completed_successfully`)
+en vez de en el entrypoint de la API: con varias réplicas de la API, solo
+una debe migrar.
+
+**CI sin ejecutar en GitHub**: no se ha hecho push desde esta sesión. Todo
+lo que la CI ejecuta (`npm run lint`, `npm run typecheck`, `vite build`,
+`npm test`, `npm run test:e2e`, `docker build`) se ejecutó en local con
+éxito; el YAML está validado. La primera ejecución real puede destapar
+diferencias de entorno (p. ej. tiempos de arranque de los servicios).
+
+**TimescaleDB fijada** a `2.30.1-pg16` (la versión que había en el
+contenedor de desarrollo) en compose de desarrollo, producción y CI.
+
+### 2026-09-22 — Fase 5.5: OpenAPI a mano
+Las rutas validan con zod y no con esquemas JSON de Fastify, así que
+`@fastify/swagger` no puede generar nada útil: `docs/openapi.yaml` se
+escribe a mano y se sirve en modo estático. El riesgo es que se desvíe del
+código; lo mitiga `redocly lint` en local y que los tests de integración
+cubren las mismas rutas. Migrar a `fastify-type-provider-zod` para generar
+la especificación desde los esquemas queda en TODO.md.

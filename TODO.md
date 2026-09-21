@@ -1,9 +1,9 @@
 # TODO — pendientes de las Fases 0 a 4
 
 > Todo lo que quedó sin hacer, a medias o simplificado a propósito en las
-> fases ya cerradas (0–4). La Fase 5 no aparece aquí: no ha empezado. Cada
-> punto dice de dónde sale (fase / entrada del DIARIO) para poder buscar el
-> contexto. Actualizado el 2026-09-21.
+> fases ya cerradas (0–5). Cada punto dice de dónde sale (fase / entrada
+> del DIARIO) para poder buscar el contexto. Actualizado el 2026-09-22 al
+> cerrar la Fase 5 (los puntos tachados los cerró esa fase).
 
 ## 1. Funcionalidad pendiente (cosas que el README promete y no existen)
 
@@ -14,9 +14,9 @@
       enviarlo. Al retomarlo: `packages/notify-channels/src/sms.ts`, zod en
       `routes/notification-channels.ts`, opción en `NotificationChannelsPage`.
 - [x] ~~**Checks de tipo `ping` (ICMP)**~~ Hecho el 2026-09-21 invocando el
-      `ping` del sistema (ADR en TASK.md). Queda: verificar en Linux/macOS
-      (solo probado en Windows) e instalar `iputils-ping` en la imagen del
-      worker si se despliega en Alpine/distroless.
+      `ping` del sistema (ADR en TASK.md). Verificado en Windows y, en 5.4,
+      en Linux (contenedor Alpine con `iputils-ping`, usuario `node`).
+      macOS sigue sin probar.
 - [ ] **Stripe real** (Fase 4.3, README §2.7). El cambio de plan es simulado
       (`POST /organizations/:id/plan`). Los pasos concretos para integrar
       Checkout + webhook están en el ADR "Fase 4.3" de TASK.md. Necesita
@@ -53,9 +53,7 @@
 - [ ] **Alertas por rol** (Fase 4.1). Los emails de caída/recuperación van a
       todos los miembros de la organización, sin filtrar por rol ni permitir
       que un miembro se desuscriba.
-- [ ] **API keys** (Fase 0.3). La tabla `api_keys` existe (hash, scopes,
-      last_used_at) y no la usa nada: no hay autenticación por API key ni UI
-      para generarlas.
+- [x] ~~**API keys**~~ Hecho en la Fase 5.1: API + página `/api-keys`.
 - [ ] **Estado "degradado" por latencia** (README §2.5). Hoy "degradado" solo
       significa "alguna región lo ve caído" (Fase 4.2); no existe umbral de
       tiempo de respuesta configurable por monitor.
@@ -107,11 +105,8 @@
 - [ ] **Auditoría de `handleX` sin `try/catch`** (bug del 2026-09-21): se
       corrigieron los borrados/pausas; no se revisó exhaustivamente el resto
       de componentes en busca de errores que se traguen en silencio.
-- [ ] **`tsconfig` raíz con project references** (Fase 0.3): el type-check se
-      hace paquete por paquete (`tsc --noEmit -p apps/api`, `-p apps/web`,
-      `-p apps/worker`…).
-- [ ] **Tag flotante `latest-pg16` de TimescaleDB** en docker-compose (Fase
-      0.2): fijar versión exacta antes de desplegar.
+- [x] ~~**`tsconfig` raíz con project references**~~ Hecho en 5.3: `npm run typecheck` recorre los 9 proyectos (sin project references, por paquete).
+- [x] ~~**Tag flotante `latest-pg16` de TimescaleDB**~~ Hecho en 5.4: `2.30.1-pg16` en desarrollo, producción y CI.
 - [ ] **`npm audit`: 2 vulnerabilidades** (1 moderada, 1 alta) en
       dependencias de desarrollo del scaffold (Fase 0.1). No explotables en
       local; revisar en la Fase 5.1.
@@ -123,10 +118,8 @@
 
 (Se solapan con la Fase 5.1, pero nacen de fases anteriores.)
 
-- [ ] **CORS `origin: true`** (Fase 1.1): restringir a los dominios reales.
-- [ ] **Sin rate limiting en `/auth/login` ni `/auth/register`** (Fase 1.1):
-      solo lo tienen `/public/status`, `/auth/username-available`,
-      `/invitations/:token` y `/plans`.
+- [x] ~~**CORS `origin: true`**~~ Hecho en 5.1: `CORS_ORIGINS`.
+- [x] ~~**Sin rate limiting en `/auth/login` ni `/auth/register`**~~ Hecho en 5.1: 10/min por IP + límite global.
 - [ ] **Bull Board sin autenticación** en `/admin/queues` (Fase 2.1), solo
       bloqueado por `NODE_ENV !== "production"`.
 - [ ] **Contraseña `changeme`** de Postgres en `.env.example` (Fase 0.2).
@@ -136,24 +129,38 @@
 
 ## 4. Pruebas y proceso
 
-- [ ] **Playwright no está en el repo.** Toda la verificación en navegador
-      real (Fases 3–4 y los dos bugs del 2026-09-21) se hizo con scripts en
-      el directorio temporal de la sesión (`ui-*.mjs`, `multiregion-test.mjs`,
-      `api-*-test.mjs`), que no se conservan. Añadir Playwright como
-      `devDependency` y convertir esos scripts en una suite e2e permanente
-      (Fase 5.3), incluyendo el servidor `region-target.mjs` que falla según
-      la región del User-Agent.
-- [ ] **Sin tests unitarios ni de integración** de ningún tipo todavía
-      (Fase 5.3): el motor de quórum (`apps/worker/src/lib/health.ts`), las
-      reglas de username (`packages/shared/src/username.ts`) y la firma HMAC
-      de webhooks son los candidatos más claros.
-- [ ] **Sin CI** (Fase 5.4): `tsc`, `eslint` y `vite build` se ejecutan a
-      mano.
+- [x] ~~**Playwright no está en el repo.**~~ Hecho en 5.3: `e2e/` con `@playwright/test`. (Los scripts de región/quórum siguen sin suite permanente: ver abajo.)
+- [x] ~~**Sin tests unitarios ni de integración**~~ Hecho en 5.3: 104 tests.
+- [x] ~~**Sin CI**~~ Hecho en 5.4 (escrita y validada en local; primera ejecución real pendiente del primer push).
 
-## 5. Datos y estado actual del entorno
+## 5. Nuevos pendientes que deja la Fase 5
+
+- [ ] **Ejecutar la CI en GitHub** (5.4): el workflow está validado en local
+      pero no ha corrido nunca en Actions; hacer push a `dev` y revisar la
+      primera ejecución. Después, activar "Require status checks" (`test`,
+      `e2e`) en la protección de rama.
+- [ ] **OpenAPI manual** (5.5): `docs/openapi.yaml` no se genera del
+      código; al añadir/cambiar rutas hay que editarla. Alternativa:
+      `fastify-type-provider-zod` + `@fastify/swagger` dinámico.
+- [ ] **Sin cobertura de tests** (5.3): añadir `@vitest/coverage-v8` y un
+      umbral en CI.
+- [ ] **E2E de un solo flujo** (5.3): equipos, planes, canales y
+      multi-región solo tienen tests de API/integración; el escenario de
+      quórum con dos workers reales (`multiregion-test.mjs`, Fase 4.2)
+      sigue sin suite permanente.
+- [ ] **Prometheus/Grafana no incluidos** (5.2): las métricas se exponen
+      pero nadie las recoge; un `prometheus.yml` con dos targets bastaría.
+- [ ] **Cuota por host con ventana fija** (5.1): permite hasta 2× el límite
+      a caballo de dos ventanas.
+- [ ] **Fly.io documentado pero no ejecutado** (5.4).
+- [ ] **Imágenes con tsx** (5.4): 568 MB la API; una build con `tsc` y
+      `dist/` la reduciría bastante.
+
+## 6. Datos y estado actual del entorno
 
 - La base de datos se vació por completo el 2026-09-21 a petición del
   usuario (0 usuarios/organizaciones/monitores); solo quedan los planes
   `free` y `pro` y las migraciones 0000–0012 aplicadas.
-- Los cambios de las Fases 3.3-bis (status pages por usuario) y 4 completas
-  están **sin commit** (último commit: `FASE 3 COMPLETA`).
+- Toda la Fase 5 (más los checks `ping`) está **sin commit** desde el
+  último commit del usuario (`Teams & Roles - MultiRegion QUÓRUM - PRICING`).
+- Existe la base `uptimepulse_test` (la crean los tests de integración).

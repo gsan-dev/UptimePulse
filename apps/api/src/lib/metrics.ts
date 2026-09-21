@@ -45,11 +45,7 @@ export async function getMonitorMetrics(monitorId: string, range: UptimeRange): 
       SELECT
         coalesce(sum(total_checks), 0)::int AS total_checks,
         coalesce(sum(up_checks), 0)::int AS up_checks,
-        coalesce(sum(down_checks), 0)::int AS down_checks,
-        CASE WHEN sum(total_checks) > 0
-          THEN (sum(avg_response_time_ms * total_checks) / sum(total_checks))::int
-          ELSE NULL
-        END AS avg_response_time_ms
+        coalesce(sum(down_checks), 0)::int AS down_checks
       FROM checks_hourly
       WHERE monitor_id = ${monitorId} AND bucket >= now() - ${interval}::interval
     `)
@@ -57,8 +53,23 @@ export async function getMonitorMetrics(monitorId: string, range: UptimeRange): 
     total_checks: number;
     up_checks: number;
     down_checks: number;
-    avg_response_time_ms: number | null;
   }[];
+
+  // El tiempo de respuesta medio se calcula sobre `checks` en crudo, no
+  // sobre el agregado: el `avg_response_time_ms` de cada bucket solo cubre
+  // los checks que tienen tiempo (los "down" por timeout/DNS no), así que
+  // ponderarlo por `total_checks` daba una media incorrecta en cuanto el
+  // rango cruzaba varios buckets (lo destapó el test de integración de la
+  // Fase 5.3: 7 up de 100–160 ms y 3 down → 104 en vez de 130). Es un
+  // recorrido de índice (monitor_id, timestamp) acotado por la retención
+  // de 90 días de la hypertable, que coincide con el rango máximo.
+  const [responseTime] = (
+    await db.execute(sql`
+      SELECT avg(response_time_ms)::int AS avg_response_time_ms
+      FROM checks
+      WHERE monitor_id = ${monitorId} AND "timestamp" >= now() - ${interval}::interval
+    `)
+  ).rows as { avg_response_time_ms: number | null }[];
 
   const [incidentsSummary] = (
     await db.execute(sql`
@@ -87,7 +98,7 @@ export async function getMonitorMetrics(monitorId: string, range: UptimeRange): 
     upChecks,
     downChecks,
     uptimePercentage: totalChecks > 0 ? Math.round((upChecks / totalChecks) * 10000) / 100 : null,
-    avgResponseTimeMs: checksSummary?.avg_response_time_ms ?? null,
+    avgResponseTimeMs: responseTime?.avg_response_time_ms ?? null,
     incidentCount: resolvedIncidents + openIncidents,
     openIncidentCount: openIncidents,
     mttrSeconds: incidentsSummary?.mttr_seconds ?? null,

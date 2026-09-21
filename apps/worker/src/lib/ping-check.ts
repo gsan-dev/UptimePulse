@@ -1,6 +1,6 @@
 import { execFile, type ExecException } from "node:child_process";
 import { isValidPingTarget } from "@uptimepulse/server-utils";
-import type { CheckOutcome } from "./types.js";
+import type { CheckErrorKind, CheckOutcome } from "./types.js";
 
 export interface PingCheckInput {
   target: string; // host o IP, validado al crear el monitor y revalidado anti-SSRF antes de cada check
@@ -38,6 +38,7 @@ export function runPingCheck(input: PingCheckInput): Promise<CheckOutcome> {
       responseTimeMs: null,
       httpStatus: null,
       errorMessage: `Host no válido para ping: ${host}`,
+      errorKind: "invalid_target",
     });
   }
 
@@ -53,49 +54,70 @@ export function runPingCheck(input: PingCheckInput): Promise<CheckOutcome> {
         const elapsed = Date.now() - startedAt;
         const output = `${stdout}\n${stderr}`;
 
-        if (REPLY_REGEX.test(output)) {
-          const rtt = RTT_REGEX.exec(output);
-          const responseTimeMs = rtt ? Math.round(Number(rtt[1].replace(",", "."))) : elapsed;
-          resolve({ status: "up", responseTimeMs, httpStatus: null, errorMessage: null });
+        if (hasEchoReply(output)) {
+          const responseTimeMs = parsePingRtt(output) ?? elapsed;
+          resolve({
+            status: "up",
+            responseTimeMs,
+            httpStatus: null,
+            errorMessage: null,
+            errorKind: null,
+          });
           return;
         }
 
+        const { message, kind } = describePingFailure(error, output, input.timeoutMs);
         resolve({
           status: "down",
           responseTimeMs: elapsed,
           httpStatus: null,
-          errorMessage: describePingFailure(error, output, input.timeoutMs),
+          errorMessage: message,
+          errorKind: kind,
         });
       }
     );
   });
 }
 
-function describePingFailure(
+/** Exportado para poder probar el parseo de la salida sin ejecutar ping (Fase 5.3). */
+export function describePingFailure(
   error: ExecException | null,
   output: string,
   timeoutMs: number
-): string {
-  if (error?.code === "ENOENT") return "El comando 'ping' no está disponible en el worker";
+): { message: string; kind: CheckErrorKind } {
+  if (error?.code === "ENOENT") {
+    return { message: "El comando 'ping' no está disponible en el worker", kind: "other" };
+  }
   if (error?.killed) {
-    return `Timeout tras ${timeoutMs}ms esperando la respuesta ICMP`;
+    return { message: `Timeout tras ${timeoutMs}ms esperando la respuesta ICMP`, kind: "timeout" };
   }
   if (
     /could not find host|no pudo encontrar el host|name or service not known|unknown host|temporary failure in name resolution/i.test(
       output
     )
   ) {
-    return "No se pudo resolver el nombre de dominio (DNS)";
+    return { message: "No se pudo resolver el nombre de dominio (DNS)", kind: "dns" };
   }
   if (/unreachable|inaccesible|transmit failed|error en la transmisi/i.test(output)) {
-    return "Host inalcanzable";
+    return { message: "Host inalcanzable", kind: "connection" };
   }
   if (/timed out|agotado|100% packet loss|100% perdidos/i.test(output)) {
-    return `Sin respuesta ICMP en ${timeoutMs}ms`;
+    return { message: `Sin respuesta ICMP en ${timeoutMs}ms`, kind: "timeout" };
   }
   const firstLine = output
     .split("\n")
     .map((l) => l.trim())
     .find((l) => l.length > 0);
-  return firstLine ?? "Ping fallido";
+  return { message: firstLine ?? "Ping fallido", kind: "other" };
+}
+
+/** ¿La salida de ping contiene una respuesta de echo real? Exportado para tests. */
+export function hasEchoReply(output: string): boolean {
+  return REPLY_REGEX.test(output);
+}
+
+/** Latencia que imprime ping (ms), o null si no aparece. Exportado para tests. */
+export function parsePingRtt(output: string): number | null {
+  const rtt = RTT_REGEX.exec(output);
+  return rtt ? Math.round(Number(rtt[1].replace(",", "."))) : null;
 }

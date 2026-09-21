@@ -5,7 +5,7 @@ import { db, organizationMembers, organizations, plans, users } from "@uptimepul
 import { getUsernameError, normalizeUsername, type PublicUser } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { hashPassword, verifyPassword } from "../lib/password.js";
-import { requireAuth } from "../plugins/auth.js";
+import { requireAuth, requireUserSession } from "../plugins/auth.js";
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from "../lib/tokens.js";
 
 const REFRESH_COOKIE = "uptimepulse_refresh";
@@ -66,7 +66,11 @@ async function isUsernameTaken(username: string, exceptUserId?: string): Promise
 }
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
-  app.post("/auth/register", async (request, reply) => {
+  // Login y registro son los dos endpoints públicos que más interesa
+  // proteger de fuerza bruta/spam: 10 intentos por minuto y por IP (Fase 5.1).
+  const AUTH_RATE_LIMIT = { config: { rateLimit: { max: env.authRateLimitPerMinute, timeWindow: "1 minute" } } };
+
+  app.post("/auth/register", AUTH_RATE_LIMIT, async (request, reply) => {
     const parsed = registerSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
@@ -130,7 +134,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  app.post("/auth/login", async (request, reply) => {
+  app.post("/auth/login", AUTH_RATE_LIMIT, async (request, reply) => {
     const parsed = loginSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
@@ -170,7 +174,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(204).send();
   });
 
-  app.get("/me", { preHandler: requireAuth }, async (request, reply) => {
+  app.get("/me", { preHandler: [requireAuth, requireUserSession] }, async (request, reply) => {
     const user = await db.query.users.findFirst({ where: eq(users.id, request.user!.id) });
     if (!user) {
       return reply.code(404).send({ error: "Usuario no encontrado" });
@@ -182,7 +186,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // usuarios anteriores a la migración 0008, que recibieron un username
   // derivado de su email y puede que quieran otro. Cambiar el username cambia
   // las URLs públicas de sus status pages — se avisa en el formulario.
-  app.patch("/me", { preHandler: requireAuth }, async (request, reply) => {
+  app.patch("/me", { preHandler: [requireAuth, requireUserSession] }, async (request, reply) => {
     const parsed = updateMeSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });

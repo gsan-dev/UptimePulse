@@ -2,7 +2,9 @@ import { eq } from "drizzle-orm";
 import type { Job } from "bullmq";
 import { checks, db, monitors } from "@uptimepulse/db";
 import type { MonitorCheckJobData } from "@uptimepulse/queue";
+import { extractHostname } from "@uptimepulse/server-utils";
 import { createLogger } from "@uptimepulse/shared";
+import { hostRateLimiter, telemetry } from "../runtime.js";
 import { runCheckWithRetries } from "./run-check.js";
 import { notifyTransition } from "./notifications.js";
 import { evaluateMonitorHealth } from "./health.js";
@@ -22,7 +24,26 @@ const logger = createLogger("worker");
 export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<void> {
   const monitor = await db.query.monitors.findFirst({ where: eq(monitors.id, job.data.monitorId) });
   if (!monitor || monitor.isPaused) {
+    telemetry.checksSkipped.inc();
     return;
+  }
+
+  // Fase 5.1: cuota por host de destino. Si se supera, el check no se
+  // ejecuta ni se guarda (no es información sobre el monitor, es
+  // protección del destino); el siguiente ciclo lo reintentará.
+  const hostname = safeHostname(monitor.type, monitor.target);
+  if (hostname) {
+    const quota = await hostRateLimiter.tryAcquire(hostname);
+    if (!quota.allowed) {
+      telemetry.checksRateLimited.inc();
+      logger.warn("check saltado: el host de destino agotó su cuota por minuto", {
+        monitorId: monitor.id,
+        hostname,
+        count: quota.count,
+        limit: quota.limit,
+      });
+      return;
+    }
   }
 
   const outcome = await runCheckWithRetries({
@@ -35,6 +56,19 @@ export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<vo
     expectedStatus: monitor.expectedStatus,
     timeoutMs: monitor.timeoutMs,
   });
+
+  telemetry.checksTotal.inc({
+    type: monitor.type,
+    status: outcome.status,
+    error_kind: outcome.errorKind ?? "none",
+  });
+  if (
+    outcome.responseTimeMs !== null &&
+    outcome.errorKind !== "ssrf" &&
+    outcome.errorKind !== "invalid_target"
+  ) {
+    telemetry.checkDuration.observe({ type: monitor.type }, outcome.responseTimeMs / 1000);
+  }
 
   const [savedCheck] = await db
     .insert(checks)
@@ -55,6 +89,8 @@ export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<vo
     status: outcome.status,
     responseTimeMs: outcome.responseTimeMs,
     errorMessage: outcome.errorMessage,
+    errorKind: outcome.errorKind,
+    jobId: job.id,
     pid: process.pid,
   });
 
@@ -90,10 +126,18 @@ export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<vo
     });
   }
 
+  if (health.incidentOpened) telemetry.incidents.inc({ action: "opened" });
+  if (health.incidentClosed) telemetry.incidents.inc({ action: "closed" });
+
   if (health.incidentOpened || health.incidentClosed) {
     try {
       await notifyTransition(
-        { id: monitor.id, name: monitor.name, target: monitor.target, organizationId: monitor.organizationId },
+        {
+          id: monitor.id,
+          name: monitor.name,
+          target: monitor.target,
+          organizationId: monitor.organizationId,
+        },
         {
           ...outcome,
           // Al cerrar un incidente el check que lo cierra puede ser "up" en
@@ -132,5 +176,13 @@ export async function processCheckJob(job: Job<MonitorCheckJobData>): Promise<vo
       url.hostname,
       url.port ? Number(url.port) : 443
     );
+  }
+}
+
+function safeHostname(type: "http" | "tcp" | "ping", target: string): string | null {
+  try {
+    return extractHostname(type, target);
+  } catch {
+    return null;
   }
 }

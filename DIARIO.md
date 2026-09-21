@@ -2384,3 +2384,338 @@ borrados en SQL. Quedan tu usuario, 1 organización y 3 monitores.
 
 ### Próximo paso
 Commit de todo lo pendiente y Fase 5.
+
+---
+
+## 2026-09-21 — Fase 5.1: seguridad
+
+### Objetivo
+Cerrar la checklist de seguridad: rate limiting real (API e checks
+salientes), API keys, anti-SSRF en redirecciones, Helmet/CORS y secretos.
+
+### Decisiones
+Ver ADR "Fase 5.1" en TASK.md (API keys = rol de organización; cuota por
+host en el worker; redirecciones a mano; rate limit en Redis; error handler
+antes que las rutas).
+
+### Qué se hizo
+1. **DB (migración 0013):** `api_keys.name`, `key_prefix`,
+   `created_by_user_id`, `key_hash` único; tipo `ApiKeyScope`.
+2. **API:** `lib/api-keys.ts` (generar/hashear/resolver, `roleForScopes`),
+   `plugins/auth.ts` acepta `Bearer up_…` y añade `requireUserSession`;
+   `routes/api-keys.ts` (listar/crear/revocar, admin con sesión);
+   `/me`, organizaciones, invitaciones y planes exigen sesión de persona;
+   login/registro con límite 10/min; `env.ts` con `corsOrigins`,
+   `apiRateLimitPerMinute`, `metricsToken` y `secret()` que rechaza
+   secretos de ejemplo en producción; `server.ts` con helmet, CORS por
+   env, rate limit global en Redis por IP/API key, `trustProxy` en
+   producción y el error handler movido antes de las rutas.
+3. **Worker:** `lib/host-rate-limit.ts` (cuota por host en Redis) aplicado
+   en `process-check.ts`; `http-check.ts` sigue redirecciones a mano
+   revalidando cada salto (max 5, solo http/https); `run-check.ts` pasa
+   `allowPrivateTargets`.
+4. **Docs:** `docs/SECURITY.md` (checklist), `.env.example` con
+   `CORS_ORIGINS`, `API_RATE_LIMIT_PER_MINUTE`, `CHECK_MAX_PER_HOST_PER_MINUTE`.
+
+### Comandos ejecutados
+```bash
+npm install --workspace=apps/api @fastify/helmet prom-client @fastify/swagger @fastify/swagger-ui
+cd packages/db && npx drizzle-kit generate --name api_keys_name_prefix_scopes && cd ../.. && npm run db:migrate
+npx tsc --noEmit -p apps/api && npx tsc --noEmit -p apps/worker && npx eslint apps/api/src apps/worker/src
+CHECK_MAX_PER_HOST_PER_MINUTE=3 npm run dev:worker      # solo para la prueba de cuota
+npx tsx security-test.mjs                                # 18 comprobaciones
+NODE_ENV=production JWT_ACCESS_SECRET=changeme_access_secret npx tsx -e "import('./apps/api/src/env.ts')"
+```
+
+### Verificación completa (18/18 + 3 manuales)
+- Helmet: `X-Content-Type-Options=nosniff`, `X-Frame-Options=SAMEORIGIN`,
+  HSTS; `X-Request-Id` devuelto y respetado si lo manda el cliente.
+- CORS: `http://localhost:5173` permitido; `https://evil.example` sin
+  `Access-Control-Allow-Origin`.
+- Login: 11º intento → 429 con `{ "error": "Demasiadas peticiones: máximo
+  10 por N seconds…" }` (tras mover el error handler; antes salía con el
+  formato por defecto de Fastify).
+- API keys: creación devuelve `up_…` una vez; listado solo prefijo; read
+  → GET 200 / POST 403; write → POST 201; write no puede
+  `/organizations`, `/me` ni api-keys (403); `X-Organization-Id` ignorado;
+  inexistente → 401; revocada → 401; `last_used_at` actualizado.
+- Rate limit global: petición nº 296 con API key → 429; JWT desde la misma
+  IP sigue en 200 (cuotas separadas).
+- Cuota por host (worker con 3/min): 6 checks encolados → 1 fila nueva
+  (ya había 2 de la creación = 3), `uptimepulse_checks_rate_limited_total=5`.
+- Redirecciones (`runHttpCheck` directo con servidor local en :4120): 302
+  → 127.0.0.1 bloqueada (`ssrf`); bucle → "Demasiadas redirecciones (más de
+  5)"; `file://` → "esquema no permitido"; `http://github.com` → up 200.
+- Secretos: con `changeme_access_secret` o un secreto corto en
+  `NODE_ENV=production` la API no arranca; `CORS_ORIGINS=*` en producción
+  tampoco. `grep` de claves hardcodeadas en `apps/`+`packages/`: nada.
+
+### Limpieza
+Monitores de prueba borrados vía API; usuario `e2e-sec-*` borrado (ver
+limpieza al final de la Fase 5.2). Worker reiniciado sin la cuota de prueba.
+
+### Cómo reproducir/comprobar tú mismo
+Ver la sección final de `docs/SECURITY.md`.
+
+### Pendiente / notas
+- Sin UI para API keys todavía (solo API); se añade en 5.5 junto a la
+  documentación OpenAPI si da tiempo, si no queda en TODO.md.
+- La cuota por host usa ventana fija: en el peor caso permite 2× el límite
+  en 60 s a caballo de dos ventanas. Suficiente para el propósito.
+
+---
+
+## 2026-09-21 — Fase 5.2: observabilidad
+
+### Objetivo
+Saber qué hace el sistema sin leer código: request id en logs, métricas
+Prometheus en API y worker, health checks reales.
+
+### Qué se hizo
+- **API:** `genReqId` desde `X-Request-Id` (validado) o UUID; hook
+  `onResponse` con una línea JSON por petición y contadores/histograma
+  (`lib/telemetry.ts`); `/health` comprueba Postgres y Redis (503 si no);
+  `/metrics` (opcional `METRICS_TOKEN`).
+- **Worker:** `lib/telemetry.ts` (contadores por `type/status/error_kind`,
+  histograma de latencia, rate-limited, skipped, jobs fallidos, incidentes,
+  gauge de la cola), `http-server.ts` (`/health`, `/metrics` en
+  `WORKER_HTTP_PORT`=3001), `runtime.ts` (conexión Redis, telemetría y
+  limitador compartidos). `CheckOutcome.errorKind` en http/tcp/ping.
+
+### Comandos ejecutados
+```bash
+node observability-test.mjs    # 7 comprobaciones
+curl -s localhost:3000/health ; curl -s localhost:3001/health
+curl -s localhost:3001/metrics | grep uptimepulse_checks_total
+```
+
+### Verificación completa (7/7)
+- `/health` API `{status:ok,db:ok,redis:ok}`; worker igual con `region`.
+- Log de la API con `requestId` propio del cliente, `route="/plans"`,
+  `status`, `durationMs`.
+- `/metrics` API: `uptimepulse_api_http_requests_total{route="/plans",status="200"}`,
+  histograma y métricas de proceso.
+- 5 monitores (http ok, tcp timeout, tcp puerto cerrado, http 404 esperando
+  200, ping): `uptimepulse_checks_total` subió por separado `{http,up}` +3,
+  `{tcp,down,timeout}` +4, `{http,down,unexpected_status}` +2, `{ping,up}`
+  +3 (el puerto 9 de example.com se descarta en silencio → timeout, no
+  "rechazada"; el caso "connection" se cubre en los tests unitarios).
+- Histograma `uptimepulse_check_duration_seconds_count{type="http"}=7`;
+  gauge de cola `waiting=0 active=0 delayed=8 failed=3 completed=1019`.
+- Log del worker: `"errorKind":"timeout"` en "check registrado".
+
+### Limpieza
+Monitores borrados vía API; usuarios `e2e-sec-*`/`e2e-obs-*` y sus
+organizaciones borrados en SQL al final de la fase.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+curl -s -H "x-request-id: prueba-12345" -i localhost:3000/plans | grep -i x-request-id
+curl -s localhost:3001/metrics | grep -E "^uptimepulse_checks_total"
+```
+
+### Pendiente / notas
+- No hay Prometheus/Grafana en el docker-compose: las métricas se exponen,
+  no se recogen. Añadirlos sería `prometheus.yml` con dos targets.
+- La cola tiene 3 jobs `failed` antiguos (workers matados a mitad de job
+  durante las pruebas); no afectan, BullMQ los conserva para inspección.
+
+---
+
+## 2026-09-22 — Fase 5.3: tests unitarios, de integración y E2E
+
+### Objetivo
+Una suite permanente en el repo (hasta ahora toda la verificación en
+navegador vivía en scripts temporales de sesión).
+
+### Decisiones
+Ver ADR "Fase 5.3" en TASK.md: dos proyectos de Vitest, base
+`uptimepulse_test` propia, Playwright en `e2e/`.
+
+### Qué se hizo
+- `vitest.config.ts` (proyectos `unit` e `integration`), `test/test-env.ts`
+  (deriva DATABASE_URL/REDIS_URL de test a partir del `.env` o del entorno
+  de CI), `test/global-setup.ts` (crea/migra la base, limpia Redis db 1),
+  `test/setup-env.ts`.
+- Unit: `packages/server-utils/src/{ssrf-guard,target}.test.ts`,
+  `packages/shared/src/username.test.ts`, `packages/queue/src/index.test.ts`,
+  `packages/notify-channels/src/webhook.test.ts`,
+  `apps/worker/src/lib/{ping-check,http-check,tcp-check}.test.ts`.
+  `ping-check.ts` exporta `describePingFailure`, `hasEchoReply`,
+  `parsePingRtt`; `http-check.ts` acepta `fetchImpl`.
+- Integración: `apps/api/test/{helpers,auth,monitors,api-keys-and-status}.test.ts`,
+  `apps/worker/test/health.test.ts`.
+- E2E: `playwright.config.ts`, `e2e/critical-flow.spec.ts`,
+  `e2e/global-teardown.ts`.
+- Scripts raíz: `test`, `test:unit`, `test:integration`, `test:e2e`,
+  `typecheck` (9 proyectos, incluido `tsconfig.tools.json` para
+  test/e2e/configs). `apps/api` y `apps/worker` incluyen `test/` en su
+  tsconfig. `.gitignore`: `test-results/`, `playwright-report/`.
+
+### Comandos ejecutados
+```bash
+npm install -D vitest @playwright/test @types/node
+npm run test:unit            # 87 tests, 8 archivos, ~1 s
+npm run test:integration     # 17 tests, 4 archivos, ~25 s (crea uptimepulse_test)
+npm test                     # 104 tests
+npm run test:e2e             # 1 test con 7 pasos, ~7 s
+npm run typecheck && npm run lint
+```
+
+### Verificación completa
+- `npm test`: **104/104**. `npm run test:e2e`: **1/1** (limpieza: "1
+  usuarios y 1 organizaciones de prueba borrados").
+- Con un test roto a propósito (`expect(1+1).toBe(3)`) `npm run test:unit`
+  devuelve exit code 1; sin él, 0.
+- La base de desarrollo no se toca: antes y después, 1 usuario y 3
+  monitores (los tuyos).
+- Primer intento de integración: 5 fallos por el rate limit de login
+  (todas las peticiones vienen de 127.0.0.1 y los contadores están en
+  Redis) → `AUTH_RATE_LIMIT_PER_MINUTE` configurable, 10000 en tests.
+- `username.test.ts`: "me" está reservado pero cae antes por longitud
+  mínima; el test comprueba que ningún reservado se puede registrar, sin
+  exigir el motivo.
+
+### Limpieza
+`uptimepulse_test` se queda creada (la reutilizan las siguientes
+ejecuciones; se trunca entre tests). Redis db 1 vacía.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+docker compose up -d && npm test && npm run test:e2e
+```
+
+### Pendiente / notas
+- No hay medición de cobertura; `vitest --coverage` necesitaría
+  `@vitest/coverage-v8`.
+- Los E2E cubren un solo flujo; equipos, planes y canales siguen
+  verificados solo por integración/API.
+
+---
+
+## 2026-09-22 — Fase 5.4: CI/CD, Dockerfiles y despliegue
+
+### Objetivo
+Que el repo se construya, pruebe y empaquete solo, y que se pueda
+desplegar siguiendo un documento.
+
+### Decisiones
+Ver ADR "Fase 5.4" en TASK.md: tsx en las imágenes, `migrate` como
+servicio, CI validada en local pero no ejecutada en GitHub, TimescaleDB
+fijada.
+
+### Qué se hizo
+- `apps/api/Dockerfile`, `apps/worker/Dockerfile` (con `iputils-ping`),
+  `apps/web/Dockerfile` + `apps/web/nginx.conf` (SPA fallback, caché de
+  assets, CSP y cabeceras). `.dockerignore`. `tsx` y `start` en api/worker.
+- `docker-compose.prod.yml` (postgres, redis, migrate, api, worker, web;
+  `:?` obliga a definir `POSTGRES_PASSWORD` y los JWT).
+- `.github/workflows/ci.yml` (quality, test, e2e, docker) con nombres de
+  imagen en minúsculas para GHCR.
+- `docs/DEPLOY.md`. `docker-compose.yml` con la versión de TimescaleDB fijada.
+
+### Comandos ejecutados
+```bash
+docker compose -p uptimepulse-prodtest --env-file prod-test.env -f docker-compose.prod.yml build
+docker compose -p uptimepulse-prodtest --env-file prod-test.env -f docker-compose.prod.yml up -d
+docker compose -p uptimepulse-prodtest ps ; curl localhost:3100/health ; curl -I localhost:8080/
+node prod-smoke.mjs                       # 8 comprobaciones contra el stack en Docker
+docker compose -p uptimepulse-prodtest down -v --rmi local
+docker compose -f docker-compose.prod.yml config --quiet   # sintaxis
+node -e "require('js-yaml').load(fs.readFileSync('.github/workflows/ci.yml'))"
+```
+
+### Verificación completa
+- Build: primer intento falló en el worker (bloque runtime copiado de la
+  API sin sustituir, por un `\n` literal al generar el archivo) y luego
+  en la web (`tsconfig.base.json` no copiado); corregidos, las 3 imágenes
+  construyen: api 568 MB, worker 374 MB, web 74,5 MB.
+- Stack arrancado con puertos alternativos (API 3100, web 8080): `migrate`
+  "migraciones aplicadas correctamente" y `Exited (0)`; api/worker/postgres/
+  redis `healthy`; `GET /health` → `{ok, db ok, redis ok}`; nginx 200 con
+  CSP; `/monitors` → 200 (fallback SPA).
+- Smoke (8/8): registro 201; monitores http y **ping** → `up` ejecutados
+  por el worker del contenedor (ping 15 ms desde Linux con usuario `node`
+  gracias a iputils → **el path de Linux de `ping -c 1 -W` queda
+  verificado**); `/admin/queues` 404 en producción; `/docs` 200; HSTS;
+  login en el frontend nginx y dashboard "Operativo" en Chromium.
+- Todo lo que la CI ejecuta se ejecutó en local: lint, typecheck, build,
+  `npm test` (104), `test:e2e` (1), `docker build` ×3.
+
+### Limpieza
+`down -v --rmi local`: contenedores, volúmenes e imágenes de la prueba
+borrados; solo quedan postgres/redis/mailpit de desarrollo.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+cp .env.example .env   # pon POSTGRES_PASSWORD y dos JWT_* de 64 hex
+docker compose -f docker-compose.prod.yml up -d --build
+curl -s localhost:3000/health ; open http://localhost:8080
+```
+
+### Pendiente / notas
+- **La CI no se ha ejecutado en GitHub** (sin push en esta sesión). Al
+  hacer push a `dev` se lanzará; si algo falla será por entorno, no por
+  comandos (todos verificados aquí).
+- Bloquear el merge con tests rotos exige activar "Require status checks"
+  (`test`, `e2e`) en la protección de rama, desde la web de GitHub.
+- Fly.io: documentado, no ejecutado.
+
+---
+
+## 2026-09-22 — Fase 5.5: documentación final y página de API keys
+
+### Qué se hizo
+- READMEs de `apps/api`, `apps/worker`, `apps/web`.
+- `docs/openapi.yaml` (39 rutas) + `redocly.yaml`; servida en `/docs` por
+  `apps/api/src/routes/docs.ts` (`@fastify/swagger` estático + Swagger UI).
+- README raíz: estado, capturas reales (`docs/screenshots/*.png` tomadas
+  con `screenshots.mjs` sobre un usuario de demostración con 5 monitores y
+  una status page, borrado después), arranque en 5 comandos, stack real,
+  roadmap, estructura, "qué queda".
+- Web: `pages/ApiKeysPage.tsx` + `api/apiKeys.ts`, ruta `/api-keys`, enlace
+  "API keys" en la cabecera solo para admins.
+
+### Comandos ejecutados
+```bash
+npx @redocly/cli lint docs/openapi.yaml    # "Your API description is valid" (0 errores)
+curl -s localhost:3000/docs/json | python -c "..."   # 39 paths
+node screenshots.mjs ; node ui-apikeys-test.mjs
+npm run lint && npm run typecheck && npm test && npm run test:e2e && npm run build --workspace=apps/web
+```
+
+### Verificación completa
+- `redocly lint`: válido. `/docs` 200 y `/docs/json` con 39 rutas (hubo que
+  reiniciar la API: la especificación se lee al arrancar).
+- API keys en Chromium (4/4): enlace solo admin; clave `up_<64hex>`
+  mostrada una vez y copiada al portapapeles; lista solo con prefijo y
+  scopes; clave válida contra la API (200) y 401 tras revocar con el
+  diálogo propio.
+- Capturas: 5 archivos PNG reales en `docs/screenshots/`.
+- Comprobación final del repo completo: ver "Cierre de la Fase 5".
+
+### Limpieza
+Usuarios `e2e-shot-*` y `e2e-keysui-*` borrados con sus organizaciones;
+monitores y status pages por API. Estado: 1 usuario (el tuyo), 3 monitores.
+
+### Pendiente / notas
+- La especificación OpenAPI es manual: si se añade una ruta hay que
+  documentarla a mano (anotado en TODO.md).
+
+## 2026-09-22 — Bug encontrado por los tests: media de tiempo de respuesta mal ponderada
+En la comprobación final, `monitors.test.ts` falló con 104 ms en vez de
+130: a las 00:08 los 10 checks del test cayeron en dos buckets horarios y
+`getMonitorMetrics` ponderaba el `avg_response_time_ms` de cada bucket por
+`total_checks`, aunque esa media solo cubre los checks con tiempo (los
+"down" por timeout/DNS no lo tienen). Había pasado antes solo porque todos
+los checks caían en el mismo bucket. Corregido en `lib/metrics.ts`: la
+media se calcula sobre `checks` en crudo (índice `(monitor_id, timestamp)`,
+rango ≤ retención de 90 días); los contadores de uptime siguen viniendo del
+agregado. 17/17 de integración tras el cambio. Es exactamente el tipo de
+error que la Fase 5.3 debía destapar.
+
+## 2026-09-22 — Cierre de la Fase 5
+`PROGRESO-FASE5.md` eliminado (todo su contenido está en TASK.md y aquí).
+TODO.md actualizado: se tachan los puntos que la Fase 5 ha cerrado.
+Comprobación final (ver salida en la respuesta de la sesión): `npm run
+lint`, `npm run typecheck`, `npm test`, `npm run test:e2e`, `vite build`.

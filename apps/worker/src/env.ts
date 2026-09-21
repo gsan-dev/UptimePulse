@@ -11,7 +11,9 @@ config({ path: fileURLToPath(new URL("../../../.env", import.meta.url)) });
 function required(name: string): string {
   const value = process.env[name];
   if (!value) {
-    throw new Error(`Falta la variable de entorno ${name}. Copia .env.example a .env en la raíz del proyecto.`);
+    throw new Error(
+      `Falta la variable de entorno ${name}. Copia .env.example a .env en la raíz del proyecto.`
+    );
   }
   return value;
 }
@@ -41,6 +43,13 @@ export const env = {
   // el mínimo que de verdad distingue "caída real" de "ruido".
   incidentFailureThreshold: Number(process.env.INCIDENT_FAILURE_THRESHOLD ?? 2),
   allowPrivateMonitorTargets: process.env.ALLOW_PRIVATE_MONITOR_TARGETS === "true",
+  // Fase 5.1: cuántos checks por minuto puede recibir un mismo host de
+  // destino, sumando todos los monitores, usuarios y regiones. Por encima,
+  // el check se salta (no cuenta como "down").
+  maxChecksPerHostPerMinute: Number(process.env.CHECK_MAX_PER_HOST_PER_MINUTE ?? 60),
+  // Fase 5.2: puerto del pequeño servidor HTTP del worker (/health y /metrics).
+  httpPort: Number(process.env.WORKER_HTTP_PORT ?? 3001),
+  metricsToken: process.env.METRICS_TOKEN || undefined,
   smtpHost: process.env.SMTP_HOST ?? "localhost",
   smtpPort: Number(process.env.SMTP_PORT ?? 1025),
   smtpSecure: process.env.SMTP_SECURE === "true",

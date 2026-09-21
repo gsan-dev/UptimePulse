@@ -2,15 +2,18 @@
 import { env } from "./env.js";
 import { createLogger } from "@uptimepulse/shared";
 import { pool } from "@uptimepulse/db";
-import { createMonitorCheckWorker, createRedisConnection } from "@uptimepulse/queue";
+import { createMonitorCheckWorker } from "@uptimepulse/queue";
+import { startWorkerHttpServer } from "./http-server.js";
 import { processCheckJob } from "./lib/process-check.js";
+import { connection, telemetry } from "./runtime.js";
 
 const logger = createLogger("worker");
 
-const connection = createRedisConnection(env.redisUrl);
+const httpServer = startWorkerHttpServer();
 const worker = createMonitorCheckWorker(connection, env.region, processCheckJob, env.concurrency);
 
 worker.on("failed", (job, error) => {
+  telemetry.jobsFailed.inc();
   logger.error("job de check fallido", {
     jobId: job?.id,
     monitorId: job?.data.monitorId,
@@ -33,6 +36,7 @@ async function shutdown(signal: string): Promise<void> {
   stopping = true;
   logger.info("apagando worker", { signal });
   await worker.close();
+  httpServer.close();
   await pool.end();
   process.exit(0);
 }

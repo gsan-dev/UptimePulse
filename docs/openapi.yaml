@@ -1,0 +1,916 @@
+openapi: 3.0.3
+info:
+  title: UptimePulse API
+  version: 0.0.1
+  description: |
+    API REST de UptimePulse (monitorización de uptime). Se sirve en `/docs`
+    (Swagger UI) desde la propia API.
+
+    **Autenticación.** Dos formas, ambas por `Authorization: Bearer …`:
+    - un *access token* JWT de 15 min (de `/auth/register`, `/auth/login` o
+      `/auth/refresh`; el refresh token viaja en una cookie httpOnly);
+    - una **API key** `up_…` creada por un admin en
+      `/organizations/{id}/api-keys`. Actúa en nombre de la organización con
+      el rol equivalente a sus scopes (`read` → readonly, `write` → editor) y
+      nunca puede administrar la organización (`/me`, equipo, plan, claves).
+
+    **Organización activa.** Las rutas de datos actúan sobre la organización
+    indicada en `X-Organization-Id`; sin cabecera, sobre la personal del
+    usuario. Con API key la fija la clave y la cabecera se ignora.
+
+    **Errores.** Siempre `{ "error": "<mensaje en español>" }`; los 400 de
+    validación pueden llevar el detalle de zod en `error`. Los 422 por límite
+    del plan añaden `limit`. Cada respuesta lleva `X-Request-Id`.
+
+    **Rate limits.** 300 peticiones/min por IP o API key en toda la API (429);
+    login y registro 10/min; `/public/status`, `/plans`, `/invitations/{token}`
+    y `/auth/username-available` 60/min.
+servers:
+  - url: http://localhost:3000
+    description: Desarrollo local
+tags:
+  - name: Sistema
+  - name: Auth
+  - name: Organizaciones
+  - name: API keys
+  - name: Planes
+  - name: Monitores
+  - name: Canales de notificación
+  - name: Status pages
+  - name: Público
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: JWT de acceso o API key `up_…`.
+  parameters:
+    organizationHeader:
+      name: X-Organization-Id
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+      description: Organización activa. Sin ella, la personal del usuario.
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    range:
+      name: range
+      in: query
+      schema: { type: string, enum: [24h, 7d, 30d, 90d], default: 24h }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          description: Mensaje legible, o el detalle de validación de zod.
+          oneOf: [{ type: string }, { type: object }]
+    PlanLimitError:
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            limit:
+              type: object
+              description: Presente cuando el error lo causa un límite del plan.
+              properties:
+                kind: { type: string, enum: [maxMonitors, minInterval, allowedChannels] }
+                plan: { type: string }
+                max: { type: integer }
+                current: { type: integer }
+                minIntervalSeconds: { type: integer }
+                allowed: { type: array, items: { type: string } }
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string, example: gdev }
+        fullName: { type: string }
+        email: { type: string, format: email }
+        createdAt: { type: string, format: date-time }
+    AuthResponse:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        accessToken: { type: string, description: JWT de 15 minutos. }
+    RegisterInput:
+      type: object
+      required: [username, fullName, email, password]
+      properties:
+        username:
+          type: string
+          description: 3–30 caracteres, minúsculas/números/guiones; se normaliza. Nombres reservados (admin, status, api…) rechazados.
+        fullName: { type: string, maxLength: 100 }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+        organizationName: { type: string, description: "Nombre de la organización personal (por defecto, el del usuario)." }
+    LoginInput:
+      type: object
+      required: [identifier, password]
+      properties:
+        identifier: { type: string, description: Email o nombre de usuario. }
+        password: { type: string }
+    Role:
+      type: string
+      enum: [admin, editor, readonly]
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        planName: { type: string, example: free }
+    OrganizationDetail:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        plan: { $ref: "#/components/schemas/Plan" }
+        usage:
+          type: object
+          properties:
+            monitors: { type: integer }
+    Member:
+      type: object
+      properties:
+        userId: { type: string, format: uuid }
+        username: { type: string }
+        fullName: { type: string }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        joinedAt: { type: string, format: date-time }
+    Invitation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        expiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+    ApiKey:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        keyPrefix: { type: string, example: up_3f9a1c2b }
+        scopes: { type: array, items: { type: string, enum: [read, write] } }
+        lastUsedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+    ApiKeyCreated:
+      allOf:
+        - $ref: "#/components/schemas/ApiKey"
+        - type: object
+          properties:
+            key:
+              type: string
+              description: La clave completa. Solo se devuelve aquí, una vez.
+              example: up_3f9a1c2b…(64 hex)
+    Plan:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: pro }
+        maxMonitors: { type: integer }
+        minIntervalSeconds: { type: integer }
+        allowedChannels: { type: array, items: { type: string } }
+        priceCentsMonthly: { type: integer, description: Precio mensual en céntimos. }
+    MonitorType:
+      type: string
+      enum: [http, tcp, ping]
+    MonitorInput:
+      type: object
+      required: [name, type, target, intervalSeconds, timeoutMs]
+      properties:
+        name: { type: string, maxLength: 200 }
+        type: { $ref: "#/components/schemas/MonitorType" }
+        target:
+          type: string
+          description: |
+            `http`: URL completa. `tcp`: `host:puerto`. `ping`: host o IP sin
+            esquema ni puerto. Los destinos privados/internos (127.0.0.0/8,
+            10/8, 172.16/12, 192.168/16, 169.254/16, ::1, fc00::/7…) se
+            rechazan con 422, también si el DNS resuelve a uno.
+        method: { type: string, enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS], default: GET, description: Solo http. }
+        headers: { type: object, additionalProperties: { type: string }, description: Solo http. }
+        body: { type: string, description: Solo http. }
+        expectedStatus: { type: integer, minimum: 100, maximum: 599, description: "Solo http. Sin él, cualquier status < 400 es operativo." }
+        intervalSeconds: { type: integer, minimum: 30, maximum: 86400, description: Sujeto al mínimo del plan. }
+        timeoutMs: { type: integer, minimum: 1000, maximum: 60000 }
+        tags: { type: array, items: { type: string } }
+    Monitor:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        name: { type: string }
+        type: { $ref: "#/components/schemas/MonitorType" }
+        target: { type: string }
+        method: { type: string, nullable: true }
+        headers: { type: object, nullable: true }
+        body: { type: string, nullable: true }
+        expectedStatus: { type: integer, nullable: true }
+        intervalSeconds: { type: integer }
+        timeoutMs: { type: integer }
+        isPaused: { type: boolean }
+        tags: { type: array, items: { type: string } }
+        consolidatedStatus:
+          type: string
+          enum: [up, degraded, down]
+          nullable: true
+          description: Estado consolidado multi-región (null hasta el primer check).
+        sslExpiresAt: { type: string, format: date-time, nullable: true }
+        lastCheck: { $ref: "#/components/schemas/Check" }
+        createdAt: { type: string, format: date-time }
+    MonitorDetail:
+      allOf:
+        - $ref: "#/components/schemas/Monitor"
+        - type: object
+          properties:
+            regions:
+              type: array
+              description: Último check visto desde cada región configurada.
+              items:
+                type: object
+                properties:
+                  region: { type: string }
+                  status: { type: string, enum: [up, down], nullable: true }
+                  responseTimeMs: { type: integer, nullable: true }
+                  timestamp: { type: string, format: date-time, nullable: true }
+    Check:
+      type: object
+      nullable: true
+      properties:
+        id: { type: string, format: uuid }
+        timestamp: { type: string, format: date-time }
+        status: { type: string, enum: [up, down] }
+        responseTimeMs: { type: integer, nullable: true }
+        httpStatus: { type: integer, nullable: true }
+        errorMessage: { type: string, nullable: true }
+        region: { type: string }
+    Metrics:
+      type: object
+      properties:
+        range: { type: string }
+        totalChecks: { type: integer }
+        upChecks: { type: integer }
+        downChecks: { type: integer }
+        uptimePercentage: { type: number, nullable: true, example: 99.87 }
+        avgResponseTimeMs: { type: integer, nullable: true }
+        incidentCount: { type: integer }
+        openIncidentCount: { type: integer }
+        mttrSeconds: { type: integer, nullable: true, description: Tiempo medio de recuperación de los incidentes resueltos en el rango. }
+    TimeseriesPoint:
+      type: object
+      properties:
+        bucket: { type: string, format: date-time }
+        totalChecks: { type: integer }
+        upChecks: { type: integer }
+        downChecks: { type: integer }
+        avgResponseTimeMs: { type: integer, nullable: true }
+    Incident:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        monitorId: { type: string, format: uuid }
+        startedAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+        causeSummary: { type: string, nullable: true }
+    MaintenanceWindowInput:
+      type: object
+      required: [startsAt, endsAt]
+      properties:
+        startsAt: { type: string, format: date-time }
+        endsAt: { type: string, format: date-time }
+        note: { type: string, maxLength: 500 }
+    MaintenanceWindow:
+      allOf:
+        - $ref: "#/components/schemas/MaintenanceWindowInput"
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            monitorId: { type: string, format: uuid }
+    ChannelInput:
+      type: object
+      required: [type, name, config]
+      properties:
+        type: { type: string, enum: [discord, slack, webhook], description: Sujeto a los canales que permite el plan. }
+        name: { type: string, maxLength: 100 }
+        config:
+          type: object
+          description: "`discord`/`slack`: `{ webhookUrl }`. `webhook`: `{ url, secret }` (el payload se firma con HMAC-SHA256 en `X-UptimePulse-Signature`)."
+    Channel:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string }
+        name: { type: string }
+        config: { type: object, description: Sin secretos. }
+        createdAt: { type: string, format: date-time }
+    StatusPageInput:
+      type: object
+      required: [slug, title]
+      properties:
+        slug: { type: string, pattern: "^[a-z0-9-]+$", maxLength: 60, description: Único dentro de la organización. }
+        title: { type: string, maxLength: 200 }
+        isPublic: { type: boolean, default: true }
+        monitorIds: { type: array, items: { type: string, format: uuid } }
+    StatusPage:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        slug: { type: string }
+        title: { type: string }
+        isPublic: { type: boolean }
+        monitorIds: { type: array, items: { type: string, format: uuid } }
+        createdAt: { type: string, format: date-time }
+    PublicStatus:
+      type: object
+      properties:
+        title: { type: string }
+        overallStatus: { type: string, enum: [operational, degraded, major_outage] }
+        monitors:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              name: { type: string }
+              currentStatus: { type: string, enum: [up, degraded, down, paused, pending] }
+              uptime24h: { type: number, nullable: true }
+              uptime7d: { type: number, nullable: true }
+              uptime30d: { type: number, nullable: true }
+              incidents:
+                type: array
+                items: { $ref: "#/components/schemas/Incident" }
+  responses:
+    Unauthorized:
+      description: Sin token, token inválido/caducado o API key revocada.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: Sin rol suficiente, organización ajena, o acción de persona intentada con API key.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: No existe o no pertenece a la organización activa.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    BadRequest:
+      description: Validación.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    TooMany:
+      description: Rate limit.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+paths:
+  /health:
+    get:
+      tags: [Sistema]
+      summary: Salud de la API (Postgres y Redis)
+      security: []
+      responses:
+        "200":
+          description: Todo responde.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  db: { type: string, example: ok }
+                  redis: { type: string, example: ok }
+        "503": { description: "Alguna dependencia falla (`status` = `degraded`)." }
+  /metrics:
+    get:
+      tags: [Sistema]
+      summary: Métricas Prometheus
+      security: []
+      description: Con `METRICS_TOKEN` configurado exige `Authorization Bearer <token>`.
+      responses:
+        "200": { description: "Formato de exposición de Prometheus (`text/plain`)." }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Registro (crea también la organización personal)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RegisterInput" } } }
+      responses:
+        "201":
+          description: Registrado; cookie `uptimepulse_refresh` (httpOnly, Path=/auth).
+          content: { application/json: { schema: { $ref: "#/components/schemas/AuthResponse" } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { description: "Email o username ya en uso." }
+        "429": { $ref: "#/components/responses/TooMany" }
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login por email o username
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/LoginInput" } } }
+      responses:
+        "200":
+          description: Sesión iniciada; cookie de refresh.
+          content: { application/json: { schema: { $ref: "#/components/schemas/AuthResponse" } } }
+        "401": { description: "Credenciales inválidas." }
+        "429": { $ref: "#/components/responses/TooMany" }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Nuevo access token a partir de la cookie de refresh
+      security: []
+      responses:
+        "200": { description: "Nuevo token.", content: { application/json: { schema: { $ref: "#/components/schemas/AuthResponse" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Borra la cookie de refresh
+      security: []
+      responses:
+        "204": { description: "Sesión cerrada." }
+  /auth/username-available:
+    get:
+      tags: [Auth]
+      summary: ¿Está libre este username?
+      security: []
+      parameters:
+        - { name: username, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Resultado.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  username: { type: string }
+                  available: { type: boolean }
+                  reason: { type: string }
+  /me:
+    get:
+      tags: [Auth]
+      summary: Usuario de la sesión
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: "Usuario.", content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    patch:
+      tags: [Auth]
+      summary: Cambiar username o nombre
+      security: [{ bearer: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                fullName: { type: string }
+      responses:
+        "200": { description: "Actualizado.", content: { application/json: { schema: { $ref: "#/components/schemas/User" } } } }
+        "409": { description: "Username en uso." }
+
+  /organizations:
+    get:
+      tags: [Organizaciones]
+      summary: Mis organizaciones y mi rol en cada una
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Organization" } } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /organizations/{id}:
+    get:
+      tags: [Organizaciones]
+      summary: Detalle con plan y uso
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Detalle.", content: { application/json: { schema: { $ref: "#/components/schemas/OrganizationDetail" } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /organizations/{id}/plan:
+    post:
+      tags: [Planes]
+      summary: Cambiar de plan (simulado, sin pago; solo admin)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [planName], properties: { planName: { type: string } } } } }
+      responses:
+        "200": { description: "Plan cambiado.", content: { application/json: { schema: { $ref: "#/components/schemas/OrganizationDetail" } } } }
+        "404": { description: "Plan inexistente." }
+        "409": { description: "La organización tiene más monitores de los que permite el plan destino." }
+  /organizations/{id}/members:
+    get:
+      tags: [Organizaciones]
+      summary: Miembros
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Member" } } } } }
+  /organizations/{id}/members/{userId}:
+    patch:
+      tags: [Organizaciones]
+      summary: Cambiar el rol de un miembro (admin)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [role], properties: { role: { $ref: "#/components/schemas/Role" } } } } }
+      responses:
+        "200": { description: "Actualizado." }
+        "409": { description: "Sería degradar al último admin." }
+    delete:
+      tags: [Organizaciones]
+      summary: Expulsar a un miembro (admin)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: "Expulsado." }
+        "409": { description: "Es el último admin." }
+  /organizations/{id}/invitations:
+    get:
+      tags: [Organizaciones]
+      summary: Invitaciones pendientes (admin)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Invitation" } } } } }
+    post:
+      tags: [Organizaciones]
+      summary: Invitar por email (admin); envía un enlace válido 7 días
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "201": { description: "Invitación creada y email enviado.", content: { application/json: { schema: { $ref: "#/components/schemas/Invitation" } } } }
+        "409": { description: "Ya es miembro o ya está invitado." }
+        "502": { description: "No se pudo enviar el email (la invitación se descarta)." }
+  /organizations/{id}/invitations/{invitationId}:
+    delete:
+      tags: [Organizaciones]
+      summary: Anular una invitación (admin)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: "Anulada." }
+  /invitations/{token}:
+    get:
+      tags: [Organizaciones]
+      summary: Datos de una invitación (público, para la pantalla de aceptación)
+      security: []
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: Invitación válida.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organizationName: { type: string }
+                  email: { type: string }
+                  role: { $ref: "#/components/schemas/Role" }
+                  expiresAt: { type: string, format: date-time }
+        "404": { description: "Inexistente, usada o caducada." }
+  /invitations/{token}/accept:
+    post:
+      tags: [Organizaciones]
+      summary: Aceptar (el email de la sesión debe coincidir con el invitado)
+      security: [{ bearer: [] }]
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: "Ahora eres miembro." }
+        "403": { description: "La sesión no es del email invitado." }
+        "404": { description: "Inexistente, usada o caducada." }
+
+  /organizations/{id}/api-keys:
+    get:
+      tags: [API keys]
+      summary: Listar (admin con sesión)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Solo prefijos.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/ApiKey" } } } } }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [API keys]
+      summary: Crear (admin con sesión). La clave completa solo se devuelve aquí.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name: { type: string, maxLength: 100 }
+                scopes: { type: array, minItems: 1, items: { type: string, enum: [read, write] } }
+      responses:
+        "201": { description: "Creada.", content: { application/json: { schema: { $ref: "#/components/schemas/ApiKeyCreated" } } } }
+        "422": { description: "Máximo 20 claves por organización." }
+  /organizations/{id}/api-keys/{keyId}:
+    delete:
+      tags: [API keys]
+      summary: Revocar (inmediato)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: keyId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: "Revocada." }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /plans:
+    get:
+      tags: [Planes]
+      summary: Planes disponibles (público)
+      security: []
+      responses:
+        "200": { description: "Ordenados por precio.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Plan" } } } } }
+
+  /monitors:
+    get:
+      tags: [Monitores]
+      summary: Monitores de la organización activa, con su último check
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Monitor" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Monitores]
+      summary: Crear (editor). Programa el check periódico y uno inmediato.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MonitorInput" } } }
+      responses:
+        "201": { description: "Creado.", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422":
+          description: Target privado/irresoluble, o límite del plan (`limit`).
+          content: { application/json: { schema: { $ref: "#/components/schemas/PlanLimitError" } } }
+  /monitors/summary:
+    get:
+      tags: [Monitores]
+      summary: Resumen del dashboard (contadores por estado y sparklines 24h)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Resumen." }
+  /monitors/{id}:
+    get:
+      tags: [Monitores]
+      summary: Detalle con el último check por región
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Detalle.", content: { application/json: { schema: { $ref: "#/components/schemas/MonitorDetail" } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Monitores]
+      summary: Editar (editor). Reprograma el check si cambia el intervalo.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/MonitorInput" } } }
+      responses:
+        "200": { description: "Actualizado.", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
+        "422": { description: "Target privado o límite del plan.", content: { application/json: { schema: { $ref: "#/components/schemas/PlanLimitError" } } } }
+    delete:
+      tags: [Monitores]
+      summary: Borrar (editor). Quita sus job schedulers en todas las regiones.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "204": { description: "Borrado." }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /monitors/{id}/pause:
+    post:
+      tags: [Monitores]
+      summary: Pausar (editor)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Pausado.", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
+  /monitors/{id}/resume:
+    post:
+      tags: [Monitores]
+      summary: Reanudar (editor)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Reanudado.", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
+  /monitors/{id}/checks:
+    get:
+      tags: [Monitores]
+      summary: Últimos checks (todas las regiones)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        "200": { description: "Más recientes primero.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Check" } } } } }
+  /monitors/{id}/metrics:
+    get:
+      tags: [Monitores]
+      summary: Uptime %, latencia media, incidentes y MTTR en un rango
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/range" }]
+      responses:
+        "200": { description: "Métricas.", content: { application/json: { schema: { $ref: "#/components/schemas/Metrics" } } } }
+  /monitors/{id}/timeseries:
+    get:
+      tags: [Monitores]
+      summary: Serie por hora (para gráficos) en un rango
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/range" }]
+      responses:
+        "200": { description: "Puntos.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/TimeseriesPoint" } } } } }
+  /monitors/{id}/incidents:
+    get:
+      tags: [Monitores]
+      summary: Incidentes del rango
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/range" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Incident" } } } } }
+  /monitors/{id}/maintenance-windows:
+    get:
+      tags: [Monitores]
+      summary: Ventanas de mantenimiento
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/MaintenanceWindow" } } } } }
+    post:
+      tags: [Monitores]
+      summary: Crear ventana (editor). Dentro de ella no se abren incidentes ni se alerta.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MaintenanceWindowInput" } } }
+      responses:
+        "201": { description: "Creada.", content: { application/json: { schema: { $ref: "#/components/schemas/MaintenanceWindow" } } } }
+  /monitors/{id}/maintenance-windows/{windowId}:
+    delete:
+      tags: [Monitores]
+      summary: Borrar ventana (editor)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: windowId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: "Borrada." }
+  /monitors/{id}/notification-channels:
+    get:
+      tags: [Monitores]
+      summary: Canales asociados al monitor
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Channel" } } } } }
+  /monitors/{id}/notification-channels/{channelId}:
+    post:
+      tags: [Monitores]
+      summary: Asociar canal (editor)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: channelId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "201": { description: "Asociado." }
+    delete:
+      tags: [Monitores]
+      summary: Desasociar canal (editor)
+      security: [{ bearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: channelId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: "Desasociado." }
+
+  /notification-channels:
+    get:
+      tags: [Canales de notificación]
+      summary: Canales de la organización
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Channel" } } } } }
+    post:
+      tags: [Canales de notificación]
+      summary: Crear (editor). La URL pasa el mismo anti-SSRF que los monitores.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChannelInput" } } }
+      responses:
+        "201": { description: "Creado.", content: { application/json: { schema: { $ref: "#/components/schemas/Channel" } } } }
+        "422": { description: "URL privada o tipo no permitido por el plan (`limit`).", content: { application/json: { schema: { $ref: "#/components/schemas/PlanLimitError" } } } }
+  /notification-channels/{id}:
+    delete:
+      tags: [Canales de notificación]
+      summary: Borrar (editor)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "204": { description: "Borrado." }
+  /notification-channels/{id}/test:
+    post:
+      tags: [Canales de notificación]
+      summary: Enviar un mensaje de prueba (editor)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Resultado del envío (`ok`, `error`, `detail`)." }
+        "502": { description: "El proveedor rechazó el mensaje." }
+
+  /status-pages:
+    get:
+      tags: [Status pages]
+      summary: Status pages de la organización
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      responses:
+        "200": { description: "Lista.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/StatusPage" } } } } }
+    post:
+      tags: [Status pages]
+      summary: Crear (editor). Pública en `/status/{username}/{slug}`.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/StatusPageInput" } } }
+      responses:
+        "201": { description: "Creada.", content: { application/json: { schema: { $ref: "#/components/schemas/StatusPage" } } } }
+        "409": { description: "Slug repetido en la organización." }
+  /status-pages/{id}:
+    get:
+      tags: [Status pages]
+      summary: Detalle
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200": { description: "Detalle.", content: { application/json: { schema: { $ref: "#/components/schemas/StatusPage" } } } }
+    patch:
+      tags: [Status pages]
+      summary: Editar título, visibilidad o monitores (editor)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/StatusPageInput" } } }
+      responses:
+        "200": { description: "Actualizada.", content: { application/json: { schema: { $ref: "#/components/schemas/StatusPage" } } } }
+    delete:
+      tags: [Status pages]
+      summary: Borrar (editor)
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "204": { description: "Borrada." }
+
+  /public/status/{username}/{slug}:
+    get:
+      tags: [Público]
+      summary: Status page pública (sin sesión)
+      security: []
+      description: 404 idéntico si el usuario o el slug no existen (no permite enumerar usuarios).
+      parameters:
+        - { name: username, in: path, required: true, schema: { type: string } }
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Estado.", content: { application/json: { schema: { $ref: "#/components/schemas/PublicStatus" } } } }
+        "404": { description: "Página no encontrada." }
+        "429": { $ref: "#/components/responses/TooMany" }

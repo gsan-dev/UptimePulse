@@ -1,4 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
+import type { ApiKeyScope } from "@uptimepulse/db";
+import { isApiKey, resolveApiKey, roleForScopes } from "../lib/api-keys.js";
 import { verifyAccessToken } from "../lib/tokens.js";
 import { resolveOrganization, roleSatisfies, type OrganizationRole } from "../lib/organizations.js";
 
@@ -12,10 +14,18 @@ export interface RequestOrganization {
   role: OrganizationRole;
 }
 
+export interface RequestApiKey {
+  id: string;
+  organizationId: string;
+  scopes: ApiKeyScope[];
+}
+
 declare module "fastify" {
   interface FastifyRequest {
     user?: AuthenticatedUser;
     organization?: RequestOrganization;
+    /** Presente cuando la petición se autenticó con una API key (Fase 5.1), no con JWT. */
+    apiKey?: RequestApiKey;
   }
 }
 
@@ -23,9 +33,10 @@ const ORGANIZATION_HEADER = "x-organization-id";
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * preHandler de Fastify: exige `Authorization: Bearer <accessToken>` válido.
- * Si falta o el token no verifica, corta la petición con 401 antes de llegar
- * al handler de la ruta.
+ * preHandler de Fastify: exige `Authorization: Bearer <accessToken>` válido,
+ * o `Authorization: Bearer up_<clave>` con una API key de la organización
+ * (Fase 5.1). Si falta o no verifica, corta la petición con 401 antes de
+ * llegar al handler de la ruta.
  */
 export async function requireAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   const header = request.headers.authorization;
@@ -34,6 +45,18 @@ export async function requireAuth(request: FastifyRequest, reply: FastifyReply):
   }
 
   const token = header.slice("Bearer ".length);
+  if (isApiKey(token)) {
+    const apiKey = await resolveApiKey(token);
+    if (!apiKey) {
+      return reply.code(401).send({ error: "API key inválida o revocada" });
+    }
+    request.apiKey = apiKey;
+    // Una API key actúa en nombre de la organización, no de una persona:
+    // `user` queda sin definir y las rutas que necesitan un usuario (perfil,
+    // equipo, plan) lo rechazan con requireUserSession.
+    request.organization = { id: apiKey.organizationId, role: roleForScopes(apiKey.scopes) };
+    return;
+  }
   try {
     const payload = verifyAccessToken(token);
     request.user = { id: payload.sub, email: payload.email };
@@ -53,6 +76,10 @@ export async function requireAuth(request: FastifyRequest, reply: FastifyReply):
  * eres miembro".
  */
 export async function requireOrganization(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  // Con API key la organización viene fijada por la propia clave; la cabecera
+  // se ignora (no se puede usar una clave de una organización en otra).
+  if (request.apiKey) return;
+
   const raw = request.headers[ORGANIZATION_HEADER];
   const requested = Array.isArray(raw) ? raw[0] : raw;
   if (requested !== undefined && requested !== "" && !UUID_REGEX.test(requested)) {
@@ -82,4 +109,15 @@ export function requireRole(minimum: OrganizationRole) {
       });
     }
   };
+}
+
+/**
+ * preHandler para rutas que solo tienen sentido para una persona con sesión
+ * (perfil, equipo, plan, gestión de API keys): una API key da 403 aunque
+ * tenga scope write.
+ */
+export async function requireUserSession(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  if (request.apiKey || !request.user) {
+    return reply.code(403).send({ error: "Esta operación requiere iniciar sesión; no se puede hacer con una API key" });
+  }
 }

@@ -7,7 +7,7 @@ import { createMailer, organizationInvitationEmail } from "@uptimepulse/mailer";
 import { createLogger } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { getMembership, type OrganizationRole } from "../lib/organizations.js";
-import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
+import { requireAuth, requireOrganization, requireRole, requireUserSession } from "../plugins/auth.js";
 
 const logger = createLogger("api");
 
@@ -72,6 +72,9 @@ function assertRouteOrganizationMatches(request: { organization?: { id: string }
 
 export async function organizationRoutes(app: FastifyInstance): Promise<void> {
   app.addHook("preHandler", requireAuth);
+  // Equipo, invitaciones y organizaciones son cosas de personas, no de
+  // integraciones: una API key no puede listarlas ni tocarlas (Fase 5.1).
+  app.addHook("preHandler", requireUserSession);
 
   // Todas mis organizaciones con mi rol en cada una — es lo que alimenta el
   // selector del frontend. No pasa por requireOrganization a propósito: es
@@ -343,7 +346,7 @@ export async function invitationRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  app.post("/invitations/:token/accept", { preHandler: requireAuth }, async (request, reply) => {
+  app.post("/invitations/:token/accept", { preHandler: [requireAuth, requireUserSession] }, async (request, reply) => {
     const params = tokenParamSchema.safeParse(request.params);
     if (!params.success) {
       return reply.code(404).send({ error: "Invitación no válida o caducada" });

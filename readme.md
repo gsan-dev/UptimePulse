@@ -4,6 +4,57 @@
 
 ---
 
+## Estado: las 5 fases del plan están completas
+
+[![CI](https://github.com/gsan-dev/UptimePulse/actions/workflows/ci.yml/badge.svg)](https://github.com/gsan-dev/UptimePulse/actions/workflows/ci.yml)
+
+Checks HTTP/TCP/ping desde varias regiones con quórum, incidentes, alertas
+(email, Discord, Slack, webhook firmado), SSL, status pages públicas por
+usuario, equipos con roles, API keys, planes con límites reales, métricas
+Prometheus, tests (unitarios, integración, E2E) y CI con imágenes Docker.
+Lo que no está hecho a propósito (SMS, Stripe real, OAuth…) está en
+[TODO.md](TODO.md); cada decisión, en los ADR de [TASK.md](TASK.md); cada
+paso reproducible, en [DIARIO.md](DIARIO.md).
+
+### Capturas (reales, tomadas con Playwright sobre la app en local)
+
+| Dashboard en tiempo real | Detalle de un monitor |
+| --- | --- |
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Detalle](docs/screenshots/monitor-detail.png) |
+
+| Status page pública (`/status/<usuario>/<slug>`) | Planes | API (`/docs`) |
+| --- | --- | --- |
+| ![Status page](docs/screenshots/status-page.png) | ![Planes](docs/screenshots/pricing.png) | ![Swagger](docs/screenshots/api-docs.png) |
+
+### Arrancar en local en 5 comandos
+
+Requisitos: Node 22+, Docker con Compose v2.
+
+```bash
+git clone https://github.com/gsan-dev/UptimePulse.git && cd UptimePulse
+cp .env.example .env          # los valores de ejemplo valen para desarrollo
+docker compose up -d          # TimescaleDB, Redis y Mailpit (emails en http://localhost:8025)
+npm install && npm run db:migrate
+npm run dev:api & npm run dev:worker & npm run dev:web   # o tres terminales
+```
+
+Abre http://localhost:5173, regístrate y crea un monitor: en unos segundos
+verás "Operativo" sin recargar. API en http://localhost:3000 (`/docs`,
+`/health`, `/metrics`); worker en http://localhost:3001 (`/health`, `/metrics`).
+
+```bash
+npm run lint && npm run typecheck   # calidad
+npm test                            # unitarios + integración (usa la base uptimepulse_test)
+npm run test:e2e                    # Playwright contra los procesos arrancados
+```
+
+Más detalle por aplicación: [apps/api](apps/api/README.md),
+[apps/worker](apps/worker/README.md), [apps/web](apps/web/README.md).
+Despliegue: [docs/DEPLOY.md](docs/DEPLOY.md). Seguridad:
+[docs/SECURITY.md](docs/SECURITY.md).
+
+---
+
 ## 1. Descripción del proyecto
 
 **UptimePulse** es una aplicación web tipo SaaS que permite a un usuario registrar URLs, APIs o servicios y monitorizarlos de forma continua. El sistema realiza comprobaciones periódicas (HTTP, TCP, SSL), detecta caídas y recuperaciones, calcula métricas de disponibilidad y rendimiento, y notifica al usuario por email, SMS o webhook cuando algo falla.
@@ -153,14 +204,15 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
                           (email / SMS / webhook)
 ```
 
-**Stack sugerido:**
-- Backend: Node.js (Express/Fastify) o Python (FastAPI)
-- Cola: Redis + BullMQ (o Celery + Redis)
-- Base de datos: PostgreSQL + extensión TimescaleDB
-- Frontend: React + TailwindCSS + Recharts
-- Tiempo real: WebSockets (Socket.io)
-- Alertas: Nodemailer/Resend (email), Twilio (SMS), fetch a webhooks
-- Infraestructura: Docker Compose en desarrollo, despliegue en VPS o Fly.io/Railway
+**Stack real (el que hay en el repositorio):**
+- Backend: Node.js 22 + Fastify 5 + zod; Drizzle ORM sobre PostgreSQL 16 + TimescaleDB 2.30 (hypertable `checks`, agregado continuo `checks_hourly`)
+- Cola: Redis 7 + BullMQ (job schedulers, una cola por región)
+- Frontend: React 18 + Vite + TailwindCSS + Recharts
+- Tiempo real: Socket.io con adaptador Redis (el worker publica, la API reenvía)
+- Alertas: Nodemailer (Mailpit en desarrollo, cualquier SMTP en producción), Discord, Slack, webhook genérico firmado con HMAC-SHA256. SMS pendiente (sin cuenta de Twilio).
+- Observabilidad: logs JSON con request id, `prom-client` en `/metrics`, `/health` con dependencias
+- Tests: Vitest (unitarios e integración contra la base real), Playwright (E2E)
+- Infraestructura: Docker Compose en desarrollo y producción (`docker-compose.prod.yml`), GitHub Actions (lint, type-check, tests, E2E, imágenes en GHCR), guía para Fly.io
 
 ---
 
@@ -168,10 +220,14 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 
 | Fase | Contenido |
 |---|---|
-| **Fase 1 — MVP** | Auth, CRUD de monitores, worker simple con checks HTTP, dashboard básico, alertas por email |
-| **Fase 2** | Cola de trabajo real (Redis/BullMQ), lógica de incidentes, WebSockets para tiempo real |
-| **Fase 3** | SSL check, webhooks/SMS, status pages públicas |
-| **Fase 4** | Equipos/roles, checks multi-región, planes de suscripción con límites |
+| **Fase 0 — Base** ✅ | Monorepo, Docker Compose, esquema y migraciones, logging JSON |
+| **Fase 1 — MVP** ✅ | Auth (JWT + refresh httpOnly), CRUD de monitores con anti-SSRF, worker HTTP/TCP, dashboard, alertas por email |
+| **Fase 2** ✅ | BullMQ, incidentes con umbral y ventanas de mantenimiento, WebSockets, métricas sobre TimescaleDB |
+| **Fase 3** ✅ | SSL, Discord/Slack/webhook firmado, status pages públicas por usuario (`/status/<usuario>/<slug>`) |
+| **Fase 4** ✅ | Equipos y roles con invitaciones, checks multi-región con quórum, planes con límites reales (Stripe simulado) |
+| **Fase 5** ✅ | Seguridad (helmet, CORS, rate limits, API keys, cuota por host, redirecciones), observabilidad, tests, CI/CD, documentación. Ping ICMP añadido. |
+
+El detalle de cada fase, con lo verificado y cómo, está en [TASK.md](TASK.md).
 
 ---
 
@@ -180,21 +236,31 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 ```
 uptimepulse/
 ├── apps/
-│   ├── api/            # Servidor REST + WebSocket
-│   ├── worker/         # Proceso de checks (independiente del API)
-│   └── web/            # Cliente React
+│   ├── api/            # Fastify: REST + Socket.io, productor de la cola (README propio)
+│   ├── worker/         # Consumidor de la cola: checks, quórum, incidentes, alertas (README propio)
+│   └── web/            # React + Vite (README propio)
 ├── packages/
-│   └── shared/         # Tipos e interfaces compartidas (TS)
-├── docker-compose.yml
+│   ├── db/             # Esquema Drizzle, migraciones SQL, cliente
+│   ├── queue/          # BullMQ: colas por región, job schedulers, quórum
+│   ├── server-utils/   # Anti-SSRF, validación de targets
+│   ├── mailer/         # Nodemailer + plantillas
+│   ├── notify-channels/# Discord, Slack, webhook firmado
+│   └── shared/         # Logger JSON, reglas de username, tipos
+├── e2e/                # Playwright (flujo crítico)
+├── test/               # Configuración de los tests de integración (base uptimepulse_test)
+├── docs/               # openapi.yaml, SECURITY.md, DEPLOY.md, capturas
+├── .github/workflows/  # CI
+├── docker-compose.yml       # infraestructura de desarrollo
+├── docker-compose.prod.yml  # stack completo para un servidor
+├── TASK.md · DIARIO.md · TODO.md
 └── README.md
 ```
 
 ---
 
-## 7. Próximos pasos
+## 7. Qué queda
 
-1. Definir el esquema de base de datos (migraciones).
-2. Levantar el esqueleto del backend (API + auth).
-3. Construir el worker más simple posible (un ping cada minuto guardado en DB).
-4. Conectar un dashboard mínimo que lea esos datos.
-5. Iterar añadiendo cola de trabajo, tiempo real y alertas.
+El plan original está cumplido. Lo que se dejó fuera conscientemente y la
+deuda técnica conocida están en [TODO.md](TODO.md) (SMS con Twilio, Stripe
+real, OAuth, resumen semanal, edición completa del monitor, UI de ventanas
+de mantenimiento, revocación de refresh tokens, entre otros).

@@ -26,7 +26,7 @@ type AppSocketServer = SocketIOServer<Record<string, never>, Record<string, neve
  */
 export function attachRealtime(httpServer: HttpServer): AppSocketServer {
   const io: AppSocketServer = new SocketIOServer(httpServer, {
-    cors: { origin: true, credentials: true },
+    cors: { origin: env.corsOrigins, credentials: true },
   });
 
   const pubClient = createRedisConnection(env.redisUrl);

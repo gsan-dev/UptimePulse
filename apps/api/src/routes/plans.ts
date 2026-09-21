@@ -4,7 +4,7 @@ import { z } from "zod";
 import { db, organizations, plans } from "@uptimepulse/db";
 import { createLogger } from "@uptimepulse/shared";
 import { countOrganizationMonitors, listPlans } from "../lib/plans.js";
-import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
+import { requireAuth, requireOrganization, requireRole, requireUserSession } from "../plugins/auth.js";
 
 const logger = createLogger("api");
 
@@ -32,6 +32,7 @@ export async function planRoutes(app: FastifyInstance): Promise<void> {
 
   app.register(async (scoped) => {
     scoped.addHook("preHandler", requireAuth);
+    scoped.addHook("preHandler", requireUserSession);
     scoped.addHook("preHandler", requireOrganization);
 
     // Organización activa con su plan y su uso actual — lo que necesita la

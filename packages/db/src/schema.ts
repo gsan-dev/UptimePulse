@@ -266,8 +266,20 @@ export const apiKeys = pgTable("api_keys", {
   organizationId: uuid("organization_id")
     .notNull()
     .references(() => organizations.id, { onDelete: "cascade" }),
-  keyHash: text("key_hash").notNull(),
-  scopes: jsonb("scopes").notNull().$type<string[]>().default([]),
+  // Nombre que le da el usuario ("CI de producción") y prefijo visible de la
+  // clave (Fase 5.1): la clave completa solo se muestra una vez al crearla,
+  // en la base de datos queda su sha256.
+  name: text("name").notNull(),
+  keyPrefix: text("key_prefix").notNull(),
+  keyHash: text("key_hash").notNull().unique(),
+  scopes: jsonb("scopes").notNull().$type<ApiKeyScope[]>().default([]),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
   lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// "read" = ver monitores/checks/incidentes (equivale al rol readonly);
+// "write" = además crear/editar/borrar (equivale al rol editor). Una API key
+// nunca puede administrar la organización (miembros, plan, otras claves).
+export const API_KEY_SCOPES = ["read", "write"] as const;
+export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];

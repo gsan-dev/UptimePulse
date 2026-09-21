@@ -8,7 +8,7 @@ import { useOrganization } from "../context/OrganizationContext";
  * organización, se muestra su nombre sin desplegable.
  */
 export function OrganizationSwitcher() {
-  const { organizations, active, role, setActive } = useOrganization();
+  const { organizations, active, role, setActive, isAdmin } = useOrganization();
   if (!active) return null;
 
   return (
@@ -42,6 +42,11 @@ export function OrganizationSwitcher() {
       <Link to="/team" className="text-gray-400 hover:text-emerald-400">
         Equipo
       </Link>
+      {isAdmin && (
+        <Link to="/api-keys" className="text-gray-400 hover:text-emerald-400" title="API keys para integraciones">
+          API keys
+        </Link>
+      )}
       <Link
         to="/pricing"
         className="text-gray-400 hover:text-emerald-400"
