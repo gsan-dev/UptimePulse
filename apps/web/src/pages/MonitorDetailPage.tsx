@@ -4,15 +4,22 @@ import { ApiError } from "../api/client";
 import {
   deleteMonitor,
   getMonitor,
+  getMonitorMetrics,
+  getMonitorTimeseries,
   listMonitorChecks,
+  listMonitorIncidents,
   pauseMonitor,
   resumeMonitor,
   updateMonitor,
 } from "../api/monitors";
-import type { ApiCheck, ApiMonitor } from "../api/types";
+import type { ApiCheck, ApiIncident, ApiMonitor, ApiMonitorMetrics, ApiTimeseriesPoint, UptimeRange } from "../api/types";
+import { MonitorChannelsSection } from "../components/MonitorChannelsSection";
+import { RangeSelector } from "../components/RangeSelector";
+import { ResponseTimeChart } from "../components/ResponseTimeChart";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
+import { useRealtime } from "../context/RealtimeContext";
+import { useToast } from "../context/ToastContext";
 
-const POLL_INTERVAL_MS = 10000;
 const CHECKS_LIMIT = 20;
 
 function Stat({ label, value }: { label: string; value: string }) {
@@ -27,12 +34,18 @@ function Stat({ label, value }: { label: string; value: string }) {
 export function MonitorDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { subscribe } = useRealtime();
+  const { showToast } = useToast();
   const [monitor, setMonitor] = useState<ApiMonitor | null>(null);
   const [checks, setChecks] = useState<ApiCheck[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editName, setEditName] = useState("");
   const [editInterval, setEditInterval] = useState(300);
+  const [range, setRange] = useState<UptimeRange>("24h");
+  const [metrics, setMetrics] = useState<ApiMonitorMetrics | null>(null);
+  const [timeseries, setTimeseries] = useState<ApiTimeseriesPoint[]>([]);
+  const [rangeIncidents, setRangeIncidents] = useState<ApiIncident[]>([]);
 
   const refresh = useCallback(async () => {
     if (!id) return;
@@ -46,11 +59,47 @@ export function MonitorDetailPage() {
     }
   }, [id]);
 
+  // Fase 2.4: métricas/gráfico/incidentes dependen del rango elegido, así
+  // que se piden aparte de refresh() (que solo trae el monitor + últimos
+  // checks en crudo, independiente del selector de rango).
+  const refreshRangeData = useCallback(async () => {
+    if (!id) return;
+    try {
+      const [metricsData, timeseriesData, incidentsData] = await Promise.all([
+        getMonitorMetrics(id, range),
+        getMonitorTimeseries(id, range),
+        listMonitorIncidents(id, range),
+      ]);
+      setMetrics(metricsData);
+      setTimeseries(timeseriesData);
+      setRangeIncidents(incidentsData);
+    } catch {
+      // Un fallo aquí no debe tapar la vista principal del monitor — los
+      // Stat de arriba simplemente se quedan en su último valor conocido.
+    }
+  }, [id, range]);
+
+  // Carga inicial única — el WebSocket (Fase 2.3) dispara el refresco cuando
+  // de verdad cambia algo, en vez de sondear cada 10s sin motivo.
   useEffect(() => {
     void refresh();
-    const interval = setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
   }, [refresh]);
+
+  useEffect(() => {
+    void refreshRangeData();
+  }, [refreshRangeData]);
+
+  useEffect(() => {
+    return subscribe((event) => {
+      if (event.monitorId !== id) return;
+      void refresh();
+      void refreshRangeData();
+      showToast(
+        `${event.name} ahora está ${event.status === "up" ? "operativo ✅" : "caído 🔴"}`,
+        event.status
+      );
+    });
+  }, [subscribe, refresh, refreshRangeData, showToast, id]);
 
   useEffect(() => {
     if (monitor && !isEditing) {
@@ -124,6 +173,19 @@ export function MonitorDetailPage() {
         />
       </div>
 
+      {monitor.type === "http" && monitor.target.startsWith("https://") && (
+        <div className="mb-6">
+          <Stat
+            label="Certificado SSL"
+            value={
+              monitor.sslExpiresAt
+                ? `Caduca en ${Math.max(0, Math.floor((new Date(monitor.sslExpiresAt).getTime() - Date.now()) / 86_400_000))} días`
+                : "Todavía sin comprobar"
+            }
+          />
+        </div>
+      )}
+
       <div className="mb-6 flex flex-wrap items-center gap-3">
         <button
           onClick={() => void handleTogglePause()}
@@ -173,6 +235,30 @@ export function MonitorDetailPage() {
         >
           Borrar
         </button>
+      </div>
+
+      <MonitorChannelsSection monitorId={monitor.id} />
+
+      <div className="mb-3 flex items-center justify-between">
+        <h2 className="text-lg font-medium text-white">Histórico</h2>
+        <RangeSelector value={range} onChange={setRange} />
+      </div>
+
+      <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Uptime" value={metrics?.uptimePercentage != null ? `${metrics.uptimePercentage}%` : "—"} />
+        <Stat
+          label="Tiempo de respuesta medio"
+          value={metrics?.avgResponseTimeMs != null ? `${metrics.avgResponseTimeMs}ms` : "—"}
+        />
+        <Stat label="Incidentes" value={metrics ? String(metrics.incidentCount) : "—"} />
+        <Stat
+          label="MTTR"
+          value={metrics?.mttrSeconds != null ? `${Math.round(metrics.mttrSeconds / 60)} min` : "—"}
+        />
+      </div>
+
+      <div className="mb-6 rounded-lg border border-white/10 bg-white/5 p-4">
+        <ResponseTimeChart points={timeseries} incidents={rangeIncidents} />
       </div>
 
       <h2 className="mb-3 text-lg font-medium text-white">Últimos checks</h2>

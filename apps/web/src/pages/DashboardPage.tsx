@@ -1,33 +1,52 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { listMonitors } from "../api/monitors";
-import type { ApiMonitor } from "../api/types";
+import { getDashboardSummary, listMonitors } from "../api/monitors";
+import type { ApiDashboardSummary, ApiMonitor } from "../api/types";
+import { Sparkline } from "../components/Sparkline";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
+import { SummaryHeader } from "../components/SummaryHeader";
 import { useAuth } from "../context/AuthContext";
-
-// Polling simple (no WebSocket todavía, eso es Fase 2.3). 10s coincide con
-// el ciclo de sondeo por defecto del worker (WORKER_POLL_INTERVAL_MS).
-const POLL_INTERVAL_MS = 10000;
+import { useRealtime } from "../context/RealtimeContext";
+import { useToast } from "../context/ToastContext";
 
 export function DashboardPage() {
   const { user, logout } = useAuth();
+  const { subscribe } = useRealtime();
+  const { showToast } = useToast();
   const [monitors, setMonitors] = useState<ApiMonitor[] | null>(null);
+  const [summary, setSummary] = useState<ApiDashboardSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      setMonitors(await listMonitors());
+      const [monitorsData, summaryData] = await Promise.all([listMonitors(), getDashboardSummary()]);
+      setMonitors(monitorsData);
+      setSummary(summaryData);
       setError(null);
     } catch {
       setError("No se pudieron cargar los monitores");
     }
   }, []);
 
+  // Carga inicial única — a partir de aquí, el WebSocket (Fase 2.3) avisa
+  // cuándo volver a pedir datos. Ya no hay sondeo a intervalo fijo.
   useEffect(() => {
     void refresh();
-    const interval = setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
   }, [refresh]);
+
+  useEffect(() => {
+    return subscribe((event) => {
+      void refresh();
+      showToast(
+        `${event.name} ahora está ${event.status === "up" ? "operativo ✅" : "caído 🔴"}`,
+        event.status
+      );
+    });
+  }, [subscribe, refresh, showToast]);
+
+  const upCount = monitors?.filter((m) => monitorDisplayStatus(m) === "up").length ?? 0;
+  const downCount = monitors?.filter((m) => monitorDisplayStatus(m) === "down").length ?? 0;
+  const pausedCount = monitors?.filter((m) => monitorDisplayStatus(m) === "paused").length ?? 0;
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
@@ -37,6 +56,18 @@ export function DashboardPage() {
           <p className="text-sm text-gray-400">{user?.email}</p>
         </div>
         <div className="flex gap-3">
+          <Link
+            to="/status-pages"
+            className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
+          >
+            Status pages
+          </Link>
+          <Link
+            to="/channels"
+            className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
+          >
+            Canales
+          </Link>
           <Link
             to="/monitors/new"
             className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500"
@@ -54,6 +85,16 @@ export function DashboardPage() {
 
       {error && <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
 
+      {monitors !== null && monitors.length > 0 && (
+        <SummaryHeader
+          upCount={upCount}
+          downCount={downCount}
+          pausedCount={pausedCount}
+          avgUptimePercentage={summary?.avgUptimePercentage ?? null}
+          activeIncidents={summary?.activeIncidents ?? 0}
+        />
+      )}
+
       {monitors === null && <p className="text-gray-400">Cargando…</p>}
 
       {monitors !== null && monitors.length === 0 && (
@@ -67,25 +108,29 @@ export function DashboardPage() {
       )}
 
       <ul className="space-y-2">
-        {monitors?.map((monitor) => (
-          <li key={monitor.id}>
-            <Link
-              to={`/monitors/${monitor.id}`}
-              className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 px-4 py-3 hover:bg-white/10"
-            >
-              <div>
-                <p className="font-medium text-white">{monitor.name}</p>
-                <p className="text-sm text-gray-400">{monitor.target}</p>
-              </div>
-              <div className="flex items-center gap-6">
-                <span className="text-sm text-gray-400">
-                  {monitor.lastCheck?.responseTimeMs != null ? `${monitor.lastCheck.responseTimeMs} ms` : "—"}
-                </span>
-                <StatusBadge status={monitorDisplayStatus(monitor)} />
-              </div>
-            </Link>
-          </li>
-        ))}
+        {monitors?.map((monitor) => {
+          const sparklinePoints = summary?.sparklines[monitor.id] ?? [];
+          return (
+            <li key={monitor.id}>
+              <Link
+                to={`/monitors/${monitor.id}`}
+                className="flex items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/5 px-4 py-3 hover:bg-white/10"
+              >
+                <div className="min-w-0">
+                  <p className="truncate font-medium text-white">{monitor.name}</p>
+                  <p className="truncate text-sm text-gray-400">{monitor.target}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-6">
+                  <Sparkline points={sparklinePoints} hasDowntime={sparklinePoints.some((p) => p.downChecks > 0)} />
+                  <span className="text-sm text-gray-400">
+                    {monitor.lastCheck?.responseTimeMs != null ? `${monitor.lastCheck.responseTimeMs} ms` : "—"}
+                  </span>
+                  <StatusBadge status={monitorDisplayStatus(monitor)} />
+                </div>
+              </Link>
+            </li>
+          );
+        })}
       </ul>
     </div>
   );

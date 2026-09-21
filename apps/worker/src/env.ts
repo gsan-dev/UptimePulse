@@ -21,6 +21,10 @@ export const env = {
   // Cuántos checks puede ejecutar en paralelo ESTE proceso worker (no el
   // total del sistema — cada instancia que arranques suma su propia cuota).
   concurrency: Number(process.env.WORKER_CONCURRENCY ?? 5),
+  // Nº de checks "down" consecutivos antes de abrir un incidente real
+  // (Fase 2.2). Con 1 se abriría un incidente por cada bache puntual — 2 es
+  // el mínimo que de verdad distingue "caída real" de "ruido".
+  incidentFailureThreshold: Number(process.env.INCIDENT_FAILURE_THRESHOLD ?? 2),
   allowPrivateMonitorTargets: process.env.ALLOW_PRIVATE_MONITOR_TARGETS === "true",
   smtpHost: process.env.SMTP_HOST ?? "localhost",
   smtpPort: Number(process.env.SMTP_PORT ?? 1025),

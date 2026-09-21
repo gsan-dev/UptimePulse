@@ -11,7 +11,10 @@
     "@bull-board/fastify": "^9.10.0",
     "@fastify/cookie": "^11.0.0",
     "@fastify/cors": "^10.0.0",
+    "@fastify/rate-limit": "^10.2.0",
+    "@socket.io/redis-adapter": "^8.3.0",
     "@uptimepulse/db": "*",
+    "@uptimepulse/notify-channels": "*",
     "@uptimepulse/queue": "*",
     "@uptimepulse/server-utils": "*",
     "@uptimepulse/shared": "*",
@@ -20,6 +23,7 @@
     "drizzle-orm": "^0.45.0",
     "fastify": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
+    "socket.io": "^4.8.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {

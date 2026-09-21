@@ -29,6 +29,34 @@
       "when": 1789935988587,
       "tag": "0003_seed_default_plan",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789945958436,
+      "tag": "0004_incidents_open_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789945964015,
+      "tag": "0005_checks_hourly_continuous_aggregate",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789946525988,
+      "tag": "0006_checks_hourly_realtime_aggregation",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1789948675318,
+      "tag": "0007_ssl_and_notification_channel_name",
+      "breakpoints": true
     }
   ]
 }

@@ -1306,3 +1306,426 @@ npm run dev:worker   # terminal B
 
 ### Próximo paso (Fase 2.2)
 Motor de incidentes real: agrupar N checks fallidos consecutivos (no solo 1, como ahora) en un "incidente" con inicio/fin, respetando ventanas de mantenimiento, y calculando métricas de uptime — sustituyendo la detección de transición simple de la Fase 1.5 por algo más robusto.
+
+---
+
+## 2026-09-21 — Fase 2.2: Motor de incidentes real
+
+### Objetivo
+Sustituir la detección de transición cruda de la Fase 1.5 ("cambió el status de un check respecto al anterior → notifica") por un motor de incidentes de verdad: agrupar N checks fallidos **consecutivos** en un `incident` con inicio y fin, respetar `maintenance_windows` (una caída durante una ventana programada no cuenta), y calcular métricas de uptime %, tiempo de respuesta medio y MTTR sobre rangos de tiempo (24h/7d/30d/90d).
+
+### Decisiones
+1. **El umbral de checks fallidos consecutivos es configurable** (`INCIDENT_FAILURE_THRESHOLD`, por defecto 2), no hardcodeado. Con 1 se abriría un incidente por cualquier bache puntual — 2 es el mínimo que empieza a distinguir señal de ruido, y coincide con lo que hacen productos reales del mismo tipo (UptimeRobot, Better Uptime, etc.).
+2. **Las notificaciones por email pasan a dispararse por incidente, no por check** — ver el ADR completo en TASK.md ("Notificaciones por email: ligadas al incidente, no al check crudo"). Es un cambio de comportamiento respecto a lo verificado en la Fase 1.5, deliberado: además de reducir ruido, es la única forma de que las ventanas de mantenimiento silencien también la *alerta*, no solo el *incidente*.
+3. **El `started_at` del incidente es el timestamp del primer check fallido de la racha, no el que cruza el umbral.** Al abrir el incidente se consultan los últimos `threshold` checks y se usa el más antiguo de ellos — así la duración (`resolved_at - started_at`) refleja la caída real, no solo la parte de ella que ocurrió después de "darse cuenta".
+4. **Las métricas se calculan sobre un *continuous aggregate* de TimescaleDB (`checks_hourly`), no sobre `checks` en crudo.** Ver el ADR completo en TASK.md. Motivo resumido: escalabilidad (un rango de 90 días son ~2160 filas agregadas, no potencialmente millones de checks) y permanencia (no está sujeto a la política de retención de 90 días de `checks`).
+5. **Se añadió un CRUD mínimo de ventanas de mantenimiento** (`GET/POST /monitors/:id/maintenance-windows`, `DELETE .../:windowId`) aunque no estaba en el checklist original de la fase — sin él era imposible verificar de verdad que el motor las respeta. Sin `PATCH`: para este alcance basta con borrar y recrear.
+6. **Índice parcial en `incidents`** (`WHERE resolved_at IS NULL`) para la consulta "¿hay ya un incidente abierto para este monitor?", que se repite en cada check fallido de cada monitor.
+
+### Qué se hizo
+- **`packages/db/migrations/0004_incidents_open_index.sql`**: índice parcial `incidents_open_by_monitor_idx` sobre `(monitor_id) WHERE resolved_at IS NULL`.
+- **`packages/db/migrations/0005_checks_hourly_continuous_aggregate.sql`**: vista materializada continua `checks_hourly` (bucket de 1 hora: `total_checks`, `up_checks`, `down_checks`, `avg_response_time_ms` por monitor) + política de refresco automático cada 30 min + índice `(monitor_id, bucket DESC)`.
+- **`packages/db/migrations/0006_checks_hourly_realtime_aggregation.sql`** (migración de corrección, ver "Verificación" más abajo): activa `timescaledb.materialized_only = false` sobre `checks_hourly`.
+- **`apps/worker/src/lib/incidents.ts`** (nuevo): `updateIncidentState(monitorId, status, errorMessage, checkTimestamp, failureThreshold)` — la lógica completa del motor: comprueba incidente abierto, comprueba ventana de mantenimiento, cuenta la racha de fallos consecutivos, abre/cierra el incidente. Devuelve `{ opened, closed }` para que quien llama decida si notificar.
+- **`apps/worker/src/lib/process-check.ts`** (modificado): tras guardar el check (ahora con `.returning()` para tener su `timestamp` exacto), llama a `updateIncidentState()` y solo notifica si `opened || closed` — ya no compara el check actual con el anterior directamente.
+- **`apps/worker/src/env.ts`**: nueva variable `incidentFailureThreshold` (de `INCIDENT_FAILURE_THRESHOLD`, por defecto 2).
+- **`.env` / `.env.example`**: añadida `INCIDENT_FAILURE_THRESHOLD=2`.
+- **`apps/api/src/lib/metrics.ts`** (nuevo): `getMonitorMetrics(monitorId, range)` — dos consultas SQL crudas (vía `db.execute(sql\`...\`)`) contra `checks_hourly` (uptime %, tiempo de respuesta medio ponderado) e `incidents` (nº de incidentes, incidentes abiertos, MTTR sobre los resueltos en el rango).
+- **`apps/api/src/routes/monitors.ts`** (modificado): nuevas rutas `GET /monitors/:id/metrics?range=24h|7d|30d|90d`, `GET /monitors/:id/incidents`, `GET/POST /monitors/:id/maintenance-windows`, `DELETE /monitors/:id/maintenance-windows/:windowId`.
+
+### Comandos ejecutados
+```bash
+# Migraciones "custom" (mismo patrón que 0002/0003 de la Fase 0.3)
+cd packages/db
+npx drizzle-kit generate --custom --name incidents_open_index
+npx drizzle-kit generate --custom --name checks_hourly_continuous_aggregate
+# ... (se editó el contenido de los .sql generados vacíos) ...
+npm run db:migrate
+
+# Tras detectar el problema de materialized_only (ver "Verificación"):
+npx drizzle-kit generate --custom --name checks_hourly_realtime_aggregation
+# ... (se editó el ALTER MATERIALIZED VIEW) ...
+npm run db:migrate
+
+# Reinicio limpio de api/worker para cargar el código nuevo (se encontró y
+# mató un proceso duplicado de la API de una sesión anterior que no llegó a
+# hacer bind del puerto — ver nota de "pendiente" de la Fase 2.1 sobre
+# EADDRINUSE, quedaba un tsx watch zombi sin servir nada)
+npm run dev:api &
+npm run dev:worker &
+
+npx tsc --noEmit --project apps/worker   # limpio
+npx tsc --noEmit --project apps/api      # limpio
+npx eslint apps/api/src apps/worker/src packages/db/src   # limpio
+```
+
+### Verificación completa
+Toda la prueba se hizo **a través de la API** (nunca `INSERT`/`DELETE` SQL directo sobre `monitors`), aplicando la lección de la Fase 2.1 sobre schedulers huérfanos. Se registró un usuario de prueba nuevo (`test-fase22@example.com`) en vez de tocar la cuenta real, y se bajó temporalmente `min_interval_seconds` del plan "free" a 30 (el mínimo que permite el propio *schema* Zod) solo para poder ver varios ciclos de check en minutos en vez de en horas — revertido a 300 al terminar.
+
+**1. Umbral de incidente y `started_at` correcto:**
+- Monitor `incident-test-1` creado contra un endpoint que siempre devuelve error. Tras el 2º check "down" consecutivo (threshold=2) se creó el incidente con `started_at` = timestamp del **primer** check fallido, no del segundo — confirmado comparando el `started_at` del incidente contra el `timestamp` del check más antiguo de los dos.
+- Email de caída recibido en Mailpit **exactamente una vez**, en el momento en que se abrió el incidente (no en el primer check "down" suelto, que por sí solo no cruza el umbral).
+
+**2. Ventanas de mantenimiento silencian el incidente (y la alerta):**
+- Segundo monitor `incident-test-2-maintenance` creado con una ventana de mantenimiento activa desde el momento de su creación. Acumuló **3 checks "down" consecutivos** sin que se creara ningún incidente (`GET /monitors/:id/incidents` → `[]`) y sin ningún email de alerta.
+
+**3. Cierre de incidente y MTTR exacto:**
+- Se corrigió el target de `incident-test-1` a un endpoint que responde 200. Al siguiente check ("up"), el incidente se cerró con `resolved_at`.
+- `resolved_at - started_at` = **268 segundos** exactos, e independientemente, `GET /monitors/:id/metrics?range=24h` devolvió `"mttrSeconds": 268` — **coinciden exactamente**, confirmando que el cálculo de MTTR sobre `incidents` es correcto.
+- Email de recuperación recibido en Mailpit una única vez, pese a que hubo 10 checks "down" entre la apertura y el cierre del incidente (0 emails de más).
+- `GET /monitors/:id/metrics?range=24h` final: `{"totalChecks":11,"upChecks":1,"downChecks":10,"uptimePercentage":9.09,"mttrSeconds":268,"incidentCount":1,"openIncidentCount":0}` — el uptime % refleja correctamente el incidente real.
+
+**4. Bug real encontrado y corregido en vivo — `materialized_only` de TimescaleDB:**
+Al probar las métricas por primera vez, `GET /monitors/:id/metrics` devolvía `totalChecks: 0` con checks reales en la tabla. Investigado con SQL directo:
+```sql
+SELECT materialized_only FROM timescaledb_information.continuous_aggregates WHERE view_name='checks_hourly';
+-- devolvía: t  (true) — la suposición de la migración 0005 (real-time aggregation
+-- activada por defecto) era incorrecta en esta versión de TimescaleDB.
+```
+Corregido con una migración de seguimiento (`0006`, `ALTER MATERIALIZED VIEW checks_hourly SET (timescaledb.materialized_only = false)`) en vez de reescribir la 0005 ya aplicada (`__drizzle_migrations` guarda un hash de contenido; editar una migración ya corrida haría que Drizzle intentara reaplicarla y fallara contra objetos que ya existen). Tras aplicar la 0006, `materialized_only` pasó a `f` y las métricas empezaron a devolver los totales correctos de inmediato (sin esperar al primer refresco automático).
+
+**5. Cero interferencia con monitores reales / cero schedulers huérfanos tras la limpieza:**
+- Antes de esta fase, mientras el worker ya corría con el código nuevo, el monitor real `TEST-blackjack` del usuario cruzó de verdad el umbral de 2 fallos y el motor le abrió un incidente real (`502`, sin cerrar todavía) — confirmado que es un caso real, no de prueba, y se dejó intacto (ver aviso al usuario).
+- Limpieza tras las pruebas: `DELETE /monitors/:id` vía API para ambos monitores de prueba (código 204, desprograma su *job scheduler*), luego borrado del usuario/organización de prueba por SQL (no tienen *scheduler* asociado, solo los monitores lo tienen) y restauración de `min_interval_seconds` a 300.
+- Verificación final: `monitors` = 2 filas (las reales del usuario), `incidents` = 1 fila (la real de `TEST-blackjack`, no tocada), `maintenance_windows` = 0 filas, `/admin/queues` → cola `monitor-checks` con `delayed: 2` (exactamente los 2 monitores reales, cero huérfanos).
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. Con la API y el worker corriendo, crea un monitor contra un endpoint
+#    que siempre falle (ejemplo real: https://httpbin.org/status/500):
+curl -X POST http://localhost:3000/monitors -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"http","name":"prueba-incidente","target":"https://httpbin.org/status/500","intervalSeconds":30}'
+# (si tu plan exige un intervalo mínimo mayor a 30s, ajústalo temporalmente
+#  con: UPDATE plans SET min_interval_seconds = 30 WHERE name = 'free';
+#  y no olvides devolverlo a 300 al terminar)
+
+# 2. Espera a que pasen 2 ciclos de check (unos 30-60s) y comprueba que se
+#    abrió un incidente:
+curl http://localhost:3000/monitors/$MONITOR_ID/incidents -H "Authorization: Bearer $TOKEN"
+# Debe aparecer un incidente con resolved_at: null
+
+# 3. Comprueba que llegó el email de caída (una sola vez):
+curl http://localhost:8025/api/v1/messages
+
+# 4. Crea una ventana de mantenimiento para OTRO monitor que falle y
+#    comprueba que, pese a fallar, no abre incidente:
+curl -X POST http://localhost:3000/monitors/$OTRO_MONITOR_ID/maintenance-windows \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d "{\"startsAt\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"endsAt\":\"$(date -u -d '+30 min' +%Y-%m-%dT%H:%M:%S.000Z)\",\"note\":\"prueba\"}"
+
+# 5. Corrige el target del primer monitor a uno que responda 200
+#    (ej. https://httpbin.org/status/200), espera un ciclo más, y comprueba
+#    que el incidente se cerró con resolved_at y que llegó el email de
+#    recuperación:
+curl -X PATCH http://localhost:3000/monitors/$MONITOR_ID -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -d '{"target":"https://httpbin.org/status/200"}'
+
+# 6. Comprueba las métricas agregadas:
+curl "http://localhost:3000/monitors/$MONITOR_ID/metrics?range=24h" -H "Authorization: Bearer $TOKEN"
+# uptimePercentage, avgResponseTimeMs, incidentCount, mttrSeconds
+
+# 7. Limpieza: borra los monitores de prueba vía API (no por SQL directo)
+curl -X DELETE http://localhost:3000/monitors/$MONITOR_ID -H "Authorization: Bearer $TOKEN"
+```
+
+### Pendiente / notas
+- **httpstat.us dejó de responder de forma fiable durante esta sesión** (devolvía 404 para cualquier ruta, incluida su propia página de inicio) — se cambió a `httpbin.org/status/{código}` como target de prueba, que sí respondió consistentemente. No afecta al código del proyecto, solo a cómo se prueba manualmente.
+- El aviso al usuario sobre `TEST-blackjack` (su monitor real) está caído desde `2026-09-20T23:14:18Z` con un incidente abierto de verdad — no es parte de esta verificación, es información real que el motor de incidentes nuevo detectó.
+- La Fase 2.2 no incluye UI en el frontend para ver incidentes/métricas/ventanas de mantenimiento — eso llega con la Fase 2.4 (dashboard mejorado). Por ahora todo se verifica por API/SQL directo, igual que se avisó en la Fase 1.4 sobre las limitaciones de verificación visual en esta sesión.
+- El cálculo de `avgResponseTimeMs` en `getMonitorMetrics` es una media ponderada por nº de checks de cada bucket horario (`sum(avg*count)/sum(count)`), no una media simple de las medias — para no sesgar el resultado si un bucket tuvo muchos más checks que otro.
+- Simplificación conocida: si una ventana de mantenimiento empieza *a mitad* de una racha de fallos ya en curso, los checks fallidos anteriores a la ventana siguen contando para el umbral una vez que la ventana termina (no se "reinicia" la racha al entrar en mantenimiento). Caso límite, aceptable para el alcance de este proyecto.
+
+### Próximo paso (Fase 2.3)
+Tiempo real con WebSockets: servidor Socket.io en la API (autenticado con el mismo JWT), evento `monitor:status_changed` emitido a los clientes de la organización correspondiente, y sustitución del polling de 10s del frontend por la suscripción — con toast/notificación visual cuando cambia el estado de un monitor mientras el dashboard está abierto.
+
+---
+
+## 2026-09-21 — Fase 2.3: Tiempo real con WebSockets
+
+### Objetivo
+Sustituir el polling de 10s del frontend (Fase 1.4) por una suscripción WebSocket de verdad: cuando un check cambia el estado visible de un monitor, la API empuja un evento `monitor:status_changed` a los navegadores de esa organización, y el dashboard/detalle se actualizan sin recargar ni sondear.
+
+### Decisiones
+Ver el ADR completo en TASK.md ("Tiempo real: Socket.io + Redis, no un segundo servidor WS"). Resumen de las dos decisiones clave:
+1. **Socket.io en la API + `@socket.io/redis-adapter`, y `@socket.io/redis-emitter` en el worker** (mismo canal Redis, sin abrir sockets él mismo) — porque quien detecta el cambio (worker) no es quien tiene las conexiones WebSocket (API), y ya se paga el coste de tener Redis por BullMQ.
+2. **El evento se dispara por transición cruda `up<->down` de un check, no por el umbral de incidentes de la Fase 2.2.** El dashboard debe reflejar lo que está pasando ahora mismo; el motor de incidentes decide, aparte, si eso es una alerta de verdad. Por eso `process-check.ts` vuelve a comparar contra el check anterior (como hacía antes de la Fase 2.2), pero ahora con dos propósitos distintos y explícitos: uno alimenta al motor de incidentes/notificaciones, el otro alimenta el WebSocket.
+3. **Autenticación del socket con el JWT de acceso existente**, mandado en `socket.handshake.auth.token` (no un header — el handshake WebSocket del navegador no permite headers custom). Cada conexión se une a una sala `org:<organizationId>`, calculada igual que en el resto de la API (`getPrimaryOrganizationId`).
+4. **El frontend no parchea el estado a mano con el payload del evento** — al recibir `monitor:status_changed`, simplemente vuelve a pedir los datos completos (`refresh()`, ya existente) y muestra un toast con la info del evento. Es menos "óptimo" que actualizar solo el campo que cambió, pero evita que el estado del frontend diverja de la forma real que devuelve la API (`ApiMonitor`, `Serialized<T>`, etc.) por un payload de WebSocket deliberadamente resumido.
+
+### Qué se hizo
+- **`apps/api/src/realtime.ts`** (nuevo): `attachRealtime(httpServer)` — crea el `Server` de Socket.io colgado del `http.Server` interno de Fastify (`app.server`, disponible desde que se instancia, no hace falta esperar a `listen()`), le pone el adaptador de Redis (dos conexiones ioredis, `pubClient`/`subClient`, la segunda por `.duplicate()`), autentica con el JWT y une cada socket a `org:<organizationId>`.
+- **`apps/api/src/server.ts`**: llama a `attachRealtime(app.server)` al final de `buildServer()`.
+- **`apps/worker/src/lib/realtime-emitter.ts`** (nuevo): `emitMonitorStatusChanged(organizationId, payload)`, envuelve un `Emitter` de `@socket.io/redis-emitter` sobre una conexión Redis dedicada (no la del `Worker` de BullMQ, para no interferir con sus comandos bloqueantes).
+- **`apps/worker/src/lib/process-check.ts`**: vuelve a leer el status del check anterior (`getPreviousCheckStatus`, antes de insertar el nuevo) — pero ahora solo para decidir si emitir el evento en vivo, con un comentario explícito de por qué esto es independiente del motor de incidentes.
+- **Frontend** (`apps/web`):
+  - `src/api/client.ts`: `getAccessToken()` (antes solo existía el setter) — el socket necesita leer el token vigente en cada intento de conexión.
+  - `src/api/realtime.ts` (nuevo): singleton perezoso del cliente `socket.io-client`, con `auth` como función (no objeto) para mandar siempre el token más reciente, no uno capturado al crear el socket.
+  - `src/context/RealtimeContext.tsx` (nuevo): conecta el socket solo mientras hay sesión (`useAuth().user`), reparte `monitor:status_changed` a quien se suscriba.
+  - `src/context/ToastContext.tsx` (nuevo): toasts simples (sin librería externa), auto-descartables a los 6s.
+  - `App.tsx`: envuelve las rutas en `<ToastProvider><RealtimeProvider>`.
+  - `DashboardPage.tsx` / `MonitorDetailPage.tsx`: fuera el `setInterval` de 10s; ahora se suscriben con `useRealtime().subscribe()` y en cada evento relevante llaman a `refresh()` + `showToast()`.
+
+### Comandos ejecutados
+```bash
+# Dependencias nuevas
+npm pkg set dependencies.socket.io="^4.8.0" dependencies["@socket.io/redis-adapter"]="^8.3.0" -w apps/api
+npm pkg set dependencies["@socket.io/redis-emitter"]="^5.1.0" -w apps/worker
+npm pkg set dependencies.recharts="^2.13.0" dependencies["socket.io-client"]="^4.8.0" -w apps/web  # (se instaló ya pensando en la 2.4)
+npm install
+
+npx tsc --noEmit --project apps/api     # limpio (tras corregir el tipo de Socket.data con generics, ver más abajo)
+npx tsc --noEmit --project apps/worker  # limpio
+npx tsc --noEmit --project apps/web     # limpio
+npx eslint apps/api/src apps/worker/src apps/web/src   # limpio
+```
+
+### Verificación completa
+Sin herramienta de navegador real disponible en esta sesión, pero esta vez sí existe una forma de comprobar el WebSocket de extremo a extremo sin necesidad de uno: un cliente `socket.io-client` real, corriendo en Node, autenticado con un JWT real — no un mock ni una simulación de HTTP.
+
+1. **Conexión y autenticación real:** script `verify-ws.mjs` (temporal, borrado al terminar) que se conecta a `http://localhost:3000` con `auth: { token }` usando el `accessToken` de un usuario de prueba recién registrado. Log: `{"event":"connected","socketId":"..."}` — confirma que `io.use()` verificó el JWT y resolvió su organización antes de aceptar la conexión.
+2. **Evento en tiempo real, caída:** se creó un monitor de prueba (`ws-test-1`) y se forzó una transición up→down (`PATCH target` a un endpoint que devuelve 500, junto con un cambio de intervalo para disparar un check inmediato). El listener recibió `monitor:status_changed` con `status: "down", previousStatus: "up"` en cuestión de segundos — sin ningún sondeo de por medio, solo la reacción al evento real.
+3. **Evento en tiempo real, recuperación:** se corrigió el target a un 200 y se repitió el patrón — el listener recibió `status: "up", previousStatus: "down"`.
+4. **Aislamiento por organización:** se registró un segundo usuario de prueba (organización distinta) con su propio listener conectado *a la vez* que el primero. Al forzar otra transición en `ws-test-1` (que pertenece a la primera organización), el segundo listener no recibió absolutamente nada — confirma que `socket.join(`org:...`)` + `.to(`org:...`)` aíslan correctamente entre organizaciones, no solo que el evento "funciona" en general.
+5. **Limpieza:** monitor de prueba borrado vía API (204, desprograma su *scheduler*), usuarios/organizaciones de prueba borrados por SQL, script `verify-ws.mjs` eliminado. Estado final verificado: 1 usuario real (`gdev@outlook.es`), 1 organización real, 2 monitores reales (`temp-test`, `TEST-blackjack`), cola `monitor-checks` con `delayed: 2` (cero huérfanos).
+6. **Tipado:** el primer intento de `Socket.data` con `declare module "socket.io"` fallaba (`TS2717: Subsequent property declarations must have the same type`, porque `socket.io` ya declara `SocketData` como tipo genérico, no como una interfaz para fusionar) — corregido pasando el tipo de los datos del socket como parámetro genérico de `Server<...>` en vez de intentar una augmentación de módulo.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. Instala un cliente de socket.io de prueba en cualquier carpeta con
+#    node_modules que lo tenga (por ejemplo, dentro de apps/web):
+cd apps/web
+cat > verify-ws.mjs <<'EOF'
+import { io } from "socket.io-client";
+const socket = io("http://localhost:3000", { auth: { token: process.argv[2] } });
+socket.on("connect", () => console.log("conectado", socket.id));
+socket.on("connect_error", (e) => console.log("error de conexión:", e.message));
+socket.on("monitor:status_changed", (payload) => console.log("EVENTO:", payload));
+EOF
+
+# 2. Consigue un access token real (login) y conéctate:
+node verify-ws.mjs "TU_ACCESS_TOKEN"
+
+# 3. En otra terminal, fuerza una transición en un monitor tuyo (cambia su
+#    target a uno que falle, o al revés) y observa que el evento llega a la
+#    terminal del paso 2 en segundos, sin que nadie lo pida.
+
+# 4. Borra verify-ws.mjs al terminar — no forma parte del repo.
+```
+También, con `apps/web` corriendo (`npm run dev:web`) y sesión iniciada en el navegador, abrir las DevTools → pestaña Network → WS, y comprobar que hay una conexión activa a `ws://localhost:3000/socket.io/...` con frames `monitor:status_changed` llegando cuando cambie un monitor.
+
+### Pendiente / notas
+- Reconfirmado el mismo detalle ya anotado en la Fase 2.1/2.2: `scheduleMonitorCheck()` dispara un check casi inmediatamente DOS veces al crear/reprogramar un monitor (el *job scheduler* de BullMQ más el `enqueueImmediateCheck` explícito) — se vio de nuevo como dos eventos `monitor:status_changed` casi idénticos (200ms de diferencia) en el listener de prueba. No rompe nada (el frontend simplemente refresca dos veces seguidas), pero sigue siendo candidato a un ajuste fino si se retoma la Fase 2.1.
+- No hay reconexión "inteligente" más allá de la que trae `socket.io-client` por defecto (reintentos con backoff) — suficiente para el alcance de este proyecto.
+- El toast no se agrupa ni deduplica: si llegan varios eventos casi seguidos (ver punto anterior), aparecen varios toasts casi iguales. Cosmético, no funcional.
+
+### Próximo paso (Fase 2.4)
+Dashboard mejorado: sparklines de las últimas 24h por monitor (Recharts), cabecera con resumen agregado (operativos vs. caídos, uptime medio global, incidentes activos), y en el detalle de un monitor, selector de rango temporal (24h/7d/30d/90d) con gráfico de tiempo de respuesta y zonas sombreadas en rojo para las caídas — reutilizando `checks_hourly` y `incidents` de la Fase 2.2.
+
+---
+
+## 2026-09-21 — Fase 2.4: Dashboard mejorado
+
+### Objetivo
+Aprovechar toda la infraestructura de las Fases 2.1-2.3 (cola, incidentes, tiempo real) en la interfaz: sparklines de 24h por monitor en el listado, una cabecera con el estado agregado de la organización, y en el detalle de cada monitor un selector de rango temporal con un gráfico de tiempo de respuesta que sombrea en rojo los periodos de caída real.
+
+### Decisiones
+Ver el ADR completo en TASK.md ("Dashboard mejorado: un único endpoint de resumen, no N llamadas por monitor"). Resumen:
+1. **`GET /monitors/summary`**: un solo endpoint nuevo para toda la cabecera + las sparklines del dashboard, en vez de que el frontend calcule cosas él mismo con N llamadas. El desglose operativos/caídos/pausados SÍ se calcula en el frontend (ya tiene `lastCheck` de cada monitor); solo el uptime medio agregado de verdad (cruza monitores) necesita SQL nuevo.
+2. **Un único mecanismo de series temporales** (`getMonitorTimeseries`, por horas, sobre `checks_hourly`) para dos usos distintos: el gráfico de la vista de detalle (rango elegido por el usuario) y las sparklines del dashboard (siempre `range=24h`). Evita mantener dos consultas de agregación parecidas.
+3. **Las zonas sombreadas del gráfico usan un eje X numérico (timestamp en ms), no categórico.** Con un eje de categorías, una `ReferenceArea` de Recharts solo puede alinearse a valores exactos ya presentes en los datos (los buckets horarios) — un incidente real casi nunca empieza o termina justo en el borde de una hora. Con eje numérico, `x1`/`x2` pueden ser cualquier timestamp real (`incident.startedAt`/`resolvedAt`), recortado (`clamp`) al dominio visible por si el incidente empieza antes o sigue abierto después del rango.
+4. **`GET /monitors/:id/incidents` acepta un `range` opcional**: incluye un incidente si empezó dentro del rango, **o si sigue abierto** aunque empezara antes — de lo contrario una caída larga desaparecería del gráfico en cuanto su inicio quedara fuera de la ventana visible.
+
+### Qué se hizo
+- **`apps/api/src/lib/metrics.ts`**: `rangeToInterval()` (extraído para reutilizar), `getMonitorTimeseries(monitorId, range)` (serie por horas) y `getOrganizationSummary(organizationId)` (uptime medio + incidentes activos, agregados a nivel de organización).
+- **`apps/api/src/routes/monitors.ts`**: nuevas rutas `GET /monitors/:id/timeseries?range=`, `GET /monitors/summary`; `GET /monitors/:id/incidents` ahora acepta `?range=` opcional (`or(isNull(resolvedAt), startedAt >= now() - interval)`).
+- **Frontend** (`apps/web`):
+  - `src/api/types.ts`: `ApiMonitorMetrics`, `ApiTimeseriesPoint`, `ApiDashboardSummary`, `ApiIncident`, `ApiMaintenanceWindow`, `UptimeRange`.
+  - `src/api/monitors.ts`: `getMonitorMetrics`, `getMonitorTimeseries`, `listMonitorIncidents`, `getDashboardSummary`.
+  - `src/components/Sparkline.tsx` (nuevo): mini-gráfico de área con Recharts, sin ejes ni tooltip, rojo si hubo algún check "down" en el rango.
+  - `src/components/SummaryHeader.tsx` (nuevo): 4 tarjetas (operativos, caídos, uptime medio 24h, incidentes activos) para la cabecera del dashboard.
+  - `src/components/RangeSelector.tsx` (nuevo): selector 24h/7d/30d/90d, botones simples.
+  - `src/components/ResponseTimeChart.tsx` (nuevo): `LineChart` de Recharts con eje X numérico + `ReferenceArea` roja por incidente.
+  - `DashboardPage.tsx`: pide `getDashboardSummary()` junto a `listMonitors()`, muestra `SummaryHeader` y una `Sparkline` por fila.
+  - `MonitorDetailPage.tsx`: estado de `range`, `refreshRangeData()` (metrics + timeseries + incidents del rango elegido, independiente de `refresh()`), fila de estadísticas (uptime/tiempo de respuesta/incidentes/MTTR) y el gráfico.
+
+### Comandos ejecutados
+```bash
+npx tsc --noEmit --project apps/api     # limpio
+npx tsc --noEmit --project apps/web     # error de tipos en Tooltip formatter de Recharts, corregido
+npx eslint apps/api/src apps/web/src    # limpio
+cd apps/web && npm run build            # build de producción correcto (bundle ~624KB con Recharts, sin código de pg/drizzle-orm)
+```
+
+### Verificación completa
+Igual que en la Fase 2.2, toda la prueba se hizo a través de la API con un usuario de prueba nuevo, nunca tocando los monitores reales del usuario.
+
+1. **Estado inicial vacío:** `GET /monitors/summary` sin monitores → `{"avgUptimePercentage":null,"activeIncidents":0,"sparklines":{}}` — sin errores con cero datos.
+2. **Datos reales tras un check:** monitor de prueba contra un endpoint que responde 200 → `GET /monitors/:id/timeseries?range=24h` reflejó el bucket con los checks reales.
+3. **Bug real encontrado y corregido:** el primer resultado del paso 2 devolvía `"totalChecks":"2"` y `"avgResponseTimeMs":"882.5000000000000000"` — **strings**, no números, pese a que el tipo TypeScript decía `number`. Causa: `count(*)` de Postgres es `bigint` y `avg(...)` es `numeric`; el driver `pg` los serializa como string para no perder precisión si no se castean explícitamente en el SQL. `getMonitorMetrics` (Fase 2.2) ya lo hacía bien; `getMonitorTimeseries` (nueva) no. Corregido con `::int` y `round(avg_response_time_ms)::int` en la consulta — verificado que tras el fix `GET /monitors/:id/timeseries` devuelve `2` y `883` como números de verdad (JSON sin comillas).
+4. **Ciclo completo up→down→up:** el mismo monitor de prueba llevado a fallar (2 checks seguidos, cruzando el umbral del motor de incidentes de la Fase 2.2) y recuperado después. En cada paso:
+   - `GET /monitors/:id/incidents` (sin y con `range=24h`/`range=90d`) devolvió el incidente abierto en los tres casos — confirma que un incidente sin resolver aparece independientemente del rango.
+   - `GET /monitors/summary` mientras estuvo caído: `{"avgUptimePercentage":33.33,"activeIncidents":1,...}` — coincide con 2 checks "up" de 6 totales.
+   - `GET /monitors/:id/metrics?range=24h` tras la recuperación: `{"uptimePercentage":50,"incidentCount":1,"openIncidentCount":0,"mttrSeconds":31}` — consistente con 4 up / 8 total y el incidente ya cerrado.
+5. **Limpieza:** monitor borrado vía API (204), usuario/organización de prueba borrados por SQL. Estado final: 1 usuario real, 1 organización real, 2 monitores reales, cola `monitor-checks` con `delayed: 2` (sin huérfanos).
+6. **Frontend:** sin navegador real disponible en esta sesión (igual que en la Fase 1.4/2.3), verificado con `tsc --noEmit`, `vite build` de producción, e inspección del bundle para confirmar que sigue sin arrastrar `pg`/`drizzle-orm` pese a añadir Recharts (~624KB con gzip ~180KB, aviso de Vite sobre el tamaño del chunk — aceptable para el alcance de este proyecto, no se hizo code-splitting).
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. Con la API corriendo, pide el resumen del dashboard (sustituye el token):
+curl "http://localhost:3000/monitors/summary" -H "Authorization: Bearer $TOKEN"
+
+# 2. Pide la serie temporal de un monitor concreto en distintos rangos:
+curl "http://localhost:3000/monitors/$MONITOR_ID/timeseries?range=24h" -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:3000/monitors/$MONITOR_ID/timeseries?range=7d" -H "Authorization: Bearer $TOKEN"
+
+# 3. Pide los incidentes filtrados por rango (debe incluir cualquiera que
+#    siga abierto, aunque empezara antes del rango):
+curl "http://localhost:3000/monitors/$MONITOR_ID/incidents?range=24h" -H "Authorization: Bearer $TOKEN"
+
+# 4. En el navegador (npm run dev:web), abre el dashboard: deberías ver la
+#    cabecera con el resumen agregado y una sparkline junto a cada monitor.
+#    Entra al detalle de un monitor con histórico real y cambia el selector
+#    24h/7d/30d/90d — el gráfico y las estadísticas deben actualizarse.
+```
+
+### Pendiente / notas
+- El bundle de producción de `apps/web` supera los 500KB (aviso de Vite) tras añadir Recharts — no se ha hecho code-splitting ni carga diferida del gráfico porque no es necesario para el alcance de un proyecto de portfolio, pero sería el primer sitio a mirar si esto se convirtiera en un producto real con métricas de rendimiento de carga.
+- Las sparklines y el gráfico de detalle usan resolución horaria (`checks_hourly`) incluso para el rango de 24h — 24 puntos es suficiente para una sparkline compacta y mantiene un único mecanismo de agregación para todos los rangos, a costa de no mostrar cada check individual en el gráfico de 24h (si se quisiera esa granularidad, habría que añadir una consulta aparte sobre `checks` en crudo solo para ese caso).
+- El toast y el refresco por WebSocket (Fase 2.3) siguen disparando un refetch completo de `metrics`/`timeseries`/`incidents` del rango activo en la vista de detalle, no solo del monitor/checks — coherente con el resto de la página, pero son 3 peticiones extra por cada evento en vez de 1.
+
+### Próximo paso (Fase 3)
+SSL (verificación de expiración de certificados con alertas a 30/15/7 días), webhooks/SMS/Slack/Discord como canales de notificación adicionales al email, y páginas de estado públicas.
+
+---
+
+## 2026-09-21 — Fase 3: SSL, webhooks/Discord/Slack, status pages públicas
+
+### Objetivo
+Cerrar toda la Fase 3 del roadmap: alertas de certificados SSL a punto de caducar, canales de notificación configurables por el usuario (Discord/Slack/webhook genérico con firma HMAC, cada uno con un botón de "probar conexión" antes de confiar en él), y páginas de estado públicas compartibles sin necesidad de cuenta. SMS (Twilio) queda pospuesto por decisión explícita: sin una cuenta real, no se podía verificar con el mismo rigor que el resto (ver pregunta al usuario y ADR en TASK.md).
+
+### Decisiones
+Los ADR completos están en TASK.md; resumen de las cinco decisiones de esta fase:
+1. **SMS pospuesto**, documentado como hueco real, no simulado.
+2. **`packages/notify-channels`** (paquete nuevo): la lógica de envío a Discord/Slack/webhook, compartida entre la API (botón "probar conexión") y el worker (envío real ante una caída) — "probar" prueba literalmente el mismo código que se usa en producción.
+3. **`ChannelMessage` genérico**: se renderiza una sola vez por evento (título/descripción/tono/campos) y cada sender lo traduce a su formato — añadir un canal nuevo en el futuro no exige tocar la lógica de negocio.
+4. **Status pages bajo `/status/:slug`**, no un subdominio — evita gestión de DNS que no aporta nada a la demostración de la funcionalidad.
+5. **La status page pública nunca expone `target`** — solo `name`/`displayName` y el estado derivado.
+
+Otras decisiones más pequeñas, ya anotadas en el código:
+- El `started_at` de una alerta SSL usa el mismo patrón de dedupe que los incidentes (Fase 2.2): un campo `sslLastAlertedThresholdDays` en `monitors`, reseteado a `null` en cuanto cambia la fecha de expiración detectada (el certificado se renovó).
+- El evento `monitor:status_changed` de WebSocket (Fase 2.3) y las notificaciones por canal (Fase 3.2) siguen siendo conceptos separados a propósito: uno reacciona a cada check, el otro al umbral de incidentes/SSL.
+- `getCertificateExpiry` usa una conexión TLS **aparte** de la del check HTTP normal (`fetch` no expone el certificado del peer) y con `rejectUnauthorized: false`, para poder leer la fecha de expiración incluso de un certificado ya inválido/caducado — si usara la validación estricta por defecto, nunca podría leer la fecha de un certificado que ya falló la validación, justo el caso que más importa alertar.
+
+### Qué se hizo
+
+**Esquema (migración `0007_ssl_and_notification_channel_name.sql`):**
+- `monitors.sslExpiresAt` (timestamp, nullable) y `monitors.sslLastAlertedThresholdDays` (integer, nullable).
+- `notification_channels.name` (nuevo, no estaba en el diseño original de la Fase 0.3) y `notification_channels.createdAt`.
+
+**`packages/notify-channels`** (paquete nuevo):
+- `discord.ts`: `sendDiscordMessage()` — embed con color según `tone`, usa `?wait=true` para que Discord devuelva el mensaje creado (con su `id`) en vez de un 204 vacío sin confirmación.
+- `slack.ts`: `sendSlackMessage()` — texto plano con emoji según `tone`.
+- `webhook.ts`: `sendGenericWebhook()` + `signWebhookPayload()` — firma HMAC-SHA256 sobre el cuerpo EXACTO que se envía (no un objeto reconstruido aparte).
+- `dispatch.ts`: `sendChannelNotification(type, config, message)` — único punto de entrada usado por API y worker.
+
+**`packages/mailer`**: nueva plantilla `sslExpiringEmail()`.
+
+**`apps/worker`**:
+- `src/lib/ssl-check.ts`: `getCertificateExpiry(hostname, port)` — conexión `tls.connect` dedicada, best-effort (nunca lanza).
+- `src/lib/ssl-alerts.ts`: `checkSslExpiry()` — umbral 30/15/7 (resuelve al más urgente ya cruzado), dedupe vía `sslLastAlertedThresholdDays`, resetea el dedupe si el certificado cambió.
+- `src/lib/notifications.ts` (reescrito): `notifyTransition()` y la nueva `notifySslExpiring()` ahora, además del email de siempre, reparten un `ChannelMessage` a todos los canales que el monitor tenga activados (`dispatchToChannels`), tolerando el fallo de un canal sin bloquear a los demás.
+- `src/lib/process-check.ts`: añadida la llamada a `checkSslExpiry()` tras el check normal, solo para monitores `http` con target `https://`.
+
+**`apps/api`**:
+- `src/routes/notification-channels.ts` (nuevo): CRUD de canales (`discord`/`slack`/`webhook` únicamente — `sms`/`email` no se pueden crear aquí) + `POST /notification-channels/:id/test`, todos protegidos por el mismo guard anti-SSRF (`assertPublicHost`) que ya protegía los targets de monitores.
+- `src/routes/monitors.ts`: `GET/POST/DELETE /monitors/:id/notification-channels[/:channelId]` — la "matriz" monitor↔canal, resuelta como toggles individuales, no un formulario con guardado explícito.
+- `src/lib/metrics.ts`: `getMonitorDailyHistory()` — un punto por día (no por hora) sobre `checks_hourly`, para las barras de 90 días de la status page.
+- `src/routes/status-pages.ts` (nuevo): CRUD autenticado de status pages, con `filterOwnedMonitorIds()` para blindar contra "colar" el id de un monitor ajeno en una página pública.
+- `src/routes/public-status.ts` (nuevo): `GET /public/status/:slug`, sin autenticación, limitado a 30 peticiones/minuto (`@fastify/rate-limit`, registrado con `global: false` — el resto de la API no tiene límite explícito, ya lo protege exigir JWT).
+
+**Frontend** (`apps/web`):
+- `src/pages/NotificationChannelsPage.tsx` (nuevo, ruta `/channels`): crear/listar/borrar canales, botón "Probar conexión" con el resultado real devuelto por la API.
+- `src/components/MonitorChannelsSection.tsx` (nuevo): checkboxes por canal en el detalle de un monitor, persistencia instantánea.
+- `src/pages/StatusPagesPage.tsx` (nuevo, ruta `/status-pages`): crear/listar/borrar status pages, elegir qué monitores incluir.
+- `src/pages/PublicStatusPage.tsx` (nuevo, ruta pública `/status/:slug`, **fuera** de `<ProtectedRoute>`): layout distinto por completo, banner de estado general, barras de histórico de 90 días.
+- `src/api/publicStatus.ts` (nuevo): cliente HTTP deliberadamente independiente de `api/client.ts` — la página pública no debe depender de nada relacionado con la sesión.
+- Stat nuevo de "Certificado SSL" en el detalle de un monitor `https://` (días restantes, derivado de `monitor.sslExpiresAt`).
+
+### Comandos ejecutados
+```bash
+# Nuevo paquete
+mkdir packages/notify-channels/src
+
+# Dependencias nuevas
+npm pkg set dependencies["@socket.io/redis-adapter"] -w apps/api   # (ya existía; recordatorio del patrón)
+# ...editados a mano los package.json de apps/api, apps/worker, apps/web...
+npm install   # @fastify/rate-limit, y el nuevo workspace @uptimepulse/notify-channels
+
+# Migración de esquema (auto-generada, no "custom" — sí hay cambio de columnas)
+cd packages/db && npx drizzle-kit generate --name ssl_and_notification_channel_name
+npm run db:migrate
+
+npx tsc --noEmit --project apps/api / apps/worker / apps/web / packages/notify-channels / packages/mailer   # limpio
+npx eslint apps/api/src apps/worker/src apps/web/src packages/notify-channels/src packages/mailer/src        # limpio
+cd apps/web && npm run build   # build de producción correcto
+```
+
+### Verificación completa
+Aplicando el mismo estándar de toda la sesión ("verificar con interacciones reales, no simulaciones"), pero esta vez con dos servicios externos reales de por medio.
+
+**1. Anti-SSRF en la creación de canales:** un canal Discord con `webhookUrl: "http://localhost:9999/fake"` fue rechazado con 422 (`"localhost" resuelve a "::1", una dirección privada/interna`) antes de intentar guardarlo.
+
+**2. Discord real:** con el webhook real proporcionado por el usuario, `POST /notification-channels/:id/test` devolvió `{"ok":true,"detail":"message id: 1551384347708362867"}` — un id de mensaje real, confirmado por la propia API de Discord, no un 200 genérico. Más adelante, con el canal activado en un monitor de prueba, una caída y recuperación reales dispararon dos mensajes más sin ningún error registrado en los logs del worker (`dispatchToChannels` solo loguea fallos, así que "sin logs de error" es la señal de éxito para un canal cuya respuesta no se puede leer de vuelta por HTTP).
+
+**3. Webhook genérico con HMAC, contra un receptor local propio:** un servidor HTTP mínimo (`webhook-receiver.mjs`, temporal, borrado al terminar) recalculó el HMAC-SHA256 del cuerpo recibido con el mismo secreto y lo comparó byte a byte contra la cabecera `X-UptimePulse-Signature` — válida en los 4 eventos que llegaron a lo largo de la sesión (prueba, caída, recuperación, alerta SSL). Requirió activar temporalmente `ALLOW_PRIVATE_MONITOR_TARGETS=true` (el receptor corría en `localhost`) — revertido a `false` al terminar, con API/worker reiniciados para recargarlo.
+
+**4. Ciclo completo de incidente con ambos canales activados:** monitor de prueba llevado a fallar (2 checks seguidos, cruzando el umbral del motor de incidentes de la Fase 2.2) y recuperado. En el momento exacto en que el incidente se abrió/cerró: email real en Mailpit, evento válido en el receptor HMAC, sin errores de Discord — los tres canales dispararon a la vez, ninguno bloqueó a los demás.
+
+**5. SSL contra un certificado real y deliberadamente caducado:** `expired.badssl.com` es un dominio público mantenido exactamente para pruebas como esta. Un script temporal (`verify-ssl.mts`, borrado al terminar) llamó a `getCertificateExpiry` directamente: devolvió `2015-04-12` (la fecha real del certificado). Contra `httpbin.org` devolvió `2027-01-02` (certificado sano, sin alerta). Ejecutando `checkSslExpiry()` dos veces seguidas contra el mismo certificado caducado: la primera disparó la alerta (email + webhook con firma válida + Discord, umbral resuelto correctamente a "7" pese a que faltaban -4180 días, no solo 7) y guardó el estado en `monitors`; la segunda **no generó ninguna alerta nueva** (confirmado por la ausencia del log "certificado SSL próximo a caducar" y de un segundo email/webhook) — el dedupe funciona.
+
+**6. Status pages, con peticiones HTTP reales sin autenticación:**
+- `GET /public/status/:slug` de una página con un monitor de prueba devolvió el título, `overallStatus: "operational"`, `uptimePercentage90d: 100` y 90 puntos de histórico diario — y la respuesta, inspeccionada explícitamente, **no contiene la palabra `target`** en ningún sitio.
+- Una página creada con `isPublic: false` devuelve 404 en la ruta pública (confirmado, no solo por lectura del código).
+- Un slug inexistente devuelve 404.
+- Una ráfaga de 35 peticiones seguidas a la misma página disparó el límite de verdad: las últimas 8 devolvieron 429, con cabeceras `X-RateLimit-Limit/Remaining` visibles en toda la serie.
+- **Bug real encontrado y corregido:** `getMonitorDailyHistory` fallaba con `row.day.toISOString is not a function` — `date_trunc('day', bucket)` sobre una columna calculada no siempre vuelve como `Date` ya parseado por el driver `pg` (a diferencia de `bucket` tal cual, una columna real de la vista). Corregido envolviendo con `new Date(row.day)` antes de formatear, que normaliza tanto si llega como `Date` como si llega como string.
+
+**7. Limpieza:** todos los monitores/canales/status pages de prueba borrados vía API (nunca SQL directo sobre monitores, lección de la Fase 2.1); usuarios/organizaciones de prueba borrados por SQL al final de cada bloque. Estado final verificado: 1 usuario real, 1 organización real, 2 monitores reales, 0 canales/status pages huérfanos, cola `monitor-checks` sin *schedulers* huérfanos.
+
+### Cómo reproducir/comprobar tú mismo
+```bash
+# 1. Crea un canal de Discord con tu propio webhook y pruébalo:
+curl -X POST http://localhost:3000/notification-channels -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"discord","name":"Mi Discord","config":{"webhookUrl":"TU_WEBHOOK_DE_DISCORD"}}'
+curl -X POST http://localhost:3000/notification-channels/$CHANNEL_ID/test -H "Authorization: Bearer $TOKEN"
+# Revisa tu canal de Discord — debería haber llegado un mensaje de prueba real.
+
+# 2. Actívalo en un monitor y fuerza una caída real:
+curl -X POST http://localhost:3000/monitors/$MONITOR_ID/notification-channels/$CHANNEL_ID -H "Authorization: Bearer $TOKEN"
+curl -X PATCH http://localhost:3000/monitors/$MONITOR_ID -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -d '{"target":"https://httpbin.org/status/500","intervalSeconds":301}'
+# Espera 2 checks (umbral de incidente) y revisa Discord + Mailpit.
+
+# 3. Comprueba el guard anti-SSRF:
+curl -X POST http://localhost:3000/notification-channels -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"type":"webhook","name":"malo","config":{"url":"http://localhost:1234","secret":"12345678"}}'
+# Debe devolver 422.
+
+# 4. Crea una status page y ábrela sin sesión iniciada (ventana de incógnito):
+curl -X POST http://localhost:3000/status-pages -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" -d '{"slug":"mi-estado","title":"Mi Estado","monitorIds":["'$MONITOR_ID'"]}'
+# Abre http://localhost:5173/status/mi-estado en una ventana de incógnito.
+```
+
+### Pendiente / notas
+- **SMS (Twilio) queda sin implementar** — el enum de la base de datos lo soporta, la UI no lo ofrece como opción creable. Retomar cuando haya una cuenta real de Twilio para verificarlo con el mismo rigor.
+- La redacción de la alerta SSL para un certificado YA caducado ("caduca en -4180 días") es correcta pero gramaticalmente rara — un caso límite real solo alcanzable con `expired.badssl.com`, no algo que un monitor normal debería ver en producción (un certificado realmente caducado ya haría fallar el check HTTP en sí, con `rejectUnauthorized` por defecto). Cosmético, pendiente de pulir si se retoma esta fase.
+- La gestión de status pages en el frontend no permite editar la lista de monitores después de crear la página (solo crear/borrar) — recorte de alcance deliberado dado el tamaño ya considerable de esta fase; el backend (`PATCH /status-pages/:id`) sí lo soporta, falta solo la UI.
+- `displayName` por monitor dentro de una status page (columna ya existente en `status_page_monitors` desde la Fase 0.3, para mostrar un nombre distinto al interno) tampoco tiene UI todavía — mismo motivo.
+- Verificación de frontend, igual que en fases anteriores, limitada a `tsc --noEmit` + `vite build` + inspección del bundle — sin navegador real disponible en esta sesión.
+
+### Próximo paso (Fase 4)
+Equipos y roles (invitar miembros, admin/editor/solo-lectura aplicado en cada endpoint), diseño de checks multi-región (la pieza más "sistemas distribuidos" del proyecto, requiere un ADR de quorum/consenso antes de implementar), y planes de suscripción con límites reales aplicados.

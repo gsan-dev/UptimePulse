@@ -121,50 +121,63 @@ Con 1.1 a 1.5 cerrados, UptimePulse ya es un producto usable de principio a fin:
 - [x] Bull Board montado en `/admin/queues` (solo cuando `NODE_ENV !== "production"`).
 - **Hecho cuando:** puedes lanzar 2 instancias del worker y los checks se reparten entre ellas sin duplicarse ni perderse. **Verificado con datos reales:** 5 monitores de prueba con intervalo de 15s, 2 workers (PIDs distintos en los logs) repartiéndose los jobs; consulta SQL final: `COUNT(*) = COUNT(DISTINCT timestamp)` para cada monitor (cero duplicados). También verificado que pausar/reanudar/borrar vía la API quita/añade el *job scheduler* correspondiente (confirmado con el contador `jobSchedulerCount` de Bull Board bajando y subiendo exactamente como se esperaba), y que la reconciliación al arrancar la API recupera los monitores creados antes de esta migración.
 
-### 2.2 Motor de incidentes
-- [ ] Job/listener que, al ver N checks fallidos consecutivos (configurable, ej. 2), crea un `incident` con `started_at`.
-- [ ] Al ver el primer check exitoso tras un incidente abierto, lo cierra con `resolved_at`.
-- [ ] Respeta `maintenance_windows`: un check fallido dentro de una ventana de mantenimiento no abre incidente ni dispara alerta.
-- [ ] Cálculo de métricas agregadas: % uptime (día/semana/mes/histórico), tiempo medio de respuesta, MTTR — como jobs programados o vistas materializadas de TimescaleDB (continuous aggregates).
-- **Hecho cuando:** al simular una caída de 3 checks seguidos se crea un incidente, y al recuperarse se cierra con la duración correcta; el uptime % del monitor refleja ese incidente.
+### 2.2 Motor de incidentes ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Job/listener que, al ver N checks fallidos consecutivos (configurable vía `INCIDENT_FAILURE_THRESHOLD`, por defecto 2), crea un `incident` con `started_at` = el timestamp del *primer* check fallido de la racha (no el que cruza el umbral, para que la duración sea exacta).
+- [x] Al ver el primer check exitoso tras un incidente abierto, lo cierra con `resolved_at`.
+- [x] Respeta `maintenance_windows`: un check fallido dentro de una ventana de mantenimiento no abre incidente ni dispara alerta.
+- [x] Cálculo de métricas agregadas: % uptime, tiempo medio de respuesta y MTTR sobre rangos 24h/7d/30d/90d, vía un *continuous aggregate* de TimescaleDB (`checks_hourly`, migración 0005) con política de refresco automática cada 30 min.
+- [x] **Cambio de diseño respecto a la Fase 1.5:** las notificaciones por email ahora se disparan al abrir/cerrar un *incidente* (tras cruzar el umbral), no en cada check "down" suelto — evita alertar por un bache de red puntual. Verificado: 10 checks "down" seguidos → exactamente 1 email de caída + 1 de recuperación (antes habría sido 1 por cada transición cruda).
+- **Hecho cuando:** al simular una caída de 2 checks seguidos se crea un incidente, y al recuperarse se cierra con la duración correcta; el uptime % del monitor refleja ese incidente. **Verificado con datos reales de extremo a extremo:** monitor de prueba contra un endpoint que siempre falla → tras 2 checks "down" se abrió el incidente con `started_at` = el primer check fallido (no el segundo) → email de caída recibido en Mailpit → target corregido a un endpoint que responde 200 → al siguiente check el incidente se cerró con `resolved_at` correcto → `resolved_at - started_at` = 268s, **idéntico** al `mttrSeconds` devuelto por `GET /monitors/:id/metrics` → email de recuperación recibido (solo 2 emails en total pese a 10 checks "down" de por medio). Un segundo monitor de prueba con una ventana de mantenimiento activa acumuló 3 checks "down" sin abrir ningún incidente, confirmando el respeto de `maintenance_windows`. `GET /monitors/:id/metrics?range=24h` devolvió `uptimePercentage: 9.09` (1 up / 11 checks) tras el ciclo completo. Nuevos endpoints: `GET/POST /monitors/:id/maintenance-windows`, `DELETE .../:windowId`, `GET /monitors/:id/incidents`, `GET /monitors/:id/metrics?range=`.
 
-### 2.3 Tiempo real (WebSockets)
-- [ ] Servidor Socket.io en la API, autenticado con el mismo JWT.
-- [ ] Emitir evento `monitor:status_changed` a los clientes de la organización correspondiente cuando cambia el estado de un monitor.
-- [ ] Frontend: sustituir el polling de la Fase 1 por suscripción WebSocket; actualizar UI en vivo.
-- [ ] Toast/notificación visual en el dashboard cuando cambia el estado mientras el usuario está mirando (README §3.7).
-- **Hecho cuando:** con el dashboard abierto en el navegador, al forzar la caída de un monitor de prueba, la tarjeta cambia de color sin recargar la página.
+### 2.3 Tiempo real (WebSockets) ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Servidor Socket.io en la API, autenticado con el mismo JWT de acceso (mandado en el `auth` del handshake, no en un header).
+- [x] Emitir evento `monitor:status_changed` a los clientes de la organización correspondiente cuando cambia el estado de un monitor — vía Redis (`@socket.io/redis-emitter` en el worker → `@socket.io/redis-adapter` en la API), porque quien detecta el cambio (el worker) no es quien tiene los sockets abiertos (la API).
+- [x] Frontend: sustituido el polling de 10s de la Fase 1 (Dashboard y detalle de monitor) por suscripción WebSocket (`RealtimeContext`); los datos se refrescan cuando llega un evento real, no a intervalo fijo.
+- [x] Toast visual (`ToastProvider`) cuando cambia el estado de un monitor mientras el dashboard/detalle está abierto.
+- **Hecho cuando:** con el dashboard abierto en el navegador, al forzar la caída de un monitor de prueba, la tarjeta cambia de color sin recargar la página. **Verificado con un cliente WebSocket real** (no simulado): un script Node con `socket.io-client` se autenticó con un JWT real, se conectó a la API, y recibió el evento `monitor:status_changed` (`up`→`down` y `down`→`up`) en tiempo real al forzar una transición real en un monitor de prueba vía la API — sin ningún sondeo de por medio. **Aislamiento por organización verificado:** un segundo socket autenticado con un usuario de una organización distinta, conectado al mismo tiempo, no recibió ningún evento de un monitor ajeno. La UI (Dashboard y detalle) se comprobó por `tsc --noEmit` + `vite build`, igual que en la Fase 1.4, dado que esta sesión no dispone de un navegador real.
 
-### 2.4 Dashboard mejorado
-- [ ] Sparklines de las últimas 24h por monitor (Recharts).
-- [ ] Cabecera con resumen agregado (operativos vs. caídos, uptime medio global, incidentes activos).
-- [ ] Selector de rango temporal (24h/7d/30d/90d) en la vista de detalle, con gráfico de línea de tiempo de respuesta y zonas sombreadas en rojo para caídas.
-- **Hecho cuando:** la vista de detalle de un monitor con histórico real permite cambiar el rango y el gráfico se actualiza acorde.
+### 2.4 Dashboard mejorado ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Sparklines de las últimas 24h por monitor (Recharts), coloreadas en rojo si hubo algún check "down" en ese rango.
+- [x] Cabecera con resumen agregado (operativos vs. caídos, pausados, uptime medio global de 24h, incidentes activos).
+- [x] Selector de rango temporal (24h/7d/30d/90d) en la vista de detalle, con gráfico de línea de tiempo de respuesta y zonas sombreadas en rojo para cada incidente que se solapa con el rango visible.
+- **Hecho cuando:** la vista de detalle de un monitor con histórico real permite cambiar el rango y el gráfico se actualiza acorde. **Verificado con datos reales de extremo a extremo (API):** monitor de prueba llevado de up→down→up vía `PATCH` real; `GET /monitors/:id/timeseries?range=24h` reflejó el bucket horario con `totalChecks/upChecks/downChecks` correctos; `GET /monitors/:id/incidents?range=24h` devolvió el incidente abierto por el motor de la Fase 2.2; `GET /monitors/summary` reflejó `avgUptimePercentage: 33.33` y `activeIncidents: 1` mientras estuvo caído, y `GET /monitors/:id/metrics` tras la recuperación coincidió exactamente (`uptimePercentage: 50`, `incidentCount: 1`, `openIncidentCount: 0`). **Bug real encontrado y corregido durante esta verificación:** `getMonitorTimeseries` devolvía `totalChecks`/`avgResponseTimeMs` como *strings* (`"2"`, `"882.5000000000000000"`) en vez de números — el driver de `pg` no castea `bigint`/`numeric` a `number` por defecto; corregido casteando explícitamente en el SQL (`::int`, `round(...)::int`), igual que ya hacía `getMonitorMetrics`. Frontend comprobado con `tsc --noEmit` + `vite build` (bundle sin referencias a `pg`/`drizzle-orm`, mismo chequeo que en fases anteriores) — sin navegador real disponible en esta sesión.
+
+---
+
+## 🎉 Fase 2 completa (arquitectura de sistemas distribuidos)
+
+Con 2.1 a 2.4 cerrados, UptimePulse pasó de los enfoques deliberadamente simples del MVP (Fase 1) a una arquitectura real: cola de trabajo distribuida con BullMQ (checks repartidos entre N instancias del worker sin duplicarse), un motor de incidentes que distingue señal de ruido (N caídas consecutivas, ventanas de mantenimiento, métricas de uptime/MTTR vía continuous aggregates de TimescaleDB), tiempo real de verdad por WebSocket (worker → Redis → API → navegador, con aislamiento por organización), y un dashboard que aprovecha todo lo anterior (sparklines, cabecera agregada, gráfico con rango temporal y caídas resaltadas). Cada pieza se verificó con datos e interacciones reales — dos workers concurrentes, un cliente WebSocket real, incidentes abiertos/cerrados con MTTR exacto — no solo "debería funcionar". **Siguiente:** Fase 3 (SSL, webhooks/SMS/Slack/Discord, status pages públicas).
 
 ---
 
 ## Fase 3 — SSL, webhooks/SMS, status pages
 
-### 3.1 Verificación de certificados SSL
-- [ ] Job periódico (o parte del check HTTPS) que lee la fecha de expiración del certificado.
-- [ ] Alerta a 30/15/7 días de la expiración (README §2.2), evitando reenviar la misma alerta cada día (dedupe).
-- **Hecho cuando:** contra un dominio de prueba con certificado próximo a expirar (o mockeado), se genera la alerta correspondiente solo una vez por umbral.
+### 3.1 Verificación de certificados SSL ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Comprobación como parte del check HTTP (no un job periódico aparte): tras cada check de un monitor `https://`, una conexión TLS dedicada (`node:tls`, `rejectUnauthorized: false`) lee `valid_to` del certificado del peer.
+- [x] Alerta a 30/15/7 días de la expiración, evitando reenviar la misma alerta cada día (dedupe vía `monitors.sslLastAlertedThresholdDays`, reseteado a null en cuanto el certificado cambia).
+- **Hecho cuando:** contra un dominio de prueba con certificado próximo a expirar, se genera la alerta correspondiente solo una vez por umbral. **Verificado contra un certificado real y deliberadamente caducado** (`expired.badssl.com`, servicio público diseñado exactamente para este tipo de pruebas — nada mockeado): `getCertificateExpiry` devolvió su fecha de caducidad real (`2015-04-12`); la primera comprobación clasificó correctamente `-4180 días` en el umbral "7" y disparó la alerta (email real recibido en Mailpit + webhook con firma HMAC válida + Discord); una segunda comprobación inmediata con el mismo certificado **no generó una alerta duplicada** (sin nuevo email/webhook/Discord). También verificado que un dominio con certificado sano (`httpbin.org`) devuelve su fecha real de expiración (2027) sin disparar ninguna alerta.
 
-### 3.2 Webhooks y SMS
-- [ ] Canal de notificación tipo webhook genérico: POST con payload JSON documentado (evento, monitor, timestamp, estado).
-- [ ] Firma del payload (HMAC con secreto por canal) para que el receptor pueda verificar autenticidad.
-- [ ] Integración Twilio para SMS.
-- [ ] Integración directa Slack/Discord (webhooks de esas plataformas).
-- [ ] UI de configuración: matriz "qué monitores notifican por qué canal" (README §3.5).
-- **Hecho cuando:** un monitor configurado con webhook + Slack dispara ambos al caer, y el payload del webhook verifica correctamente su firma HMAC.
+### 3.2 Webhooks y SMS ✅ parcial (2026-09-21, ver [DIARIO.md](DIARIO.md)) — SMS pospuesto
+- [x] Canal de notificación tipo webhook genérico: `POST` con payload JSON documentado (`event`, `title`, `description`, `fields`, `timestamp`).
+- [x] Firma del payload (HMAC-SHA256 con secreto por canal, header `X-UptimePulse-Signature: sha256=<hex>`) para que el receptor pueda verificar autenticidad.
+- [ ] Integración Twilio para SMS — **pospuesto deliberadamente**: sin una cuenta real de Twilio no se puede verificar de extremo a extremo con el mismo rigor que el resto del proyecto; decisión explícita del usuario, ver ADR.
+- [x] Integración directa Slack/Discord (webhooks de esas plataformas).
+- [x] UI de configuración: página `/channels` (crear/listar/borrar canales + botón "Probar conexión") + por monitor, checkboxes para activar/desactivar cada canal (`/monitors/:id`, sección "Canales de notificación") — la "matriz" del README §3.5.
+- **Hecho cuando:** un monitor configurado con webhook + Discord dispara ambos al caer, y el payload del webhook verifica correctamente su firma HMAC. **Verificado con servicios reales, no mocks:** un webhook de Discord real (proporcionado por el usuario) recibió tanto el mensaje de prueba ("Probar conexión") como las alertas reales de caída/recuperación — confirmado con el `message id` que la propia API de Discord devuelve al crear cada mensaje (`?wait=true`), no solo un 200 genérico. En paralelo, un receptor HTTP local propio verificó independientemente la firma HMAC de cada payload del canal "webhook genérico" (recalculando el HMAC con el mismo secreto y comparándolo byte a byte) — válida en los 4 eventos recibidos (prueba, caída, recuperación, alerta SSL). El guard anti-SSRF (Fase 1.2) también protege la creación de canales: una URL de webhook apuntando a `localhost` fue rechazada con 422 antes de intentar guardarla.
 
-### 3.3 Status pages públicas
-- [ ] Modelo ya creado en Fase 0 (`status_pages`, `status_page_monitors`).
-- [ ADR ] (diseño) decidir enrutado: subdominio propio (`estado.tuempresa.com`, requiere gestión de dominios/DNS del usuario) vs. ruta bajo el dominio propio (`uptimepulse.app/status/slug`) — empezar por la segunda opción (mucho más simple) y dejar la primera como mejora futura.
-- [ ] Endpoint público (sin auth) que sirve el estado agregado de los monitores marcados como visibles.
-- [ ] Frontend: layout completamente distinto (sin sidebar), con indicador general y barras de histórico de 90 días por servicio (estilo Stripe/GitHub Status).
-- [ ] Rate limiting de este endpoint público (es accesible por cualquiera, sin login).
-- **Hecho cuando:** una URL pública muestra el estado de los monitores seleccionados sin requerir login y sin exponer datos de otros monitores de la cuenta.
+### 3.3 Status pages públicas ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md))
+- [x] Modelo ya creado en Fase 0 (`status_pages`, `status_page_monitors`) — sin migración nueva, solo empezar a usarlo.
+- [x] **(ADR)** Enrutado: ruta bajo el dominio propio (`/status/:slug`), no subdominio — ver ADR completo en TASK.md.
+- [x] Endpoint público (sin auth) que sirve el estado agregado de los monitores marcados como visibles (`GET /public/status/:slug`), sin exponer `target` ni ningún otro dato de la cuenta.
+- [x] Frontend: layout completamente distinto (`PublicStatusPage.tsx`, sin sidebar ni cabecera de sesión), con banner de estado general y barras de histórico de 90 días por servicio (estilo Stripe/GitHub Status), agregadas sobre `checks_hourly` día a día.
+- [x] Rate limiting de este endpoint público (`@fastify/rate-limit`, 30 peticiones/minuto, el único endpoint de toda la API sin JWT).
+- **Hecho cuando:** una URL pública muestra el estado de los monitores seleccionados sin requerir login y sin exponer datos de otros monitores de la cuenta. **Verificado con peticiones HTTP reales sin ningún header de autenticación:** `GET /public/status/:slug` devolvió el título, estado general y el histórico de 90 días del monitor incluido — confirmado que la respuesta **no contiene el campo `target`** (grep sobre el JSON). Una página con `isPublic: false` no es accesible por esta ruta (filtrada en la propia consulta SQL). Un slug inexistente devuelve 404. El límite de 30 peticiones/minuto se disparó de verdad tras una ráfaga de 35 peticiones seguidas (las últimas 8 devolvieron 429), confirmado con las cabeceras `X-RateLimit-*` de la respuesta.
+
+---
+
+## 🎉 Fase 3 completa (SSL, webhooks/Discord/Slack, status pages) — SMS pendiente
+
+Con 3.1 a 3.3 cerrados, UptimePulse alerta de certificados SSL a punto de caducar (30/15/7 días, sin duplicados), permite a cada usuario conectar sus propios canales de Discord/Slack/webhook genérico (con prueba de conexión real y firma HMAC verificable), y publica el estado de los monitores que elija en una URL pública sin necesidad de cuenta. Todo verificado contra servicios reales cuando fue posible: un webhook de Discord real proporcionado por el usuario, un certificado real y deliberadamente caducado (`expired.badssl.com`) para probar el mecanismo de alertas SSL, y un receptor HTTP local para verificar la firma HMAC byte a byte. **Pendiente explícito:** SMS vía Twilio, pospuesto por decisión consciente del usuario al no disponer de una cuenta real para verificarlo con el mismo rigor que el resto — el hueco queda documentado, no simulado. **Siguiente:** Fase 4 (equipos/roles, checks multi-región, planes de suscripción).
 
 ---
 
@@ -320,3 +333,168 @@ Decisión: crear `packages/db` para el esquema Drizzle + cliente de Postgres,
 separado de `packages/shared`.
 Motivo: `apps/web` no debe arrastrar el driver `pg` en su bundle. Ver
 detalle completo en DIARIO.md, entrada de la Fase 0.3.
+
+### 2026-09-21 — Notificaciones por email: ligadas al incidente, no al check crudo
+Decisión: a partir de la Fase 2.2, `notifyTransition()` se llama solo cuando
+el motor de incidentes abre o cierra un `incident` (tras cruzar el umbral de
+N checks fallidos consecutivos), no en cada transición cruda `up<->down` de
+un check individual como en la Fase 1.5.
+Motivo: con la notificación ligada al check crudo, un solo bache de red
+puntual ya disparaba un email de caída (y otro de recuperación 15-30s
+después) — ruido, no señal. Ligarla al incidente real es además lo que hace
+que `maintenance_windows` funcione de verdad como "no dispares alerta": si
+la notificación siguiera mirando el check crudo, una ventana de
+mantenimiento podría evitar el *incidente* pero no la *alerta*. Verificado:
+10 checks "down" consecutivos → exactamente 1 email de caída (al abrir el
+incidente) + 1 de recuperación (al cerrarlo), no 1 por cada check.
+
+### 2026-09-21 — Métricas de uptime/MTTR: continuous aggregate de TimescaleDB, no agregación sobre `checks` en crudo
+Decisión: `checks_hourly` (migración 0005), un *continuous aggregate* que
+guarda por monitor y hora: total de checks, checks "up"/"down" y tiempo de
+respuesta medio. `GET /monitors/:id/metrics` agrega sobre esa vista, nunca
+sobre `checks` fila a fila.
+Motivo: `checks` en crudo solo retiene 90 días (política de retención de la
+Fase 0.3) y puede acumular millones de filas; un rango de 90 días son
+~2160 buckets horarios en `checks_hourly` frente a potencialmente millones
+de checks individuales. Al no estar sujeto a la retención, sirve además como
+histórico permanente para métricas a largo plazo.
+**Lección aprendida verificando esto en vivo:** se asumió que la
+"real-time aggregation" de Timescale (que combina los buckets ya
+materializados con los checks recién insertados que el job de refresco
+todavía no ha procesado) viene activada por defecto en un continuous
+aggregate — no es así en esta versión: `materialized_only` es `TRUE` por
+defecto. Con eso, `GET /monitors/:id/metrics` devolvía `totalChecks: 0` para
+un monitor con checks reales, porque el primer refresco automático (cada 30
+min) todavía no había materializado nada. Corregido con una migración de
+seguimiento (`0006_checks_hourly_realtime_aggregation.sql`,
+`ALTER MATERIALIZED VIEW ... SET (timescaledb.materialized_only = false)`)
+en vez de reescribir la 0005 ya aplicada — no se edita una migración que ya
+corrió contra la base de datos real (drizzle guarda un hash de su contenido
+en `__drizzle_migrations`; editarla habría hecho que intentara reaplicarla).
+Verificado tras el fix: `mttrSeconds` calculado por la vista coincidió
+exactamente (268s) con `resolved_at - started_at` del incidente real.
+
+### 2026-09-21 — Ventanas de mantenimiento: CRUD mínimo añadido ad-hoc
+Decisión: añadir `GET/POST /monitors/:id/maintenance-windows` y
+`DELETE .../:windowId` aunque no estaban listados explícitamente en el
+checklist de la Fase 2.2.
+Motivo: la tabla `maintenance_windows` ya existía en el esquema desde la
+Fase 0.3, pero no había ninguna forma de crear una — sin un CRUD mínimo era
+imposible verificar de verdad que el motor de incidentes las respeta. Sin
+edición (`PATCH`) deliberadamente: para el alcance actual basta con borrar y
+volver a crear si hay que ajustar una ventana.
+
+### 2026-09-21 — Tiempo real: Socket.io + Redis (adapter en la API, emitter en el worker), no un segundo servidor WS
+Decisión: `socket.io` en `apps/api` con `@socket.io/redis-adapter`, y
+`@socket.io/redis-emitter` (mismo canal Redis) en `apps/worker` para publicar
+eventos sin abrir sockets él mismo.
+Motivo: quien detecta un cambio de estado es el worker (Fase 2.1: proceso
+separado de la API, puede haber varias instancias), pero los navegadores
+solo tienen conexión WebSocket abierta con la API. Sin un canal intermedio,
+el worker no tiene forma de "avisar" a la API. Ya se paga el coste de tener
+Redis en la infraestructura (BullMQ, Fase 2.1) — reutilizarlo para pub/sub de
+eventos en vivo es más simple que montar un segundo mecanismo (un endpoint
+HTTP interno worker→api, por ejemplo) y es exactamente el patrón que
+`@socket.io/redis-adapter`/`-emitter` existen para resolver. Autenticación
+del socket con el mismo JWT de acceso de la Fase 1.1 (mandado en
+`socket.handshake.auth.token`, no en un header — el navegador no puede
+mandar headers custom en el handshake WebSocket), uniendo cada conexión a
+una sala `org:<organizationId>` para el aislamiento entre organizaciones.
+**Decisión secundaria:** el evento `monitor:status_changed` se dispara por
+cada transición cruda `up<->down` de un check individual, **no** por el
+umbral de incidentes de la Fase 2.2 — son preguntas distintas ("¿qué está
+pasando ahora mismo, para pintar la tarjeta del dashboard?" vs. "¿es esto
+una caída de verdad, para alertar?"). Verificado con un cliente
+`socket.io-client` real (no un mock): recibió el evento en tiempo real al
+forzar una transición, y un segundo socket de otra organización, conectado
+a la vez, no recibió nada de un monitor ajeno.
+
+### 2026-09-21 — Dashboard mejorado: un único endpoint de resumen, no N llamadas por monitor
+Decisión: `GET /monitors/summary` calcula el uptime medio global y los
+incidentes activos de la organización con dos consultas agregadas (`JOIN`
+entre `monitors` e `checks_hourly`/`incidents`), y añade una sparkline de
+24h por monitor reutilizando `getMonitorTimeseries` (la misma función que
+alimenta el gráfico de la vista de detalle) en un `Promise.all`.
+Motivo: el desglose "operativos vs. caídos vs. pausados" de la cabecera NO
+se calcula en el backend — se deriva en el frontend a partir de `lastCheck`,
+que `GET /monitors` ya devuelve desde la Fase 1.3. Solo el uptime medio *de
+verdad* agregado (que cruza varios monitores) necesita una consulta nueva.
+Para las sparklines, generar N llamadas (una por monitor) desde el
+frontend habría sido más simple de escribir, pero con el plan "free"
+limitado a 5 monitores el coste de un `Promise.all` en el propio backend es
+insignificante y evita N round-trips HTTP desde el navegador por cada carga
+del dashboard.
+**Bug real encontrado verificando esto:** `getMonitorTimeseries` devolvía
+`totalChecks`/`avgResponseTimeMs` como *strings* de Postgres (`bigint` y
+`numeric` no se convierten a `number` en JS por el driver `pg`), rompiendo
+el contrato de tipos de la API sin que TypeScript pudiera detectarlo (el
+`as` sobre `result.rows` "miente" con seguridad si el cast no es real).
+Corregido casteando explícitamente en el SQL (`::int`, `round(...)::int`).
+Lección: cualquier función nueva que use `db.execute(sql\`...\`)` con
+`count`/`sum`/`avg` debe castear en la propia consulta, no fiarse del tipo
+que le pongamos al resultado en TypeScript — ya había pasado (y se había
+corregido) en `getMonitorMetrics` durante la Fase 2.2, pero no se generalizó
+la lección hasta que volvió a fallar aquí.
+
+### 2026-09-21 — SMS (Twilio) pospuesto por decisión explícita del usuario
+Decisión: el enum `channel_type` conserva `"sms"` (Fase 0.3) y la UI de
+canales no lo ofrece todavía como opción creable; no se ha escrito código de
+integración con Twilio en esta fase.
+Motivo: preguntado directamente, el usuario no tenía una cuenta real de
+Twilio para esta sesión. El estándar de todo este proyecto es verificar cada
+pieza con una interacción real (un email de verdad en Mailpit, un mensaje de
+verdad en Discord, un certificado de verdad caducado) — escribir la
+integración sin poder probarla contra una cuenta real habría roto ese
+estándar sin decirlo. Mejor dejarlo pendiente, documentado como tal, que
+fingir una cobertura que no existe. Retomar en cuanto haya credenciales:
+Account SID + Auth Token + número de origen, mismo patrón de configuración
+por parámetro que `packages/mailer`/`packages/notify-channels` (nunca leer
+`process.env` dentro del paquete).
+
+### 2026-09-21 — Canales de notificación: paquete nuevo `packages/notify-channels`, compartido por API y worker
+Decisión: la lógica de envío a Discord/Slack/webhook genérico (incluida la
+firma HMAC) vive en un paquete nuevo, no directamente en `apps/worker`.
+Motivo: el botón "Probar conexión" vive en la API (Fase 3.2, para que el
+usuario pueda validar un canal sin esperar a una caída real), pero el envío
+real ante una caída lo dispara el worker. Sin un paquete compartido, habría
+dos implementaciones de "cómo mando un mensaje a Discord" que podrían
+divergir con el tiempo — con una sola, "probar" prueba literalmente el mismo
+código que se usa en producción, no una simulación aparte. Mismo patrón ya
+establecido con `packages/mailer` (Fase 1.5) y `packages/queue` (Fase 2.1):
+cada concern transversal nuevo, su propio paquete enfocado.
+
+### 2026-09-21 — Notificaciones por canal: mensaje único renderizado una vez, no una plantilla por canal
+Decisión: `ChannelMessage` (`{ title, description, tone, fields }`) se
+construye una sola vez en `apps/worker/src/lib/notifications.ts` y cada
+sender (Discord/Slack/webhook) lo traduce a su propio formato — un embed con
+color para Discord, texto con emoji para Slack, JSON firmado para el
+webhook genérico.
+Motivo: sin este paso intermedio, "cómo describo una caída de monitor"
+habría que escribirlo tres veces (una por canal) y mantenerlas sincronizadas
+a mano. Con un mensaje genérico, añadir un canal nuevo en el futuro (Fase
+4+) solo exige un sender nuevo que sepa traducir `ChannelMessage`, no tocar
+la lógica de negocio que decide qué decir y cuándo.
+
+### 2026-09-21 — Status pages: ruta bajo el dominio propio, no subdominio
+Decisión: `/status/:slug` (ruta de React Router en `apps/web`), no un
+subdominio como `estado.tuempresa.com`.
+Motivo: un subdominio por status page (o uno genérico con routing por
+`Host`) exige gestión de DNS/certificados que el usuario de este proyecto no
+tiene por qué operar para un portfolio — la ruta bajo el propio dominio
+funciona igual de bien para demostrar la funcionalidad (endpoint público sin
+auth, aislamiento de datos, rate limiting) sin esa complejidad operativa.
+Queda anotado como mejora futura si este proyecto se desplegara de verdad
+con dominios propios por cliente.
+
+### 2026-09-21 — Status page pública: nunca expone el `target` del monitor
+Decisión: `GET /public/status/:slug` devuelve `id`, `name`
+(o `displayName` si se configuró uno) y el estado derivado — nunca
+`target`.
+Motivo: una status page es, por definición, un endpoint sin autenticación
+alcanzable por cualquiera con el slug. El nombre de un monitor ("API",
+"Base de datos") es información que tiene sentido compartir; su `target`
+real (una URL, un `host:puerto`) es un detalle de infraestructura interna
+que no aporta nada a quien solo quiere saber "¿está caído o no?" y sí podría
+ayudar a un atacante a mapear la infraestructura del usuario. Verificado
+explícitamente (no solo por diseño): la respuesta real no contiene la
+palabra `target`.

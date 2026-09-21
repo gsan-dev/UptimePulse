@@ -1,13 +1,14 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { eq, and, desc, sql } from "drizzle-orm";
+import { eq, and, or, isNull, desc, sql } from "drizzle-orm";
 import { z } from "zod";
-import { checks, db, monitors } from "@uptimepulse/db";
+import { checks, db, incidents, maintenanceWindows, monitorNotificationChannels, monitors, notificationChannels } from "@uptimepulse/db";
 import { assertPublicHost, extractHostname, SsrfBlockedError } from "@uptimepulse/server-utils";
 import { scheduleMonitorCheck, unscheduleMonitorCheck } from "@uptimepulse/queue";
 import { env } from "../env.js";
 import { requireAuth } from "../plugins/auth.js";
 import { getPrimaryOrganizationId } from "../lib/organizations.js";
 import { getOrganizationPlanLimits } from "../lib/plans.js";
+import { getMonitorMetrics, getMonitorTimeseries, getOrganizationSummary, rangeToInterval, UPTIME_RANGES } from "../lib/metrics.js";
 import { monitorCheckQueue } from "../queue.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] as const;
@@ -65,10 +66,35 @@ const updateMonitorSchema = z
   .partial();
 
 const idParamSchema = z.object({ id: z.string().uuid() });
+const idAndWindowIdParamSchema = z.object({ id: z.string().uuid(), windowId: z.string().uuid() });
+const idAndChannelIdParamSchema = z.object({ id: z.string().uuid(), channelId: z.string().uuid() });
 
 const listChecksQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
 });
+
+const metricsQuerySchema = z.object({
+  range: z.enum(UPTIME_RANGES).default("24h"),
+});
+
+const listIncidentsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  // Opcional: filtra a incidentes que se solapan con el rango (Fase 2.4,
+  // para las zonas sombreadas del gráfico). Sin él, devuelve los últimos
+  // `limit` incidentes sin más (comportamiento de la Fase 2.2).
+  range: z.enum(UPTIME_RANGES).optional(),
+});
+
+const createMaintenanceWindowSchema = z
+  .object({
+    startsAt: z.coerce.date(),
+    endsAt: z.coerce.date(),
+    note: z.string().max(500).optional(),
+  })
+  .refine((data) => data.endsAt > data.startsAt, {
+    message: "endsAt debe ser posterior a startsAt",
+    path: ["endsAt"],
+  });
 
 function parseId(request: FastifyRequest, reply: FastifyReply): string | undefined {
   const result = idParamSchema.safeParse(request.params);
@@ -77,6 +103,30 @@ function parseId(request: FastifyRequest, reply: FastifyReply): string | undefin
     return undefined;
   }
   return result.data.id;
+}
+
+function parseIdAndWindowId(
+  request: FastifyRequest,
+  reply: FastifyReply
+): { id: string; windowId: string } | undefined {
+  const result = idAndWindowIdParamSchema.safeParse(request.params);
+  if (!result.success) {
+    reply.code(400).send({ error: "El id y el windowId deben ser UUID válidos" });
+    return undefined;
+  }
+  return result.data;
+}
+
+function parseIdAndChannelId(
+  request: FastifyRequest,
+  reply: FastifyReply
+): { id: string; channelId: string } | undefined {
+  const result = idAndChannelIdParamSchema.safeParse(request.params);
+  if (!result.success) {
+    reply.code(400).send({ error: "El id y el channelId deben ser UUID válidos" });
+    return undefined;
+  }
+  return result.data;
 }
 
 async function findOwnedMonitor(organizationId: string, monitorId: string) {
@@ -310,5 +360,239 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     await scheduleMonitorCheck(monitorCheckQueue, updated.id, updated.intervalSeconds);
 
     return reply.send(updated);
+  });
+
+  // --- Métricas e incidentes (Fase 2.2) ---
+
+  app.get("/monitors/:id/metrics", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const queryParsed = metricsQuerySchema.safeParse(request.query);
+    if (!queryParsed.success) {
+      return reply.code(400).send({ error: queryParsed.error.flatten() });
+    }
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    return reply.send(await getMonitorMetrics(id, queryParsed.data.range));
+  });
+
+  app.get("/monitors/:id/timeseries", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const queryParsed = metricsQuerySchema.safeParse(request.query);
+    if (!queryParsed.success) {
+      return reply.code(400).send({ error: queryParsed.error.flatten() });
+    }
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    return reply.send(await getMonitorTimeseries(id, queryParsed.data.range));
+  });
+
+  // Resumen agregado de la organización para la cabecera del dashboard
+  // (Fase 2.4): uptime medio global + incidentes activos + una sparkline de
+  // 24h por monitor, en una sola petición.
+  app.get("/monitors/summary", async (request, reply) => {
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    if (!organizationId) {
+      return reply.send({ avgUptimePercentage: null, activeIncidents: 0, sparklines: {} });
+    }
+
+    const orgMonitors = await db.query.monitors.findMany({ where: eq(monitors.organizationId, organizationId) });
+
+    const [summary, sparklineEntries] = await Promise.all([
+      getOrganizationSummary(organizationId),
+      Promise.all(orgMonitors.map(async (m) => [m.id, await getMonitorTimeseries(m.id, "24h")] as const)),
+    ]);
+
+    return reply.send({ ...summary, sparklines: Object.fromEntries(sparklineEntries) });
+  });
+
+  app.get("/monitors/:id/incidents", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const queryParsed = listIncidentsQuerySchema.safeParse(request.query);
+    if (!queryParsed.success) {
+      return reply.code(400).send({ error: queryParsed.error.flatten() });
+    }
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    const { range, limit } = queryParsed.data;
+    const rows = await db
+      .select()
+      .from(incidents)
+      .where(
+        range
+          ? and(
+              eq(incidents.monitorId, id),
+              // Un incidente "pertenece" al rango si empezó dentro de él, o
+              // si sigue abierto (aunque empezara antes) — de lo contrario
+              // una caída larga desaparecería del gráfico en cuanto su
+              // inicio quedara fuera de la ventana visible.
+              or(isNull(incidents.resolvedAt), sql`${incidents.startedAt} >= now() - ${rangeToInterval(range)}::interval`)
+            )
+          : eq(incidents.monitorId, id)
+      )
+      .orderBy(desc(incidents.startedAt))
+      .limit(limit);
+
+    return reply.send(rows);
+  });
+
+  // --- Ventanas de mantenimiento (Fase 2.2) ---
+  // CRUD mínimo: solo lo necesario para poder programar una ventana y que el
+  // motor de incidentes del worker la respete. No hay edición porque para
+  // este alcance basta con borrar y volver a crear.
+
+  app.get("/monitors/:id/maintenance-windows", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    const rows = await db
+      .select()
+      .from(maintenanceWindows)
+      .where(eq(maintenanceWindows.monitorId, id))
+      .orderBy(desc(maintenanceWindows.startsAt));
+
+    return reply.send(rows);
+  });
+
+  app.post("/monitors/:id/maintenance-windows", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const parsed = createMaintenanceWindowSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    const [window] = await db
+      .insert(maintenanceWindows)
+      .values({
+        monitorId: id,
+        startsAt: parsed.data.startsAt,
+        endsAt: parsed.data.endsAt,
+        note: parsed.data.note ?? null,
+      })
+      .returning();
+
+    return reply.code(201).send(window);
+  });
+
+  app.delete("/monitors/:id/maintenance-windows/:windowId", async (request, reply) => {
+    const parsedParams = parseIdAndWindowId(request, reply);
+    if (!parsedParams) return;
+    const { id, windowId } = parsedParams;
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    await db
+      .delete(maintenanceWindows)
+      .where(and(eq(maintenanceWindows.id, windowId), eq(maintenanceWindows.monitorId, id)));
+
+    return reply.code(204).send();
+  });
+
+  // --- Canales de notificación por monitor (Fase 3.2) ---
+  // La "matriz" del README §3.5 se resuelve así: cada monitor expone qué
+  // canales (ya creados en /notification-channels) tiene activados, y se
+  // activan/desactivan uno a uno — no hace falta un endpoint que reciba la
+  // lista completa cada vez.
+
+  app.get("/monitors/:id/notification-channels", async (request, reply) => {
+    const id = parseId(request, reply);
+    if (!id) return;
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    const rows = await db
+      .select({ channelId: monitorNotificationChannels.channelId })
+      .from(monitorNotificationChannels)
+      .where(eq(monitorNotificationChannels.monitorId, id));
+
+    return reply.send(rows.map((row) => row.channelId));
+  });
+
+  app.post("/monitors/:id/notification-channels/:channelId", async (request, reply) => {
+    const parsedParams = parseIdAndChannelId(request, reply);
+    if (!parsedParams) return;
+    const { id, channelId } = parsedParams;
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    const channel = organizationId
+      ? await db.query.notificationChannels.findFirst({
+          where: and(eq(notificationChannels.id, channelId), eq(notificationChannels.organizationId, organizationId)),
+        })
+      : null;
+    if (!channel) {
+      return reply.code(404).send({ error: "Canal no encontrado" });
+    }
+
+    await db
+      .insert(monitorNotificationChannels)
+      .values({ monitorId: id, channelId })
+      .onConflictDoNothing();
+
+    return reply.code(204).send();
+  });
+
+  app.delete("/monitors/:id/notification-channels/:channelId", async (request, reply) => {
+    const parsedParams = parseIdAndChannelId(request, reply);
+    if (!parsedParams) return;
+    const { id, channelId } = parsedParams;
+
+    const organizationId = await getPrimaryOrganizationId(request.user!.id);
+    const monitor = organizationId ? await findOwnedMonitor(organizationId, id) : null;
+    if (!monitor) {
+      return reply.code(404).send({ error: "Monitor no encontrado" });
+    }
+
+    await db
+      .delete(monitorNotificationChannels)
+      .where(and(eq(monitorNotificationChannels.monitorId, id), eq(monitorNotificationChannels.channelId, channelId)));
+
+    return reply.code(204).send();
   });
 }

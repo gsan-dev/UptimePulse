@@ -20,6 +20,13 @@ export function setAccessToken(token: string | null): void {
   accessToken = token;
 }
 
+// Usado por la conexión WebSocket (Fase 2.3): el socket se autentica con el
+// mismo access token en memoria, mandado en cada intento de conexión (ver
+// api/realtime.ts) para no arrastrar uno caducado tras un refresh.
+export function getAccessToken(): string | null {
+  return accessToken;
+}
+
 interface RequestOptions extends Omit<RequestInit, "body"> {
   body?: unknown;
   /** Evita el reintento automático de refresh (usado por /auth/refresh y /auth/logout, para no entrar en bucle). */

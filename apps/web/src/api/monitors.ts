@@ -1,5 +1,14 @@
 import { apiFetch } from "./client";
-import type { ApiCheck, ApiMonitor, MonitorType } from "./types";
+import type {
+  ApiCheck,
+  ApiDashboardSummary,
+  ApiIncident,
+  ApiMonitor,
+  ApiMonitorMetrics,
+  ApiTimeseriesPoint,
+  MonitorType,
+  UptimeRange,
+} from "./types";
 
 export interface CreateMonitorInput {
   name: string;
@@ -46,4 +55,20 @@ export function pauseMonitor(id: string): Promise<ApiMonitor> {
 
 export function resumeMonitor(id: string): Promise<ApiMonitor> {
   return apiFetch<ApiMonitor>(`/monitors/${id}/resume`, { method: "POST" });
+}
+
+export function getMonitorMetrics(id: string, range: UptimeRange): Promise<ApiMonitorMetrics> {
+  return apiFetch<ApiMonitorMetrics>(`/monitors/${id}/metrics?range=${range}`);
+}
+
+export function getMonitorTimeseries(id: string, range: UptimeRange): Promise<ApiTimeseriesPoint[]> {
+  return apiFetch<ApiTimeseriesPoint[]>(`/monitors/${id}/timeseries?range=${range}`);
+}
+
+export function listMonitorIncidents(id: string, range?: UptimeRange): Promise<ApiIncident[]> {
+  return apiFetch<ApiIncident[]>(`/monitors/${id}/incidents${range ? `?range=${range}` : ""}`);
+}
+
+export function getDashboardSummary(): Promise<ApiDashboardSummary> {
+  return apiFetch<ApiDashboardSummary>("/monitors/summary");
 }

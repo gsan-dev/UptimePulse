@@ -7,8 +7,10 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
+    "@socket.io/redis-emitter": "^5.1.0",
     "@uptimepulse/db": "*",
     "@uptimepulse/mailer": "*",
+    "@uptimepulse/notify-channels": "*",
     "@uptimepulse/queue": "*",
     "@uptimepulse/server-utils": "*",
     "@uptimepulse/shared": "*",

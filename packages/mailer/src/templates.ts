@@ -38,6 +38,21 @@ export function monitorRecoveredEmail(monitor: MonitorForEmail, responseTimeMs: 
   };
 }
 
+export function sslExpiringEmail(monitor: MonitorForEmail, daysUntilExpiry: number, expiresAt: Date): EmailContent {
+  const expiresAtText = expiresAt.toLocaleDateString("es-ES", { year: "numeric", month: "long", day: "numeric" });
+  return {
+    subject: `🟡 El certificado SSL de ${monitor.name} caduca en ${daysUntilExpiry} días`,
+    text: `El certificado SSL de tu monitor "${monitor.name}" (${monitor.target}) caduca el ${expiresAtText} (en ${daysUntilExpiry} días).\n\nRenuévalo antes de esa fecha para evitar que tus visitantes vean avisos de seguridad.\n\n— UptimePulse`,
+    html: `
+      <div style="font-family: sans-serif; color: #111;">
+        <p>El certificado SSL de tu monitor <strong>${escapeHtml(monitor.name)}</strong> (${escapeHtml(monitor.target)}) caduca el <strong>${expiresAtText}</strong> (en ${daysUntilExpiry} días).</p>
+        <p>Renuévalo antes de esa fecha para evitar que tus visitantes vean avisos de seguridad.</p>
+        <p style="color: #666; font-size: 12px;">— UptimePulse</p>
+      </div>
+    `.trim(),
+  };
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")

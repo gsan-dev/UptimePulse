@@ -85,6 +85,15 @@ export const monitors = pgTable("monitors", {
   isPaused: boolean("is_paused").notNull().default(false),
   tags: jsonb("tags").$type<string[]>().default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  // --- SSL (Fase 3.1) ---
+  // Se rellenan solo para monitores HTTP contra target "https://"; el resto
+  // se quedan en null sin más (no es un error, simplemente no aplica).
+  sslExpiresAt: timestamp("ssl_expires_at", { withTimezone: true }),
+  // Último umbral (30/15/7 días) ya notificado para el certificado ACTUAL.
+  // Se resetea a null en cuanto se detecta una fecha de caducidad distinta
+  // (el certificado se renovó) — así una alerta nunca se reenvía para el
+  // mismo certificado, pero sí vuelve a dispararse para uno nuevo.
+  sslLastAlertedThresholdDays: integer("ssl_last_alerted_threshold_days"),
 });
 
 // --- Checks (hypertable de TimescaleDB, ver migración 0002) ---
@@ -128,8 +137,13 @@ export const notificationChannels = pgTable("notification_channels", {
   organizationId: uuid("organization_id")
     .notNull()
     .references(() => organizations.id, { onDelete: "cascade" }),
+  // Añadido en la Fase 3.2 (no estaba en el diseño original de la Fase 0.3):
+  // con varios canales del mismo tipo (dos webhooks de Discord distintos,
+  // por ejemplo) hace falta una etiqueta para distinguirlos en la UI.
+  name: text("name").notNull(),
   type: channelTypeEnum("type").notNull(),
   config: jsonb("config").notNull().$type<Record<string, unknown>>(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const monitorNotificationChannels = pgTable(
