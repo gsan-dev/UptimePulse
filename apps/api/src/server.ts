@@ -18,7 +18,6 @@ import { docsRoutes } from "./routes/docs.js";
 import { monitorRoutes } from "./routes/monitors.js";
 import { notificationChannelRoutes } from "./routes/notification-channels.js";
 import { invitationRoutes, organizationRoutes } from "./routes/organizations.js";
-import { planRoutes } from "./routes/plans.js";
 import { statusPageRoutes } from "./routes/status-pages.js";
 import { publicStatusRoutes } from "./routes/public-status.js";
 import { redisConnection, regionQueues } from "./queue.js";
@@ -158,7 +157,6 @@ export async function buildServer() {
   await app.register(organizationRoutes);
   await app.register(invitationRoutes);
   await app.register(apiKeyRoutes);
-  await app.register(planRoutes);
   await app.register(monitorRoutes);
   await app.register(notificationChannelRoutes);
   await app.register(statusPageRoutes);

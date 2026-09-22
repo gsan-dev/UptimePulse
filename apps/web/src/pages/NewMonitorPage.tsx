@@ -2,7 +2,7 @@ import { useState, type FormEvent, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { createMonitor } from "../api/monitors";
-import { FormError } from "../components/PlanLimitError";
+import { FormError } from "../components/FormError";
 import type { MonitorType } from "../api/types";
 
 const inputClass =
@@ -106,7 +106,7 @@ export function NewMonitorPage() {
           </Field>
         )}
 
-        <Field label="Intervalo en segundos (el mínimo depende de tu plan)">
+        <Field label="Intervalo en segundos (mínimo 30)">
           <input
             type="number"
             min={30}

@@ -53,7 +53,7 @@ export async function requireAuth(request: FastifyRequest, reply: FastifyReply):
     request.apiKey = apiKey;
     // Una API key actúa en nombre de la organización, no de una persona:
     // `user` queda sin definir y las rutas que necesitan un usuario (perfil,
-    // equipo, plan) lo rechazan con requireUserSession.
+    // equipo) lo rechazan con requireUserSession.
     request.organization = { id: apiKey.organizationId, role: roleForScopes(apiKey.scopes) };
     return;
   }
@@ -113,7 +113,7 @@ export function requireRole(minimum: OrganizationRole) {
 
 /**
  * preHandler para rutas que solo tienen sentido para una persona con sesión
- * (perfil, equipo, plan, gestión de API keys): una API key da 403 aunque
+ * (perfil, equipo, gestión de API keys): una API key da 403 aunque
  * tenga scope write.
  */
 export async function requireUserSession(request: FastifyRequest, reply: FastifyReply): Promise<void> {

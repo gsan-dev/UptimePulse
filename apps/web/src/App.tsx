@@ -11,7 +11,6 @@ import { LoginPage } from "./pages/LoginPage";
 import { MonitorDetailPage } from "./pages/MonitorDetailPage";
 import { NewMonitorPage } from "./pages/NewMonitorPage";
 import { NotificationChannelsPage } from "./pages/NotificationChannelsPage";
-import { PricingPage } from "./pages/PricingPage";
 import { ProfilePage } from "./pages/ProfilePage";
 import { PublicStatusPage } from "./pages/PublicStatusPage";
 import { RegisterPage } from "./pages/RegisterPage";
@@ -32,7 +31,6 @@ export default function App() {
                 {/* Pública a propósito (Fase 3.3): sin <ProtectedRoute>, no requiere sesión. */}
                 <Route path="/status/:username/:slug" element={<PublicStatusPage />} />
                 {/* Pública (Fase 4.3): la página de precios se ve sin cuenta. */}
-                <Route path="/pricing" element={<PricingPage />} />
                 {/* Pública (Fase 4.1): el invitado puede no tener cuenta todavía. */}
                 <Route path="/invitations/:token" element={<InvitationPage />} />
                 <Route element={<ProtectedRoute />}>

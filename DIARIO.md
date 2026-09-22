@@ -2719,3 +2719,126 @@ error que la Fase 5.3 debía destapar.
 TODO.md actualizado: se tachan los puntos que la Fase 5 ha cerrado.
 Comprobación final (ver salida en la respuesta de la sesión): `npm run
 lint`, `npm run typecheck`, `npm test`, `npm run test:e2e`, `vite build`.
+
+---
+
+## 2026-09-22 — Retirada de planes de pago y límites de uso
+
+### Objetivo
+A petición del usuario: quitar todo lo relacionado con planes, precios y
+límites de monitores/intervalo/canales.
+
+### Qué se hizo
+- **DB:** `packages/db/migrations/0014_drop_plans.sql` (borra la FK, la
+  columna `organizations.plan_id` y la tabla `plans`); esquema Drizzle y
+  tipos de `packages/shared` sin `plans`.
+- **API:** eliminados `lib/plans.ts` y `routes/plans.ts`; `monitors.ts` y
+  `notification-channels.ts` sin comprobaciones de límite; el registro ya
+  no asigna plan; `GET /organizations` sin `planName`;
+  `GET /organizations/:id` recreado en `organizations.ts` (id, nombre, rol,
+  `usage.monitors`).
+- **Web:** eliminados `PricingPage`, `api/plans.ts` y `PlanLimitError`
+  (nuevo `components/FormError.tsx` sin enlace a planes); ruta `/pricing`
+  y enlace "Plan:" fuera; textos de ayuda actualizados.
+- **Tests:** el test de límites pasa a comprobar que se crean 8 monitores a
+  30 s sin error; e2e y auth sin `planName`.
+- **Docs:** OpenAPI sin `Planes`/`PlanLimitError`/`/plans`; README,
+  SECURITY, DEPLOY, READMEs de apps, TODO y TASK actualizados; captura
+  `pricing.png` borrada.
+
+### Comandos ejecutados
+```bash
+cd packages/db && npx drizzle-kit generate --name drop_plans   # SQL reescrito a mano con IF EXISTS
+npm run db:migrate
+npm run typecheck && npm run lint && npm test          # 104/104
+node ui-noplans-test.mjs                               # 5 comprobaciones en Chromium
+npx @redocly/cli lint docs/openapi.yaml
+```
+
+### Verificación completa
+- Base de desarrollo: `to_regclass('plans')` es NULL y `organizations` no
+  tiene `plan_id`. (Docker Desktop estaba apagado al empezar; se arrancó y
+  el contenedor de Postgres se recreó con la imagen fijada; los datos del
+  volumen se conservaron: tus 2 usuarios y 3 monitores siguen.)
+- `npm test`: 104/104 (integración contra `uptimepulse_test`, migrada con
+  la 0014).
+- Chromium (5/5): `GET /plans` → 404; cabecera sin "Plan:" ni enlace a
+  `/pricing`; `/pricing` redirige a `/monitors`; 6 monitores con intervalo
+  30 s creados desde el formulario; canal Discord creado sin error.
+  (Un primer fallo fue del propio script: buscaba la palabra "plan" y el
+  canal se llamaba "Discord sin plan".)
+
+### Limpieza
+Usuarios `e2e-noplan-*` y sus organizaciones borrados; monitores y canales
+vía API. Quedan tus 2 usuarios (gdev@outlook.es y gsanchezdom@proton.me)
+con sus organizaciones.
+
+### Pendiente / notas
+- Los únicos límites que quedan son técnicos: intervalo mínimo 30 s
+  (validación), rate limit de la API y cuota por host de destino.
+
+---
+
+## 2026-09-22 — Preparación para self-hosting
+
+### Objetivo
+Que cualquiera pueda instalar UptimePulse en su servidor con un
+`docker compose up`, sin reconstruir imágenes ni pelearse con CORS/TLS.
+
+### Decisiones
+Ver ADR "Self-hosting" en TASK.md: un solo origen (nginx proxy de `/api` y
+WebSocket), Caddy opcional para TLS, backup/restore con el procedimiento de
+TimescaleDB.
+
+### Qué se hizo
+- **Web:** `src/api/config.ts` (`API_BASE`/`SOCKET_URL`: `/api` y mismo
+  origen en producción, `http://localhost:3000` en Vite, `VITE_API_URL`
+  como override); `nginx.conf.template` (SPA + `/api` con reescritura de
+  prefijo y de `Path` de la cookie + `/socket.io` con Upgrade, upstream en
+  variable con `resolver`, `X-Forwarded-*`); Dockerfile sin URL incrustada
+  (`API_UPSTREAM`, `DNS_RESOLVER` por env).
+- **API:** `COOKIE_SECURE` (por defecto true en producción).
+- **Compose:** `docker-compose.prod.yml` con imágenes de GHCR
+  (`UPTIMEPULSE_VERSION`) + `build` de respaldo, API sin publicar, `web` en
+  `WEB_PORT`, servicio `caddy` (perfil `tls`, `deploy/Caddyfile`, `DOMAIN`).
+- **Scripts:** `scripts/backup.sh` y `scripts/restore.sh`.
+- **Docs:** `docs/DEPLOY.md` reescrito como guía de self-hosting, README
+  (sección propia), `.env.example`, OpenAPI (`servers: /api`), READMEs de
+  api/web, SECURITY.
+
+### Comandos ejecutados
+```bash
+docker compose -p uptimepulse-selfhost --env-file selfhost-test.env -f docker-compose.prod.yml --profile tls build
+docker compose -p uptimepulse-selfhost --env-file selfhost-test.env -f docker-compose.prod.yml --profile tls up -d
+node selfhost-smoke.mjs                 # 9 comprobaciones (https://localhost vía Caddy y http://localhost:8080)
+docker compose -p uptimepulse-selfhost restart api && curl localhost:8080/api/health
+sh backup-restore-test.sh               # backup, borrado, restore, worker sigue escribiendo
+docker compose -p uptimepulse-selfhost down -v --rmi local
+```
+
+### Verificación completa
+- Stack completo con Caddy (`DOMAIN=localhost`, CA interna): `https://localhost/api/health` ok,
+  `/api/docs` 200, SPA con fallback.
+- Chromium, en HTTPS (Caddy) y en HTTP plano (`COOKIE_SECURE=false`), 9/9:
+  registro por la UI; cookie `uptimepulse_refresh` httpOnly con
+  `Path=/api/auth`; monitor creado y "Operativo" recibido por WebSocket
+  (`wss://localhost/socket.io/` y `ws://localhost:8080/socket.io/`); tras
+  recargar la sesión sigue (`/api/auth/refresh` → 200); Swagger en
+  `/api/docs`; la API no está publicada fuera de `/api`.
+- **Bug encontrado y corregido:** tras `docker compose restart api` nginx
+  devolvía 502 (IP cacheada). Con `resolver` + variable: 200 tras reiniciar.
+- Backup/restore con datos: 3 checks y 7 usuarios → `delete from users` →
+  `restore.sh` recrea la base → 3 checks, 7 usuarios, hypertable y
+  agregado continuo presentes, el worker añade checks (5), login y
+  métricas funcionan. La primera versión de los scripts (`--clean` sobre la
+  base viva) se descartó porque el dump hace `DROP EXTENSION timescaledb`.
+
+### Limpieza
+Stack de prueba `uptimepulse-selfhost` eliminado con volúmenes e imágenes;
+copias de prueba en el directorio temporal de la sesión. El entorno de
+desarrollo (postgres/redis/mailpit + api/worker/web) sigue como estaba.
+
+### Pendiente / notas
+- Fly.io sigue documentado sin ejecutar.
+- Caddy con `DOMAIN=localhost` usa su CA interna (aviso del navegador);
+  con un dominio real emite Let's Encrypt, no probado aquí.

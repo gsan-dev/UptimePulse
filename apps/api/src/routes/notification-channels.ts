@@ -6,7 +6,6 @@ import { assertPublicHost, SsrfBlockedError } from "@uptimepulse/server-utils";
 import { sendChannelNotification, type NotificationChannelType } from "@uptimepulse/notify-channels";
 import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
 import { env } from "../env.js";
-import { getOrganizationPlanLimits } from "../lib/plans.js";
 
 // "sms" queda fuera a propósito (Fase 3.2: sin credenciales de Twilio para
 // probarlo de verdad esta sesión) y "email" no se gestiona como canal aquí
@@ -60,17 +59,6 @@ export async function notificationChannelRoutes(app: FastifyInstance): Promise<v
     }
 
     const organizationId = request.organization!.id;
-
-    // Fase 4.3: el plan decide qué tipos de canal se pueden crear. Los
-    // canales ya existentes no se tocan al cambiar de plan (solo se limita
-    // crear nuevos), así nadie pierde configuración por una rebaja.
-    const limits = await getOrganizationPlanLimits(organizationId);
-    if (!limits.allowedChannels.includes(parsed.data.type)) {
-      return reply.code(422).send({
-        error: `Tu plan "${limits.planName}" no incluye canales de tipo ${parsed.data.type} (permite: ${limits.allowedChannels.join(", ")})`,
-        limit: { kind: "allowedChannels", plan: limits.planName, allowed: limits.allowedChannels },
-      });
-    }
 
     try {
       await assertChannelUrlIsPublic(parsed.data.type, parsed.data.config);

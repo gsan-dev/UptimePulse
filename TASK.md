@@ -195,7 +195,7 @@ Con 3.1 a 3.3 cerrados, UptimePulse alerta de certificados SSL a punto de caduca
 - [x] UI: mostrar desde qué región(es) se detectó la caída. **Verificado en Chromium:** bloque "Estado por región (quórum: 2 de 2)" en el detalle, columna "Región" en últimos checks, badge ámbar "Degradado" en detalle y dashboard, toast "degradado 🟡 (caído desde us-east)" en vivo; el incidente y el email dicen "(visto desde: eu-west, us-east)".
 - **Hecho cuando:** con al menos 2 regiones simuladas, un fallo en una sola región no marca el monitor como caído si la otra región lo ve operativo. **Verificado con DOS procesos worker reales** (`WORKER_REGION=eu-west` y `us-east`, `CHECK_REGIONS=eu-west,us-east`) contra un servidor local que falla solo para la región del User-Agent (12/12): ambas OK → `up`; **us-east falla 2 veces seguidas y eu-west no → `degraded`, SIN incidente**; las dos fallan → `down` al instante pero sin incidente hasta que eu-west acumula 2 fallos → incidente "(visto desde: eu-west, us-east)"; recuperación → `up` e incidente cerrado; eventos WebSocket exactamente `up→degraded[us-east] · degraded→down · down→up` (uno por cambio consolidado, no por check); emails 🔴/🟢 en Mailpit.
 
-### 4.3 Planes de suscripción ✅ (2026-09-21, ver [DIARIO.md](DIARIO.md)) — Stripe simulado
+### 4.3 Planes de suscripción ✅ (2026-09-21) — **RETIRADO el 2026-09-22 por decisión del usuario** (ver ADR al final)
 - [x] Modelo `plans` ya creado en Fase 0; aplicar límites reales (nº monitores, intervalo mínimo, canales disponibles) al crear/editar monitores y canales. **Verificado contra la API:** en free, intervalo 60 s → 422; el 6º monitor → 422 (`limit.current=5`); canal Discord → 422 "no incluye canales de tipo discord (permite: email)"; los tres errores llevan un objeto `limit` estructurado además del mensaje. Segundo plan `pro` (50 monitores, 60 s, todos los canales, 9 €/mes) en la migración 0012.
 - [x] (diseño) Stripe real vs. simulado. **Decidido: simulado** (`POST /organizations/:id/plan`, solo admin) — ver ADR abajo. Reglas que sí se aplican aunque no haya pago: no se puede bajar a un plan cuyo límite de monitores ya se supera (409 explicando cuántos borrar); los canales existentes se conservan al bajar (solo se bloquea crear nuevos).
 - [x] Página de precios conectada a los planes reales del backend. **Verificado en Chromium:** `/pricing` sin sesión lista los planes de `GET /plans` con precio y límites; con sesión marca "Tu plan actual", muestra "usa 5 de 5 monitores" y el admin cambia de plan con el diálogo propio; la cabecera pasa de "Plan: free" a "Plan: pro".
@@ -948,3 +948,40 @@ escribe a mano y se sirve en modo estático. El riesgo es que se desvíe del
 código; lo mitiga `redocly lint` en local y que los tests de integración
 cubren las mismas rutas. Migrar a `fastify-type-provider-zod` para generar
 la especificación desde los esquemas queda en TODO.md.
+
+### 2026-09-22 — Se retiran los planes de pago y los límites de uso
+**Decisión del usuario:** UptimePulse no tiene planes ni límites. Se
+elimina todo lo de la Fase 4.3: tabla `plans` y `organizations.plan_id`
+(migración `0014_drop_plans`, con `IF EXISTS` para ser idempotente),
+`lib/plans.ts`, `routes/plans.ts` (`GET /plans`, `POST
+/organizations/:id/plan`), los 422 por máximo de monitores / intervalo
+mínimo / tipos de canal, la página `/pricing`, el enlace "Plan: …" de la
+cabecera, `PlanLimitError` (queda un `FormError` sin enlace) y el esquema
+`PlanLimitError` de la OpenAPI. `GET /organizations/:id` se conserva (rol
+y nº de monitores) en `routes/organizations.ts`. Los únicos límites que
+quedan son los de validación (intervalo ≥ 30 s, timeout 1–60 s) y los de
+protección (rate limit de la API, cuota por host de destino), que no son
+comerciales. Verificado: 104 tests, y en Chromium 6 monitores a 30 s y un
+canal Discord creados sin ningún error de plan.
+
+### 2026-09-22 — Self-hosting: un solo origen detrás de nginx
+**Decisión:** en las imágenes de producción el frontend habla con la API en
+su mismo origen (`/api`, `/socket.io`), y el nginx del contenedor `web` hace
+de proxy hacia `API_UPSTREAM`. Caddy (perfil `tls`) añade HTTPS automático.
+
+**Por qué:** la alternativa (API en otro dominio, `VITE_API_URL` incrustado
+en el build) obliga a cada instalación a reconstruir la imagen del frontend
+con su URL, a publicar dos puertos/dominios y a configurar CORS. Con un solo
+origen, la imagen de GHCR vale tal cual para cualquier dominio, y no hay
+CORS ni cookies cross-site. Detalles que hicieron falta: nginx reescribe el
+`Path=/auth` de la cookie de refresh a `/api/auth`
+(`proxy_cookie_path`); el upstream va en una variable con `resolver`
+127.0.0.11 porque nginx cachea la IP del contenedor `api` y devolvía 502
+tras reiniciarlo (visto en la prueba); `COOKIE_SECURE=false` para HTTP
+plano, si no el navegador descarta la cookie. `VITE_API_URL` sigue
+existiendo para el caso de dos dominios.
+
+**Copias de seguridad:** `pg_dump` plano y restauración recreando la base con
+`timescaledb_pre_restore`/`timescaledb_post_restore` (procedimiento oficial
+de Timescale); restaurar "encima" con `--clean` haría `DROP EXTENSION`.
+Verificado con datos: checks, hypertable y agregado continuo vuelven.

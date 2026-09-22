@@ -25,7 +25,6 @@ el worker (`npm run dev:worker`).
 | `/status-pages` | status pages públicas de la organización |
 | `/status/:username/:slug` | status page pública (sin sesión) |
 | `/team`, `/invitations/:token` | miembros, roles e invitaciones |
-| `/pricing` | planes reales del backend y cambio de plan (simulado) |
 | `/profile` | username y nombre |
 
 ## Decisiones que conviene conocer
@@ -51,7 +50,10 @@ npm run test:e2e                       # Playwright, flujo crítico (desde la ra
 
 ## Imagen Docker
 
-`docker build -f apps/web/Dockerfile --build-arg VITE_API_URL=https://api.midominio.com -t uptimepulse-web .`
-→ nginx sirviendo `dist/` con fallback a `index.html`, caché de `/assets` y
-cabeceras de seguridad (`apps/web/nginx.conf`). La URL de la API se fija en
-el build.
+`docker build -f apps/web/Dockerfile -t uptimepulse-web .` → nginx sirviendo
+`dist/` con fallback a `index.html`, caché de `/assets`, cabeceras de
+seguridad y **proxy de `/api` y `/socket.io` hacia `API_UPSTREAM`**
+(`apps/web/nginx.conf.template`, procesado con envsubst al arrancar;
+`DNS_RESOLVER` para re-resolver el upstream). Así la SPA habla con la API
+en su mismo origen (`src/api/config.ts`) y la imagen vale para cualquier
+dominio. Solo con API en otro dominio: `--build-arg VITE_API_URL=https://api…`.

@@ -33,7 +33,7 @@ test("registro → crear monitor → estado 'Operativo' en tiempo real → statu
     await page.fill("#passwordConfirm", user.password);
     await page.click('button[type="submit"]');
     await page.waitForURL("**/monitors");
-    await expect(page.getByText("Plan: free")).toBeVisible();
+    await expect(page.getByText("Equipo")).toBeVisible();
   });
 
   await test.step("crear un monitor HTTP desde el formulario", async () => {

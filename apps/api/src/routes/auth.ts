@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { eq, or, type InferSelectModel } from "drizzle-orm";
 import { z } from "zod";
-import { db, organizationMembers, organizations, plans, users } from "@uptimepulse/db";
+import { db, organizationMembers, organizations, users } from "@uptimepulse/db";
 import { getUsernameError, normalizeUsername, type PublicUser } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { hashPassword, verifyPassword } from "../lib/password.js";
@@ -54,7 +54,7 @@ function toPublicUser(user: InferSelectModel<typeof users>): PublicUser {
 function setRefreshCookie(reply: import("fastify").FastifyReply, token: string): void {
   reply.setCookie(REFRESH_COOKIE, token, {
     httpOnly: true,
-    secure: env.nodeEnv === "production",
+    secure: env.cookieSecure,
     sameSite: "strict",
     path: "/auth",
   });
@@ -89,10 +89,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const user = await db.transaction(async (tx) => {
       const [newUser] = await tx.insert(users).values({ username, fullName, email, passwordHash }).returning();
-      const freePlan = await tx.query.plans.findFirst({ where: eq(plans.name, "free") });
       const [org] = await tx
         .insert(organizations)
-        .values({ name: organizationName ?? `Organización de ${fullName}`, planId: freePlan?.id, ownerUserId: newUser.id })
+        .values({ name: organizationName ?? `Organización de ${fullName}`, ownerUserId: newUser.id })
         .returning();
       await tx.insert(organizationMembers).values({
         userId: newUser.id,

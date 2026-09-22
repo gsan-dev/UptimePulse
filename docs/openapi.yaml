@@ -12,20 +12,22 @@ info:
     - una **API key** `up_…` creada por un admin en
       `/organizations/{id}/api-keys`. Actúa en nombre de la organización con
       el rol equivalente a sus scopes (`read` → readonly, `write` → editor) y
-      nunca puede administrar la organización (`/me`, equipo, plan, claves).
+      nunca puede administrar la organización (`/me`, equipo, claves).
 
     **Organización activa.** Las rutas de datos actúan sobre la organización
     indicada en `X-Organization-Id`; sin cabecera, sobre la personal del
     usuario. Con API key la fija la clave y la cabecera se ignora.
 
     **Errores.** Siempre `{ "error": "<mensaje en español>" }`; los 400 de
-    validación pueden llevar el detalle de zod en `error`. Los 422 por límite
-    del plan añaden `limit`. Cada respuesta lleva `X-Request-Id`.
+    validación pueden llevar el detalle de zod en `error`. Cada respuesta
+    lleva `X-Request-Id`.
 
     **Rate limits.** 300 peticiones/min por IP o API key en toda la API (429);
-    login y registro 10/min; `/public/status`, `/plans`, `/invitations/{token}`
+    login y registro 10/min; `/public/status`, `/invitations/{token}`
     y `/auth/username-available` 60/min.
 servers:
+  - url: /api
+    description: Self-hosted (detrás del nginx del frontend, mismo origen)
   - url: http://localhost:3000
     description: Desarrollo local
 tags:
@@ -33,7 +35,6 @@ tags:
   - name: Auth
   - name: Organizaciones
   - name: API keys
-  - name: Planes
   - name: Monitores
   - name: Canales de notificación
   - name: Status pages
@@ -69,21 +70,6 @@ components:
         error:
           description: Mensaje legible, o el detalle de validación de zod.
           oneOf: [{ type: string }, { type: object }]
-    PlanLimitError:
-      allOf:
-        - $ref: "#/components/schemas/Error"
-        - type: object
-          properties:
-            limit:
-              type: object
-              description: Presente cuando el error lo causa un límite del plan.
-              properties:
-                kind: { type: string, enum: [maxMonitors, minInterval, allowedChannels] }
-                plan: { type: string }
-                max: { type: integer }
-                current: { type: integer }
-                minIntervalSeconds: { type: integer }
-                allowed: { type: array, items: { type: string } }
     User:
       type: object
       properties:
@@ -123,14 +109,12 @@ components:
         id: { type: string, format: uuid }
         name: { type: string }
         role: { $ref: "#/components/schemas/Role" }
-        planName: { type: string, example: free }
     OrganizationDetail:
       type: object
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         role: { $ref: "#/components/schemas/Role" }
-        plan: { $ref: "#/components/schemas/Plan" }
         usage:
           type: object
           properties:
@@ -170,15 +154,6 @@ components:
               type: string
               description: La clave completa. Solo se devuelve aquí, una vez.
               example: up_3f9a1c2b…(64 hex)
-    Plan:
-      type: object
-      properties:
-        id: { type: string, format: uuid }
-        name: { type: string, example: pro }
-        maxMonitors: { type: integer }
-        minIntervalSeconds: { type: integer }
-        allowedChannels: { type: array, items: { type: string } }
-        priceCentsMonthly: { type: integer, description: Precio mensual en céntimos. }
     MonitorType:
       type: string
       enum: [http, tcp, ping]
@@ -199,7 +174,7 @@ components:
         headers: { type: object, additionalProperties: { type: string }, description: Solo http. }
         body: { type: string, description: Solo http. }
         expectedStatus: { type: integer, minimum: 100, maximum: 599, description: "Solo http. Sin él, cualquier status < 400 es operativo." }
-        intervalSeconds: { type: integer, minimum: 30, maximum: 86400, description: Sujeto al mínimo del plan. }
+        intervalSeconds: { type: integer, minimum: 30, maximum: 86400 }
         timeoutMs: { type: integer, minimum: 1000, maximum: 60000 }
         tags: { type: array, items: { type: string } }
     Monitor:
@@ -298,7 +273,7 @@ components:
       type: object
       required: [type, name, config]
       properties:
-        type: { type: string, enum: [discord, slack, webhook], description: Sujeto a los canales que permite el plan. }
+        type: { type: string, enum: [discord, slack, webhook] }
         name: { type: string, maxLength: 100 }
         config:
           type: object
@@ -490,25 +465,12 @@ paths:
   /organizations/{id}:
     get:
       tags: [Organizaciones]
-      summary: Detalle con plan y uso
+      summary: Detalle con mi rol y nº de monitores
       security: [{ bearer: [] }]
       parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
       responses:
         "200": { description: "Detalle.", content: { application/json: { schema: { $ref: "#/components/schemas/OrganizationDetail" } } } }
         "403": { $ref: "#/components/responses/Forbidden" }
-  /organizations/{id}/plan:
-    post:
-      tags: [Planes]
-      summary: Cambiar de plan (simulado, sin pago; solo admin)
-      security: [{ bearer: [] }]
-      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
-      requestBody:
-        required: true
-        content: { application/json: { schema: { type: object, required: [planName], properties: { planName: { type: string } } } } }
-      responses:
-        "200": { description: "Plan cambiado.", content: { application/json: { schema: { $ref: "#/components/schemas/OrganizationDetail" } } } }
-        "404": { description: "Plan inexistente." }
-        "409": { description: "La organización tiene más monitores de los que permite el plan destino." }
   /organizations/{id}/members:
     get:
       tags: [Organizaciones]
@@ -647,14 +609,6 @@ paths:
         "204": { description: "Revocada." }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /plans:
-    get:
-      tags: [Planes]
-      summary: Planes disponibles (público)
-      security: []
-      responses:
-        "200": { description: "Ordenados por precio.", content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Plan" } } } } }
-
   /monitors:
     get:
       tags: [Monitores]
@@ -677,8 +631,8 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "422":
-          description: Target privado/irresoluble, o límite del plan (`limit`).
-          content: { application/json: { schema: { $ref: "#/components/schemas/PlanLimitError" } } }
+          description: Target privado/interno o que no resuelve.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
   /monitors/summary:
     get:
       tags: [Monitores]
@@ -705,7 +659,7 @@ paths:
         content: { application/json: { schema: { $ref: "#/components/schemas/MonitorInput" } } }
       responses:
         "200": { description: "Actualizado.", content: { application/json: { schema: { $ref: "#/components/schemas/Monitor" } } } }
-        "422": { description: "Target privado o límite del plan.", content: { application/json: { schema: { $ref: "#/components/schemas/PlanLimitError" } } } }
+        "422": { description: "Target privado/interno o que no resuelve.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     delete:
       tags: [Monitores]
       summary: Borrar (editor). Quita sus job schedulers en todas las regiones.
@@ -838,7 +792,7 @@ paths:
         content: { application/json: { schema: { $ref: "#/components/schemas/ChannelInput" } } }
       responses:
         "201": { description: "Creado.", content: { application/json: { schema: { $ref: "#/components/schemas/Channel" } } } }
-        "422": { description: "URL privada o tipo no permitido por el plan (`limit`).", content: { application/json: { schema: { $ref: "#/components/schemas/PlanLimitError" } } } }
+        "422": { description: "URL privada/interna.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /notification-channels/{id}:
     delete:
       tags: [Canales de notificación]

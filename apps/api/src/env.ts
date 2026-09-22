@@ -67,6 +67,10 @@ export const env = {
   authRateLimitPerMinute: Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE ?? 10),
   // Fase 5.2: si se define, /metrics exige "Authorization: Bearer <token>".
   metricsToken: process.env.METRICS_TOKEN || undefined,
+  // Cookie de refresh con el atributo Secure (solo viaja por HTTPS). Por
+  // defecto sí en producción; COOKIE_SECURE=false para un self-hosted en
+  // HTTP plano (red local, sin dominio), si no el navegador la descarta.
+  cookieSecure: process.env.COOKIE_SECURE ? process.env.COOKIE_SECURE === "true" : nodeEnv === "production",
   // Solo para desarrollo local: desactiva la comprobación anti-SSRF para
   // poder monitorizar hosts internos (ej. http://localhost:4000). Ver
   // lib/ssrf-guard.ts. Nunca debe activarse en un despliegue real.

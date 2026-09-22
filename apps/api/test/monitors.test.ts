@@ -84,38 +84,21 @@ describe("monitores", () => {
     }
   });
 
-  it("aplica los límites del plan free: intervalo mínimo y máximo de monitores, con objeto `limit`", async () => {
-    const fast = await api(app, "POST", "/monitors", {
+  it("no hay límite de monitores ni de intervalo más allá de la validación (30 s)", async () => {
+    const tooFast = await api(app, "POST", "/monitors", {
       token: user.token,
-      body: httpMonitor("rápido", { intervalSeconds: 60 }),
+      body: httpMonitor("rápido", { intervalSeconds: 10 }),
     });
-    expect(fast.status).toBe(422);
-    expect(fast.body.limit).toMatchObject({ kind: "minInterval", plan: "free" });
-
-    for (let i = 1; i <= 5; i++) {
+    expect(tooFast.status).toBe(400);
+    for (let i = 1; i <= 8; i++) {
       const res = await api(app, "POST", "/monitors", {
         token: user.token,
-        body: httpMonitor(`m${i}`),
+        body: httpMonitor(`m${i}`, { intervalSeconds: 30 }),
       });
-      expect(res.status).toBe(201);
+      expect(res.status, `monitor ${i}`).toBe(201);
     }
-    const sixth = await api(app, "POST", "/monitors", {
-      token: user.token,
-      body: httpMonitor("m6"),
-    });
-    expect(sixth.status).toBe(422);
-    expect(sixth.body.limit).toMatchObject({ kind: "maxMonitors", max: 5, current: 5 });
-
-    const upgraded = await api(app, "POST", `/organizations/${user.organizationId}/plan`, {
-      token: user.token,
-      body: { planName: "pro" },
-    });
-    expect(upgraded.status).toBe(200);
-    const sixthAgain = await api(app, "POST", "/monitors", {
-      token: user.token,
-      body: httpMonitor("m6", { intervalSeconds: 60 }),
-    });
-    expect(sixthAgain.status).toBe(201);
+    const list = await api(app, "GET", "/monitors", { token: user.token });
+    expect(list.body).toHaveLength(8);
   });
 
   it("aísla los monitores por organización y respeta el rol readonly", async () => {

@@ -7,7 +7,6 @@ export interface ApiOrganizationSummary {
   name: string;
   role: OrganizationRole;
   createdAt: string;
-  planName: string | null;
 }
 
 export interface ApiOrganizationMember {

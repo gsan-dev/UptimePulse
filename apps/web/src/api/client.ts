@@ -1,4 +1,4 @@
-const API_BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:3000";
+import { API_BASE } from "./config";
 
 export class ApiError extends Error {
   constructor(
@@ -82,7 +82,10 @@ function extractErrorMessage(data: unknown, fallback: string): string {
     if (typeof err === "string") return err;
     if (err && typeof err === "object") {
       const flat = err as { formErrors?: string[]; fieldErrors?: Record<string, string[]> };
-      const messages = [...(flat.formErrors ?? []), ...Object.values(flat.fieldErrors ?? {}).flat()];
+      const messages = [
+        ...(flat.formErrors ?? []),
+        ...Object.values(flat.fieldErrors ?? {}).flat(),
+      ];
       if (messages.length > 0) return messages.join(", ");
     }
   }
@@ -121,7 +124,11 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}): P
   const data = text ? JSON.parse(text) : undefined;
 
   if (!response.ok) {
-    throw new ApiError(extractErrorMessage(data, `Error ${response.status}`), response.status, data);
+    throw new ApiError(
+      extractErrorMessage(data, `Error ${response.status}`),
+      response.status,
+      data
+    );
   }
 
   return data as T;

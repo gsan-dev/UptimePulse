@@ -1,7 +1,6 @@
 import { io, type Socket } from "socket.io-client";
 import { getAccessToken, getActiveOrganizationId } from "./client";
-
-const SOCKET_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:3000";
+import { SOCKET_URL } from "./config";
 
 let socket: Socket | null = null;
 
@@ -18,7 +17,8 @@ export function getSocket(): Socket {
       autoConnect: false,
       // La organización activa va también en el handshake (Fase 4.1): el
       // socket entra solo en la sala de esa organización.
-      auth: (cb) => cb({ token: getAccessToken(), organizationId: getActiveOrganizationId() ?? undefined }),
+      auth: (cb) =>
+        cb({ token: getAccessToken(), organizationId: getActiveOrganizationId() ?? undefined }),
     });
   }
   return socket;

@@ -2,7 +2,7 @@
 
 Fastify 5 + Drizzle (Postgres/TimescaleDB) + BullMQ (Redis) + Socket.io.
 Es el único proceso que habla con el navegador: autentica, expone el CRUD
-de monitores/canales/status pages/equipos/planes, programa los checks en
+de monitores/canales/status pages/equipos, programa los checks en
 la cola (uno por región) y reenvía por WebSocket los cambios de estado que
 publica el worker.
 
@@ -41,8 +41,8 @@ src/
   realtime.ts           Socket.io + adaptador Redis (sala org:<id>)
   queue.ts              RegionQueues (productor de jobs)
   plugins/auth.ts       requireAuth (JWT o API key), requireOrganization, requireRole, requireUserSession
-  lib/                  api-keys, organizations (roles), plans (límites), metrics (uptime), tokens, password, telemetry
-  routes/               auth, organizations (+invitaciones), api-keys, plans, monitors, notification-channels, status-pages, public-status, docs
+  lib/                  api-keys, organizations (roles), metrics (uptime), tokens, password, telemetry
+  routes/               auth, organizations (+invitaciones), api-keys, monitors, notification-channels, status-pages, public-status, docs
 test/                   tests de integración (vitest, app.inject contra uptimepulse_test)
 ```
 
@@ -68,4 +68,7 @@ npm run test:integration       # necesita docker compose arrancado
 `docker build -f apps/api/Dockerfile -t uptimepulse-api .` (contexto = raíz).
 Ejecuta `tsx src/index.ts` como usuario `node`; las migraciones se aplican
 con `node node_modules/.bin/tsx packages/db/src/migrate.ts` (ver
-`docker-compose.prod.yml`, servicio `migrate`).
+`docker-compose.prod.yml`, servicio `migrate`). En self-hosting la API no se
+publica: se llega a ella por `/api` a través del nginx del frontend, que
+reescribe la cookie de refresh (`Path=/auth` → `/api/auth`). `COOKIE_SECURE`
+controla el atributo Secure de esa cookie.

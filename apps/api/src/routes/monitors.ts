@@ -10,15 +10,13 @@ import {
 } from "@uptimepulse/server-utils";
 import { env } from "../env.js";
 import { requireAuth, requireOrganization, requireRole } from "../plugins/auth.js";
-import { countOrganizationMonitors, getOrganizationPlanLimits } from "../lib/plans.js";
 import { getMonitorMetrics, getMonitorTimeseries, getOrganizationSummary, rangeToInterval, UPTIME_RANGES } from "../lib/metrics.js";
 import { regionQueues } from "../queue.js";
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] as const;
 
-// El intervalo por defecto (300s) coincide a propósito con el mínimo del
-// plan "free" (ver lib/plans.ts): así, si el cliente no manda intervalSeconds,
-// el valor por defecto nunca choca con el límite del plan.
+// Sin planes ni límites de uso (retirados el 2026-09-22): el único mínimo
+// de intervalo es el de validación (30 s); por defecto, 5 minutos.
 const baseFields = {
   name: z.string().min(1).max(200),
   intervalSeconds: z.number().int().min(30).max(86400).default(300),
@@ -196,24 +194,6 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
 
     const organizationId = request.organization!.id;
 
-    const limits = await getOrganizationPlanLimits(organizationId);
-    if (input.intervalSeconds < limits.minIntervalSeconds) {
-      return reply
-        .code(422)
-        .send({
-          error: `Tu plan "${limits.planName}" exige un intervalo mínimo de ${limits.minIntervalSeconds} segundos`,
-          limit: { kind: "minInterval", plan: limits.planName, minIntervalSeconds: limits.minIntervalSeconds },
-        });
-    }
-
-    const currentCount = await countOrganizationMonitors(organizationId);
-    if (currentCount >= limits.maxMonitors) {
-      return reply.code(422).send({
-        error: `Tu plan "${limits.planName}" permite un máximo de ${limits.maxMonitors} monitores`,
-        limit: { kind: "maxMonitors", plan: limits.planName, max: limits.maxMonitors, current: currentCount },
-      });
-    }
-
     try {
       await assertPublicHost(extractHostname(input.type, input.target), { allowPrivateTargets: env.allowPrivateMonitorTargets });
     } catch (error) {
@@ -307,18 +287,6 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
     const existing = await findOwnedMonitor(organizationId, id);
     if (!existing) {
       return reply.code(404).send({ error: "Monitor no encontrado" });
-    }
-
-    if (patch.intervalSeconds !== undefined) {
-      const limits = await getOrganizationPlanLimits(organizationId);
-      if (patch.intervalSeconds < limits.minIntervalSeconds) {
-        return reply
-          .code(422)
-          .send({
-          error: `Tu plan "${limits.planName}" exige un intervalo mínimo de ${limits.minIntervalSeconds} segundos`,
-          limit: { kind: "minInterval", plan: limits.planName, minIntervalSeconds: limits.minIntervalSeconds },
-        });
-      }
     }
 
     if (patch.target !== undefined) {

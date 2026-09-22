@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { ApiError } from "../api/client";
+import { API_BASE } from "../api/config";
 import {
   createApiKey,
   listApiKeys,
@@ -18,7 +19,7 @@ const inputClass =
   "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-500";
 
 // Swagger UI vive en la API, no en esta SPA.
-const DOCS_URL = `${(import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:3000"}/docs`;
+const DOCS_URL = `${API_BASE}/docs`;
 
 /**
  * API keys de la organización (Fase 5.1). Solo un administrador llega aquí
@@ -129,7 +130,7 @@ export function ApiKeysPage() {
         >
           documentación
         </a>
-        ). Una clave nunca puede gestionar el equipo, el plan ni otras claves.
+        ). Una clave nunca puede gestionar el equipo ni otras claves.
       </p>
 
       {!isAdmin && (

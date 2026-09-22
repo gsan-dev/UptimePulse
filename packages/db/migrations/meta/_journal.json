@@ -99,6 +99,13 @@
       "when": 1790025417130,
       "tag": "0013_api_keys_name_prefix_scopes",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790056778221,
+      "tag": "0014_drop_plans",
+      "breakpoints": true
     }
   ]
 }

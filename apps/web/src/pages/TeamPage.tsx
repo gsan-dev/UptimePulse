@@ -25,7 +25,7 @@ const ROLE_OPTIONS: OrganizationRole[] = ["readonly", "editor", "admin"];
 const ROLE_HELP: Record<OrganizationRole, string> = {
   readonly: "Ve monitores, incidentes y canales; no puede cambiar nada.",
   editor: "Además crea, edita y borra monitores, canales y status pages.",
-  admin: "Además gestiona miembros, invitaciones y el plan.",
+  admin: "Además gestiona miembros, invitaciones y API keys.",
 };
 
 /**

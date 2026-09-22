@@ -1,7 +1,7 @@
 // Cliente deliberadamente independiente de api/client.ts: la página pública
 // (Fase 3.3) no debe depender de nada relacionado con la sesión (access
 // token, refresh, AuthContext) — cualquier visitante sin cuenta la ve.
-const API_BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:3000";
+import { API_BASE } from "./config";
 
 export type PublicMonitorStatus = "up" | "degraded" | "down" | "paused" | "pending";
 export type DailyStatus = "operational" | "degraded" | "outage" | "no-data";
@@ -21,7 +21,10 @@ export interface PublicStatusPageData {
   monitors: PublicStatusMonitor[];
 }
 
-export async function getPublicStatusPage(username: string, slug: string): Promise<PublicStatusPageData> {
+export async function getPublicStatusPage(
+  username: string,
+  slug: string
+): Promise<PublicStatusPageData> {
   const response = await fetch(
     `${API_BASE}/public/status/${encodeURIComponent(username)}/${encodeURIComponent(slug)}`
   );

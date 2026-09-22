@@ -2,12 +2,24 @@ import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
-import { db, organizationInvitations, organizationMembers, organizations, plans, users } from "@uptimepulse/db";
+import {
+  db,
+  monitors,
+  organizationInvitations,
+  organizationMembers,
+  organizations,
+  users,
+} from "@uptimepulse/db";
 import { createMailer, organizationInvitationEmail } from "@uptimepulse/mailer";
 import { createLogger } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { getMembership, type OrganizationRole } from "../lib/organizations.js";
-import { requireAuth, requireOrganization, requireRole, requireUserSession } from "../plugins/auth.js";
+import {
+  requireAuth,
+  requireOrganization,
+  requireRole,
+  requireUserSession,
+} from "../plugins/auth.js";
 
 const logger = createLogger("api");
 
@@ -45,7 +57,12 @@ async function countAdmins(organizationId: string): Promise<number> {
   const [row] = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(organizationMembers)
-    .where(and(eq(organizationMembers.organizationId, organizationId), eq(organizationMembers.role, "admin")));
+    .where(
+      and(
+        eq(organizationMembers.organizationId, organizationId),
+        eq(organizationMembers.role, "admin")
+      )
+    );
   return row?.count ?? 0;
 }
 
@@ -66,7 +83,10 @@ async function findPendingInvitationByToken(token: string) {
  * requireOrganization sobre la cabecera — así no puede haber discrepancia
  * entre "sobre qué organización dices actuar" y "en cuál tienes permiso".
  */
-function assertRouteOrganizationMatches(request: { organization?: { id: string } }, routeId: string): boolean {
+function assertRouteOrganizationMatches(
+  request: { organization?: { id: string } },
+  routeId: string
+): boolean {
   return request.organization?.id === routeId;
 }
 
@@ -86,11 +106,9 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
         name: organizations.name,
         role: organizationMembers.role,
         createdAt: organizations.createdAt,
-        planName: plans.name,
       })
       .from(organizationMembers)
       .innerJoin(organizations, eq(organizations.id, organizationMembers.organizationId))
-      .leftJoin(plans, eq(plans.id, organizations.planId))
       .where(eq(organizationMembers.userId, request.user!.id))
       .orderBy(organizations.createdAt);
     return reply.send(rows);
@@ -99,6 +117,30 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
   // --- Todo lo de abajo actúa sobre la organización activa ---
   app.register(async (scoped) => {
     scoped.addHook("preHandler", requireOrganization);
+
+    // Detalle de la organización activa (nombre, mi rol, nº de monitores).
+    scoped.get("/organizations/:id", async (request, reply) => {
+      const params = idParamSchema.safeParse(request.params);
+      if (!params.success || !assertRouteOrganizationMatches(request, params.data.id)) {
+        return reply.code(403).send({ error: "No perteneces a esa organización" });
+      }
+      const org = await db.query.organizations.findFirst({
+        where: eq(organizations.id, params.data.id),
+      });
+      if (!org) {
+        return reply.code(404).send({ error: "Organización no encontrada" });
+      }
+      const [count] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(monitors)
+        .where(eq(monitors.organizationId, org.id));
+      return reply.send({
+        id: org.id,
+        name: org.name,
+        role: request.organization!.role,
+        usage: { monitors: count?.count ?? 0 },
+      });
+    });
 
     scoped.get("/organizations/:id/members", async (request, reply) => {
       const params = idParamSchema.safeParse(request.params);
@@ -139,9 +181,15 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
         }
         // Una organización nunca puede quedarse sin administrador: si el
         // único admin se degradara a sí mismo, nadie podría volver a
-        // gestionar miembros ni el plan.
-        if (target.role === "admin" && body.data.role !== "admin" && (await countAdmins(params.data.id)) <= 1) {
-          return reply.code(409).send({ error: "La organización necesita al menos un administrador" });
+        // gestionar miembros.
+        if (
+          target.role === "admin" &&
+          body.data.role !== "admin" &&
+          (await countAdmins(params.data.id)) <= 1
+        ) {
+          return reply
+            .code(409)
+            .send({ error: "La organización necesita al menos un administrador" });
         }
 
         await db
@@ -170,7 +218,9 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
           return reply.code(404).send({ error: "Ese usuario no es miembro de la organización" });
         }
         if (target.role === "admin" && (await countAdmins(params.data.id)) <= 1) {
-          return reply.code(409).send({ error: "La organización necesita al menos un administrador" });
+          return reply
+            .code(409)
+            .send({ error: "La organización necesita al menos un administrador" });
         }
         await db
           .delete(organizationMembers)
@@ -184,110 +234,124 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
       }
     );
 
-    scoped.get("/organizations/:id/invitations", { preHandler: requireRole("admin") }, async (request, reply) => {
-      const params = idParamSchema.safeParse(request.params);
-      if (!params.success || !assertRouteOrganizationMatches(request, params.data.id)) {
-        return reply.code(403).send({ error: "No perteneces a esa organización" });
-      }
-      const rows = await db
-        .select({
-          id: organizationInvitations.id,
-          email: organizationInvitations.email,
-          role: organizationInvitations.role,
-          expiresAt: organizationInvitations.expiresAt,
-          createdAt: organizationInvitations.createdAt,
-        })
-        .from(organizationInvitations)
-        .where(
-          and(
-            eq(organizationInvitations.organizationId, params.data.id),
-            isNull(organizationInvitations.acceptedAt),
-            gt(organizationInvitations.expiresAt, new Date())
+    scoped.get(
+      "/organizations/:id/invitations",
+      { preHandler: requireRole("admin") },
+      async (request, reply) => {
+        const params = idParamSchema.safeParse(request.params);
+        if (!params.success || !assertRouteOrganizationMatches(request, params.data.id)) {
+          return reply.code(403).send({ error: "No perteneces a esa organización" });
+        }
+        const rows = await db
+          .select({
+            id: organizationInvitations.id,
+            email: organizationInvitations.email,
+            role: organizationInvitations.role,
+            expiresAt: organizationInvitations.expiresAt,
+            createdAt: organizationInvitations.createdAt,
+          })
+          .from(organizationInvitations)
+          .where(
+            and(
+              eq(organizationInvitations.organizationId, params.data.id),
+              isNull(organizationInvitations.acceptedAt),
+              gt(organizationInvitations.expiresAt, new Date())
+            )
           )
-        )
-        .orderBy(organizationInvitations.createdAt);
-      return reply.send(rows);
-    });
-
-    scoped.post("/organizations/:id/invitations", { preHandler: requireRole("admin") }, async (request, reply) => {
-      const params = idParamSchema.safeParse(request.params);
-      if (!params.success || !assertRouteOrganizationMatches(request, params.data.id)) {
-        return reply.code(403).send({ error: "No perteneces a esa organización" });
+          .orderBy(organizationInvitations.createdAt);
+        return reply.send(rows);
       }
-      const body = createInvitationSchema.safeParse(request.body);
-      if (!body.success) {
-        return reply.code(400).send({ error: body.error.flatten() });
-      }
-      const organizationId = params.data.id;
+    );
 
-      // ¿Ya es miembro? (por email → usuario → membresía)
-      const existingUser = await db.query.users.findFirst({ where: eq(users.email, body.data.email) });
-      if (existingUser && (await getMembership(existingUser.id, organizationId))) {
-        return reply.code(409).send({ error: "Ese usuario ya es miembro de la organización" });
-      }
+    scoped.post(
+      "/organizations/:id/invitations",
+      { preHandler: requireRole("admin") },
+      async (request, reply) => {
+        const params = idParamSchema.safeParse(request.params);
+        if (!params.success || !assertRouteOrganizationMatches(request, params.data.id)) {
+          return reply.code(403).send({ error: "No perteneces a esa organización" });
+        }
+        const body = createInvitationSchema.safeParse(request.body);
+        if (!body.success) {
+          return reply.code(400).send({ error: body.error.flatten() });
+        }
+        const organizationId = params.data.id;
 
-      // Una invitación pendiente al mismo email se reemplaza (nuevo token,
-      // nueva caducidad, posiblemente nuevo rol) en vez de acumularse.
-      await db
-        .delete(organizationInvitations)
-        .where(
-          and(
-            eq(organizationInvitations.organizationId, organizationId),
-            eq(organizationInvitations.email, body.data.email),
-            isNull(organizationInvitations.acceptedAt)
-          )
-        );
+        // ¿Ya es miembro? (por email → usuario → membresía)
+        const existingUser = await db.query.users.findFirst({
+          where: eq(users.email, body.data.email),
+        });
+        if (existingUser && (await getMembership(existingUser.id, organizationId))) {
+          return reply.code(409).send({ error: "Ese usuario ya es miembro de la organización" });
+        }
 
-      const token = randomBytes(32).toString("hex");
-      const expiresAt = new Date(Date.now() + INVITATION_TTL_MS);
-      const [invitation] = await db
-        .insert(organizationInvitations)
-        .values({
-          organizationId,
-          email: body.data.email,
-          role: body.data.role,
-          tokenHash: hashToken(token),
-          invitedByUserId: request.user!.id,
-          expiresAt,
-        })
-        .returning();
+        // Una invitación pendiente al mismo email se reemplaza (nuevo token,
+        // nueva caducidad, posiblemente nuevo rol) en vez de acumularse.
+        await db
+          .delete(organizationInvitations)
+          .where(
+            and(
+              eq(organizationInvitations.organizationId, organizationId),
+              eq(organizationInvitations.email, body.data.email),
+              isNull(organizationInvitations.acceptedAt)
+            )
+          );
 
-      const [org, inviter] = await Promise.all([
-        db.query.organizations.findFirst({ where: eq(organizations.id, organizationId) }),
-        db.query.users.findFirst({ where: eq(users.id, request.user!.id) }),
-      ]);
-      const acceptUrl = `${env.appUrl}/invitations/${token}`;
-      try {
-        await mailer.sendMail({
-          to: body.data.email,
-          ...organizationInvitationEmail({
-            organizationName: org?.name ?? "tu organización",
-            invitedByName: inviter?.fullName ?? inviter?.username ?? inviter?.email ?? "Alguien",
+        const token = randomBytes(32).toString("hex");
+        const expiresAt = new Date(Date.now() + INVITATION_TTL_MS);
+        const [invitation] = await db
+          .insert(organizationInvitations)
+          .values({
+            organizationId,
+            email: body.data.email,
             role: body.data.role,
-            acceptUrl,
+            tokenHash: hashToken(token),
+            invitedByUserId: request.user!.id,
             expiresAt,
-          }),
-        });
-      } catch (error) {
-        // Si el correo no sale, la invitación no sirve de nada: se borra y
-        // se avisa, en vez de dejar una fila "fantasma" que el admin cree
-        // enviada.
-        await db.delete(organizationInvitations).where(eq(organizationInvitations.id, invitation.id));
-        logger.error("no se pudo enviar el email de invitación", {
-          organizationId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return reply.code(502).send({ error: "No se pudo enviar el email de invitación, inténtalo de nuevo" });
-      }
+          })
+          .returning();
 
-      return reply.code(201).send({
-        id: invitation.id,
-        email: invitation.email,
-        role: invitation.role,
-        expiresAt: invitation.expiresAt,
-        createdAt: invitation.createdAt,
-      });
-    });
+        const [org, inviter] = await Promise.all([
+          db.query.organizations.findFirst({ where: eq(organizations.id, organizationId) }),
+          db.query.users.findFirst({ where: eq(users.id, request.user!.id) }),
+        ]);
+        const acceptUrl = `${env.appUrl}/invitations/${token}`;
+        try {
+          await mailer.sendMail({
+            to: body.data.email,
+            ...organizationInvitationEmail({
+              organizationName: org?.name ?? "tu organización",
+              invitedByName: inviter?.fullName ?? inviter?.username ?? inviter?.email ?? "Alguien",
+              role: body.data.role,
+              acceptUrl,
+              expiresAt,
+            }),
+          });
+        } catch (error) {
+          // Si el correo no sale, la invitación no sirve de nada: se borra y
+          // se avisa, en vez de dejar una fila "fantasma" que el admin cree
+          // enviada.
+          await db
+            .delete(organizationInvitations)
+            .where(eq(organizationInvitations.id, invitation.id));
+          logger.error("no se pudo enviar el email de invitación", {
+            organizationId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return reply
+            .code(502)
+            .send({ error: "No se pudo enviar el email de invitación, inténtalo de nuevo" });
+        }
+
+        return reply.code(201).send({
+          id: invitation.id,
+          email: invitation.email,
+          role: invitation.role,
+          expiresAt: invitation.expiresAt,
+          createdAt: invitation.createdAt,
+        });
+      }
+    );
 
     scoped.delete(
       "/organizations/:id/invitations/:invitationId",
@@ -336,7 +400,9 @@ export async function invitationRoutes(app: FastifyInstance): Promise<void> {
       if (!invitation) {
         return reply.code(404).send({ error: "Invitación no válida o caducada" });
       }
-      const org = await db.query.organizations.findFirst({ where: eq(organizations.id, invitation.organizationId) });
+      const org = await db.query.organizations.findFirst({
+        where: eq(organizations.id, invitation.organizationId),
+      });
       return reply.send({
         organizationName: org?.name ?? "",
         email: invitation.email,
@@ -346,41 +412,53 @@ export async function invitationRoutes(app: FastifyInstance): Promise<void> {
     }
   );
 
-  app.post("/invitations/:token/accept", { preHandler: [requireAuth, requireUserSession] }, async (request, reply) => {
-    const params = tokenParamSchema.safeParse(request.params);
-    if (!params.success) {
-      return reply.code(404).send({ error: "Invitación no válida o caducada" });
-    }
-    const invitation = await findPendingInvitationByToken(params.data.token);
-    if (!invitation) {
-      return reply.code(404).send({ error: "Invitación no válida o caducada" });
-    }
-    if (invitation.email !== request.user!.email.toLowerCase()) {
-      return reply
-        .code(403)
-        .send({ error: `Esta invitación es para ${invitation.email}; inicia sesión con esa cuenta para aceptarla` });
-    }
-
-    const role: OrganizationRole = invitation.role;
-    await db.transaction(async (tx) => {
-      const existing = await tx.query.organizationMembers.findFirst({
-        where: and(
-          eq(organizationMembers.userId, request.user!.id),
-          eq(organizationMembers.organizationId, invitation.organizationId)
-        ),
-      });
-      if (!existing) {
-        await tx
-          .insert(organizationMembers)
-          .values({ userId: request.user!.id, organizationId: invitation.organizationId, role });
+  app.post(
+    "/invitations/:token/accept",
+    { preHandler: [requireAuth, requireUserSession] },
+    async (request, reply) => {
+      const params = tokenParamSchema.safeParse(request.params);
+      if (!params.success) {
+        return reply.code(404).send({ error: "Invitación no válida o caducada" });
       }
-      await tx
-        .update(organizationInvitations)
-        .set({ acceptedAt: new Date() })
-        .where(eq(organizationInvitations.id, invitation.id));
-    });
+      const invitation = await findPendingInvitationByToken(params.data.token);
+      if (!invitation) {
+        return reply.code(404).send({ error: "Invitación no válida o caducada" });
+      }
+      if (invitation.email !== request.user!.email.toLowerCase()) {
+        return reply
+          .code(403)
+          .send({
+            error: `Esta invitación es para ${invitation.email}; inicia sesión con esa cuenta para aceptarla`,
+          });
+      }
 
-    const org = await db.query.organizations.findFirst({ where: eq(organizations.id, invitation.organizationId) });
-    return reply.send({ organizationId: invitation.organizationId, organizationName: org?.name ?? "", role });
-  });
+      const role: OrganizationRole = invitation.role;
+      await db.transaction(async (tx) => {
+        const existing = await tx.query.organizationMembers.findFirst({
+          where: and(
+            eq(organizationMembers.userId, request.user!.id),
+            eq(organizationMembers.organizationId, invitation.organizationId)
+          ),
+        });
+        if (!existing) {
+          await tx
+            .insert(organizationMembers)
+            .values({ userId: request.user!.id, organizationId: invitation.organizationId, role });
+        }
+        await tx
+          .update(organizationInvitations)
+          .set({ acceptedAt: new Date() })
+          .where(eq(organizationInvitations.id, invitation.id));
+      });
+
+      const org = await db.query.organizations.findFirst({
+        where: eq(organizations.id, invitation.organizationId),
+      });
+      return reply.send({
+        organizationId: invitation.organizationId,
+        organizationName: org?.name ?? "",
+        role,
+      });
+    }
+  );
 }

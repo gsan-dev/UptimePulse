@@ -10,9 +10,9 @@
 
 Checks HTTP/TCP/ping desde varias regiones con quórum, incidentes, alertas
 (email, Discord, Slack, webhook firmado), SSL, status pages públicas por
-usuario, equipos con roles, API keys, planes con límites reales, métricas
+usuario, equipos con roles, API keys, métricas
 Prometheus, tests (unitarios, integración, E2E) y CI con imágenes Docker.
-Lo que no está hecho a propósito (SMS, Stripe real, OAuth…) está en
+Lo que no está hecho a propósito (SMS, OAuth…) está en
 [TODO.md](TODO.md); cada decisión, en los ADR de [TASK.md](TASK.md); cada
 paso reproducible, en [DIARIO.md](DIARIO.md).
 
@@ -22,11 +22,27 @@ paso reproducible, en [DIARIO.md](DIARIO.md).
 | --- | --- |
 | ![Dashboard](docs/screenshots/dashboard.png) | ![Detalle](docs/screenshots/monitor-detail.png) |
 
-| Status page pública (`/status/<usuario>/<slug>`) | Planes | API (`/docs`) |
-| --- | --- | --- |
-| ![Status page](docs/screenshots/status-page.png) | ![Planes](docs/screenshots/pricing.png) | ![Swagger](docs/screenshots/api-docs.png) |
+| Status page pública (`/status/<usuario>/<slug>`) | API (`/docs`) |
+| --- | --- |
+| ![Status page](docs/screenshots/status-page.png) | ![Swagger](docs/screenshots/api-docs.png) |
 
-### Arrancar en local en 5 comandos
+### Self-hosting en un servidor (Docker Compose)
+
+Un solo origen: `web` (nginx) sirve la interfaz y reenvía `/api` y el
+WebSocket a la API. Con dominio, Caddy pone HTTPS automático.
+
+```bash
+git clone https://github.com/gsan-dev/UptimePulse.git && cd UptimePulse
+cp .env.example .env     # POSTGRES_PASSWORD, JWT_* (openssl rand -hex 32), DOMAIN, APP_URL, SMTP_*
+docker compose -f docker-compose.prod.yml --profile tls up -d    # HTTPS en DOMAIN
+# o sin dominio:  docker compose -f docker-compose.prod.yml up -d  → http://IP:8080 (con COOKIE_SECURE=false)
+```
+
+Imágenes en GHCR (`ghcr.io/gsan-dev/uptimepulse/{api,worker,web}`),
+migraciones automáticas al arrancar, copias con `scripts/backup.sh` /
+`scripts/restore.sh`. Guía completa: [docs/DEPLOY.md](docs/DEPLOY.md).
+
+### Arrancar en local (desarrollo) en 5 comandos
 
 Requisitos: Node 22+, Docker con Compose v2.
 
@@ -50,7 +66,7 @@ npm run test:e2e                    # Playwright contra los procesos arrancados
 
 Más detalle por aplicación: [apps/api](apps/api/README.md),
 [apps/worker](apps/worker/README.md), [apps/web](apps/web/README.md).
-Despliegue: [docs/DEPLOY.md](docs/DEPLOY.md). Seguridad:
+Self-hosting: [docs/DEPLOY.md](docs/DEPLOY.md). Seguridad:
 [docs/SECURITY.md](docs/SECURITY.md).
 
 ---
@@ -124,7 +140,7 @@ No es un CRUD más. Obliga a diseñar y justificar decisiones de:
 
 ### 2.7 Cuentas y equipos
 - Registro/login con email y contraseña (y opcionalmente OAuth con GitHub/Google).
-- Planes con límites distintos (nº de monitores, intervalo mínimo de chequeo, canales de alerta disponibles) — aunque sea un proyecto de portfolio, modelar planes de suscripción es un buen ejercicio de diseño de producto.
+- Sin planes ni límites de uso: cualquier organización puede crear los monitores que quiera, con intervalo mínimo de 30 s y cualquier canal (decisión del 2026-09-22; el sistema de planes de la Fase 4.3 se retiró).
 - Equipos/organizaciones con roles (admin, editor, solo lectura) — funcionalidad de la fase 2.
 
 ---
@@ -212,7 +228,7 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 - Alertas: Nodemailer (Mailpit en desarrollo, cualquier SMTP en producción), Discord, Slack, webhook genérico firmado con HMAC-SHA256. SMS pendiente (sin cuenta de Twilio).
 - Observabilidad: logs JSON con request id, `prom-client` en `/metrics`, `/health` con dependencias
 - Tests: Vitest (unitarios e integración contra la base real), Playwright (E2E)
-- Infraestructura: Docker Compose en desarrollo y producción (`docker-compose.prod.yml`), GitHub Actions (lint, type-check, tests, E2E, imágenes en GHCR), guía para Fly.io
+- Infraestructura: Docker Compose en desarrollo y self-hosting (`docker-compose.prod.yml`: nginx como único origen + Caddy TLS opcional), GitHub Actions (lint, type-check, tests, E2E, imágenes en GHCR), guía para Fly.io
 
 ---
 
@@ -224,7 +240,7 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 | **Fase 1 — MVP** ✅ | Auth (JWT + refresh httpOnly), CRUD de monitores con anti-SSRF, worker HTTP/TCP, dashboard, alertas por email |
 | **Fase 2** ✅ | BullMQ, incidentes con umbral y ventanas de mantenimiento, WebSockets, métricas sobre TimescaleDB |
 | **Fase 3** ✅ | SSL, Discord/Slack/webhook firmado, status pages públicas por usuario (`/status/<usuario>/<slug>`) |
-| **Fase 4** ✅ | Equipos y roles con invitaciones, checks multi-región con quórum, planes con límites reales (Stripe simulado) |
+| **Fase 4** ✅ | Equipos y roles con invitaciones, checks multi-región con quórum. (Los planes con límites se implementaron y se retiraron después: no hay límites de uso.) |
 | **Fase 5** ✅ | Seguridad (helmet, CORS, rate limits, API keys, cuota por host, redirecciones), observabilidad, tests, CI/CD, documentación. Ping ICMP añadido. |
 
 El detalle de cada fase, con lo verificado y cómo, está en [TASK.md](TASK.md).
@@ -251,7 +267,9 @@ uptimepulse/
 ├── docs/               # openapi.yaml, SECURITY.md, DEPLOY.md, capturas
 ├── .github/workflows/  # CI
 ├── docker-compose.yml       # infraestructura de desarrollo
-├── docker-compose.prod.yml  # stack completo para un servidor
+├── docker-compose.prod.yml  # self-hosting: stack completo en un servidor
+├── deploy/Caddyfile         # TLS automático (perfil tls)
+├── scripts/                 # backup.sh / restore.sh
 ├── TASK.md · DIARIO.md · TODO.md
 └── README.md
 ```
@@ -261,6 +279,5 @@ uptimepulse/
 ## 7. Qué queda
 
 El plan original está cumplido. Lo que se dejó fuera conscientemente y la
-deuda técnica conocida están en [TODO.md](TODO.md) (SMS con Twilio, Stripe
-real, OAuth, resumen semanal, edición completa del monitor, UI de ventanas
+deuda técnica conocida están en [TODO.md](TODO.md) (SMS con Twilio, OAuth, resumen semanal, edición completa del monitor, UI de ventanas
 de mantenimiento, revocación de refresh tokens, entre otros).

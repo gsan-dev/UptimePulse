@@ -1,11 +1,15 @@
-# Stack completo para un despliegue en un solo servidor (Fase 5.4):
-#   cp .env.example .env   # y rellena secretos reales (ver docs/DEPLOY.md)
-#   docker compose -f docker-compose.prod.yml up -d --build
+# UptimePulse self-hosted: todo el stack en un servidor (Fase 5.4).
 #
-# A diferencia de docker-compose.yml (solo la infraestructura para
-# desarrollar), aquí también se construyen y arrancan la API, el worker y el
-# frontend. Las migraciones las aplica el servicio "migrate" antes de que
-# arranque la API. Sin Mailpit: en producción SMTP_* apunta a un proveedor real.
+#   cp .env.example .env      # rellena POSTGRES_PASSWORD, JWT_*, APP_URL, SMTP_*
+#   docker compose -f docker-compose.prod.yml up -d              # HTTP en WEB_PORT (8080)
+#   docker compose -f docker-compose.prod.yml --profile tls up -d   # + Caddy con HTTPS automático en DOMAIN
+#
+# Por defecto usa las imágenes publicadas en GHCR (UPTIMEPULSE_VERSION, "latest"
+# si no se indica); `--build` las construye desde este repositorio.
+# Un solo origen: nginx (servicio "web") sirve la SPA y reenvía /api y
+# /socket.io a la API, así que solo se publica un puerto y no hace falta CORS.
+# Las migraciones las aplica el servicio "migrate" antes de que arranque la
+# API. Sin Mailpit: SMTP_* debe apuntar a un proveedor real.
 services:
   postgres:
     image: timescale/timescaledb:2.30.1-pg16
@@ -35,6 +39,7 @@ services:
       retries: 10
 
   migrate:
+    image: ghcr.io/gsan-dev/uptimepulse/api:${UPTIMEPULSE_VERSION:-latest}
     build:
       context: .
       dockerfile: apps/api/Dockerfile
@@ -48,12 +53,14 @@ services:
     restart: "no"
 
   api:
+    image: ghcr.io/gsan-dev/uptimepulse/api:${UPTIMEPULSE_VERSION:-latest}
     build:
       context: .
       dockerfile: apps/api/Dockerfile
     restart: unless-stopped
-    ports:
-      - "${API_PORT:-3000}:3000"
+    # No se publica: se llega a la API a través de "web" (/api). Para
+    # exponerla directamente añade ports: ["3000:3000"] en un override.
+    expose: ["3000"]
     environment:
       NODE_ENV: production
       PORT: 3000
@@ -63,6 +70,7 @@ services:
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?Define JWT_REFRESH_SECRET en .env}
       APP_URL: ${APP_URL:-http://localhost:8080}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
       API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-300}
       AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-10}
       CHECK_REGIONS: ${CHECK_REGIONS:-local}
@@ -80,6 +88,7 @@ services:
         condition: service_healthy
 
   worker:
+    image: ghcr.io/gsan-dev/uptimepulse/worker:${UPTIMEPULSE_VERSION:-latest}
     build:
       context: .
       dockerfile: apps/worker/Dockerfile
@@ -108,18 +117,39 @@ services:
         condition: service_healthy
 
   web:
+    image: ghcr.io/gsan-dev/uptimepulse/web:${UPTIMEPULSE_VERSION:-latest}
     build:
       context: .
       dockerfile: apps/web/Dockerfile
-      args:
-        # URL pública de la API tal y como la ve el navegador.
-        VITE_API_URL: ${PUBLIC_API_URL:-http://localhost:3000}
     restart: unless-stopped
+    environment:
+      API_UPSTREAM: api:3000
     ports:
       - "${WEB_PORT:-8080}:80"
     depends_on:
       - api
 
+  # HTTPS automático (Let's Encrypt) delante de "web". Solo con
+  # `--profile tls`; necesita DOMAIN apuntando a este servidor y los puertos
+  # 80/443 libres. Sin este servicio, pon tu propio proxy TLS delante de WEB_PORT.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:

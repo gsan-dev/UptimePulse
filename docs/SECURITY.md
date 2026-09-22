@@ -10,7 +10,9 @@ quedan documentadas, no olvidos.
       devuelven ni se registran en logs.
 - [x] Access token JWT de 15 min en memoria del navegador; refresh token de
       7 días en cookie `httpOnly` + `SameSite=Strict` con `Path=/auth`
-      (`routes/auth.ts`). Secretos distintos para cada uno.
+      (`routes/auth.ts`). Secretos distintos para cada uno. Atributo `Secure`
+      por defecto en producción (`COOKIE_SECURE`; `false` solo para self-hosting
+      en HTTP plano).
 - [x] En producción la API **no arranca** con secretos de ejemplo
       (`changeme…`) ni de menos de 32 caracteres (`env.ts`, función
       `secret()`). Comprobado: `NODE_ENV=production
@@ -27,7 +29,7 @@ quedan documentadas, no olvidos.
 - [x] Formato `up_<64 hex>`; en la base de datos solo el sha256
       (`lib/api-keys.ts`); la clave completa se muestra una sola vez.
 - [x] Scopes `read`/`write` → rol `readonly`/`editor`. Nunca `admin`: una
-      clave no puede gestionar miembros, plan, invitaciones ni otras claves
+      clave no puede gestionar miembros, invitaciones ni otras claves
       (`requireUserSession` en `plugins/auth.ts`).
 - [x] Revocación inmediata (DELETE borra la fila; la siguiente petición da 401).
 - [x] La organización la fija la clave; `X-Organization-Id` se ignora.
@@ -66,15 +68,13 @@ quedan documentadas, no olvidos.
 - [x] Rate limit global de la API: 300/min por IP o por API key
       (`API_RATE_LIMIT_PER_MINUTE`), contadores en Redis (válido con varias
       instancias). Rutas públicas con límites propios más estrictos
-      (`/public/status`, `/plans`, `/invitations/:token`,
+      (`/public/status`, `/invitations/:token`,
       `/auth/username-available`).
 - [x] Cuota de checks salientes por host de destino: 60/min sumando todos
       los monitores, usuarios y regiones (`CHECK_MAX_PER_HOST_PER_MINUTE`,
       `apps/worker/src/lib/host-rate-limit.ts`). Por encima, el check se
       salta y se cuenta en `uptimepulse_checks_rate_limited_total`.
       Comprobado con cuota 3: de 6 checks encolados se ejecutaron 3.
-- [x] Límites por plan (nº de monitores, intervalo mínimo, canales) aplicados
-      en la API, no solo en la UI (Fase 4.3).
 - [x] `trustProxy` solo en producción (detrás de un proxy la IP real viene
       en `X-Forwarded-For`; en local confiar en ella permitiría falsearla).
 - [ ] Sin límite de tamaño explícito para `headers`/`body` de un monitor
@@ -114,8 +114,8 @@ quedan documentadas, no olvidos.
 
 ```bash
 # Cabeceras y CORS
-curl -sI http://localhost:3000/plans | grep -iE "x-frame|x-content|strict-transport|x-request-id"
-curl -sI -H "Origin: https://evil.example" http://localhost:3000/plans | grep -i access-control
+curl -sI http://localhost:3000/health | grep -iE "x-frame|x-content|strict-transport|x-request-id"
+curl -sI -H "Origin: https://evil.example" http://localhost:3000/health | grep -i access-control
 # Rate limit de login: el 11º da 429
 for i in $(seq 11); do curl -s -o /dev/null -w "%{http_code} " -X POST -H "Content-Type: application/json" \
   -d '{"identifier":"x@example.com","password":"x"}' http://localhost:3000/auth/login; done

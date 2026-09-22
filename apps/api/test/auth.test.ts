@@ -37,7 +37,7 @@ describe("autenticación", () => {
 
     const orgs = await api(app, "GET", "/organizations", { token: res.body.accessToken });
     expect(orgs.body).toHaveLength(1);
-    expect(orgs.body[0]).toMatchObject({ role: "admin", planName: "free" });
+    expect(orgs.body[0]).toMatchObject({ role: "admin" });
   });
 
   it("rechaza usernames reservados o inválidos y duplicados de email/username", async () => {
@@ -129,11 +129,11 @@ describe("autenticación", () => {
   });
 
   it("devuelve X-Request-Id y respeta el que manda el cliente", async () => {
-    const res = await api(app, "GET", "/plans", {
+    const res = await api(app, "GET", "/health", {
       headers: { "x-request-id": "peticion-de-prueba-1" },
     });
     expect(res.headers["x-request-id"]).toBe("peticion-de-prueba-1");
-    const generated = await api(app, "GET", "/plans");
+    const generated = await api(app, "GET", "/health");
     expect(String(generated.headers["x-request-id"])).toMatch(/^[0-9a-f-]{36}$/);
   });
 });

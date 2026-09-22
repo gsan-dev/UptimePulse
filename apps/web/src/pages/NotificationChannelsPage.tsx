@@ -9,7 +9,7 @@ import {
   type NotificationChannelType,
   type TestChannelResult,
 } from "../api/channels";
-import { FormError } from "../components/PlanLimitError";
+import { FormError } from "../components/FormError";
 import { useConfirm } from "../context/ConfirmContext";
 import { useOrganization } from "../context/OrganizationContext";
 import type { ApiNotificationChannel } from "../api/types";

@@ -9,18 +9,15 @@
 
 - [ ] **SMS vía Twilio** (Fase 3.2, README §2.4). Pospuesto por decisión
       explícita: no hay cuenta de Twilio para verificarlo de verdad. El enum
-      `channel_type` ya tiene `sms`, el plan `pro` ya lo lista como permitido,
-      pero ni la API ni la UI permiten crear ese canal ni el worker sabe
-      enviarlo. Al retomarlo: `packages/notify-channels/src/sms.ts`, zod en
+      `channel_type` ya tiene `sms`, pero ni la API ni la UI permiten crear
+      ese canal ni el worker sabe enviarlo. Al retomarlo: `packages/notify-channels/src/sms.ts`, zod en
       `routes/notification-channels.ts`, opción en `NotificationChannelsPage`.
 - [x] ~~**Checks de tipo `ping` (ICMP)**~~ Hecho el 2026-09-21 invocando el
       `ping` del sistema (ADR en TASK.md). Verificado en Windows y, en 5.4,
       en Linux (contenedor Alpine con `iputils-ping`, usuario `node`).
       macOS sigue sin probar.
-- [ ] **Stripe real** (Fase 4.3, README §2.7). El cambio de plan es simulado
-      (`POST /organizations/:id/plan`). Los pasos concretos para integrar
-      Checkout + webhook están en el ADR "Fase 4.3" de TASK.md. Necesita
-      claves de test.
+- [x] ~~**Stripe real**~~ Ya no aplica: los planes de pago y los límites de
+      uso se retiraron el 2026-09-22 (tabla `plans` eliminada en la migración 0014).
 - [ ] **OAuth con GitHub/Google** (Fase 1.1, README §2.7). Las columnas
       `oauth_provider`/`oauth_id` existen desde la Fase 0.3; no hay flujo.
 - [ ] **Resumen semanal por email** (Fase 1.5, README §2.4). No existe; es un
@@ -86,7 +83,7 @@
       los fallos anteriores a la ventana siguen contando para el umbral al
       terminar (la racha no se reinicia).
 - [ ] **Sin paginación en `GET /monitors` ni en checks/incidentes** (Fase 1.2).
-      Con el plan `pro` (50 monitores) y multi-región empieza a importar.
+      Sin límite de monitores por organización, empieza a importar.
 - [ ] **Sin límite de tamaño para `headers`/`body` de un monitor** (Fase 1.2).
 - [ ] **Concurrencia del worker solo por instancia** (Fase 2.1):
       `WORKER_CONCURRENCY` no limita el total del sistema.
@@ -144,7 +141,7 @@
       `fastify-type-provider-zod` + `@fastify/swagger` dinámico.
 - [ ] **Sin cobertura de tests** (5.3): añadir `@vitest/coverage-v8` y un
       umbral en CI.
-- [ ] **E2E de un solo flujo** (5.3): equipos, planes, canales y
+- [ ] **E2E de un solo flujo** (5.3): equipos, canales y
       multi-región solo tienen tests de API/integración; el escenario de
       quórum con dos workers reales (`multiregion-test.mjs`, Fase 4.2)
       sigue sin suite permanente.
@@ -159,8 +156,7 @@
 ## 6. Datos y estado actual del entorno
 
 - La base de datos se vació por completo el 2026-09-21 a petición del
-  usuario (0 usuarios/organizaciones/monitores); solo quedan los planes
-  `free` y `pro` y las migraciones 0000–0012 aplicadas.
+  usuario; la tabla `plans` desapareció el 2026-09-22 (migración 0014).
 - Toda la Fase 5 (más los checks `ping`) está **sin commit** desde el
   último commit del usuario (`Teams & Roles - MultiRegion QUÓRUM - PRICING`).
 - Existe la base `uptimepulse_test` (la crean los tests de integración).

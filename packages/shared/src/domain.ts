@@ -22,7 +22,6 @@ import type {
   notificationChannels,
   orgRoleEnum,
   organizations,
-  plans,
   statusPages,
   users,
 } from "@uptimepulse/db";
@@ -47,7 +46,6 @@ export type Incident = InferSelectModel<typeof incidents>;
 export type NotificationChannel = InferSelectModel<typeof notificationChannels>;
 export type MaintenanceWindow = InferSelectModel<typeof maintenanceWindows>;
 export type StatusPage = InferSelectModel<typeof statusPages>;
-export type Plan = InferSelectModel<typeof plans>;
 export type Organization = InferSelectModel<typeof organizations>;
 
 // Los usuarios sí necesitan una versión "recortada": el frontend nunca debe

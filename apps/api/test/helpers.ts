@@ -13,7 +13,7 @@ export async function createTestApp(): Promise<FastifyInstance> {
   return app;
 }
 
-/** Deja la base de test vacía (menos `plans`, que es semilla de las migraciones). */
+/** Deja la base de test vacía. */
 export async function truncateAll(): Promise<void> {
   await db.execute(sql`truncate table users, organizations restart identity cascade`);
 }

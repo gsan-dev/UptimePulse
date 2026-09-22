@@ -30,23 +30,11 @@ export const channelTypeEnum = pgEnum("channel_type", [
   "discord",
 ]);
 
-// --- Planes y organizaciones ---
-
-export const plans = pgTable("plans", {
-  id: uuid("id").defaultRandom().primaryKey(),
-  name: text("name").notNull().unique(),
-  maxMonitors: integer("max_monitors").notNull(),
-  minIntervalSeconds: integer("min_interval_seconds").notNull(),
-  allowedChannels: jsonb("allowed_channels").notNull().$type<string[]>(),
-  // Fase 4.3: para la página de precios. En céntimos para no usar
-  // decimales; 0 = gratis. El orden de la página es por precio.
-  priceCentsMonthly: integer("price_cents_monthly").notNull().default(0),
-});
+// --- Organizaciones ---
 
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
-  planId: uuid("plan_id").references(() => plans.id),
   // Quién la creó (Fase 4.1). La organización "personal" de un usuario es la
   // que se creó en su registro; con equipos ya no vale "la más antigua de
   // las que es miembro" (puede unirse a una más antigua que la suya), así

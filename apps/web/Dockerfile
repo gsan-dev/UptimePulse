@@ -1,8 +1,10 @@
 # Imagen del frontend (Fase 5.4). Contexto de build = raíz del repositorio:
-#   docker build -f apps/web/Dockerfile --build-arg VITE_API_URL=https://api.midominio.com -t uptimepulse-web .
+#   docker build -f apps/web/Dockerfile -t uptimepulse-web .
 #
-# Vite incrusta VITE_API_URL en el bundle en tiempo de build: la URL pública
-# de la API es un argumento de build, no una variable en tiempo de ejecución.
+# Por defecto la SPA habla con la API en su MISMO origen (/api y /socket.io,
+# que nginx reenvía a API_UPSTREAM): la misma imagen sirve para cualquier
+# dominio. Solo si API y frontend van en dominios distintos hace falta
+# reconstruir con --build-arg VITE_API_URL=https://api.midominio.com.
 
 FROM node:22-alpine AS build
 WORKDIR /app
@@ -20,12 +22,15 @@ RUN npm ci --workspace=apps/web --include-workspace-root=false --ignore-scripts
 COPY tsconfig.base.json ./
 COPY packages ./packages
 COPY apps/web ./apps/web
-ARG VITE_API_URL=http://localhost:3000
+ARG VITE_API_URL=
 ENV VITE_API_URL=$VITE_API_URL
 RUN npm run build --workspace=apps/web
 
 FROM nginx:1.27-alpine
-COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
+# La imagen de nginx procesa /etc/nginx/templates/*.template con envsubst
+# al arrancar; solo se sustituyen API_UPSTREAM y DNS_RESOLVER (las $variables de nginx quedan).
+ENV API_UPSTREAM=api:3000 DNS_RESOLVER=127.0.0.11 NGINX_ENVSUBST_FILTER=^(API_UPSTREAM|DNS_RESOLVER)$
+COPY apps/web/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/apps/web/dist /usr/share/nginx/html
 EXPOSE 80
 HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://127.0.0.1/ >/dev/null || exit 1

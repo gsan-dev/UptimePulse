@@ -47,13 +47,6 @@ export function OrganizationSwitcher() {
           API keys
         </Link>
       )}
-      <Link
-        to="/pricing"
-        className="text-gray-400 hover:text-emerald-400"
-        title="Ver planes y límites"
-      >
-        Plan: {active.planName ?? "—"}
-      </Link>
     </div>
   );
 }
