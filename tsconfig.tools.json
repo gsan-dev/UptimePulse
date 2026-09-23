@@ -4,5 +4,12 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["test", "e2e", "vitest.config.ts", "playwright.config.ts"]
+  "include": [
+    "test",
+    "e2e",
+    "e2e-docker",
+    "vitest.config.ts",
+    "playwright.config.ts",
+    "playwright.docker.config.ts"
+  ]
 }

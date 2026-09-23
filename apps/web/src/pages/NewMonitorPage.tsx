@@ -1,46 +1,48 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError } from "../api/client";
-import { createMonitor } from "../api/monitors";
+import { createMonitor, listMonitors } from "../api/monitors";
 import { FormError } from "../components/FormError";
-import type { MonitorType } from "../api/types";
-
-const inputClass =
-  "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-500";
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label className="block space-y-1">
-      <span className="text-sm text-gray-400">{label}</span>
-      {children}
-    </label>
-  );
-}
+import {
+  commitPendingTag,
+  emptyMonitorForm,
+  MonitorFormFields,
+  toCreateInput,
+  type MonitorFormValues,
+} from "../components/MonitorFormFields";
+import { collectTags } from "../lib/tags";
 
 export function NewMonitorPage() {
   const navigate = useNavigate();
-  const [name, setName] = useState("");
-  const [type, setType] = useState<MonitorType>("http");
-  const [target, setTarget] = useState("");
-  const [intervalSeconds, setIntervalSeconds] = useState(300);
-  const [timeoutMs, setTimeoutMs] = useState(5000);
-  const [expectedStatus, setExpectedStatus] = useState("");
+  const [values, setValues] = useState<MonitorFormValues>(emptyMonitorForm);
+  const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
   const [error, setError] = useState<ApiError | string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Las etiquetas que ya existen en la organización se ofrecen como
+  // sugerencias: sin esto es demasiado fácil acabar con "produccion",
+  // "producción" y "prod" como tres grupos distintos. Si falla, el campo
+  // sigue funcionando a mano.
+  useEffect(() => {
+    let cancelled = false;
+    void listMonitors()
+      .then((monitors) => {
+        if (!cancelled) setTagSuggestions(collectTags(monitors));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function handleSubmit(event: FormEvent): Promise<void> {
     event.preventDefault();
     setError(null);
     setIsSubmitting(true);
+    const submitted = commitPendingTag(values);
+    setValues(submitted);
     try {
-      await createMonitor({
-        name,
-        type,
-        target,
-        intervalSeconds,
-        timeoutMs,
-        expectedStatus: type === "http" && expectedStatus ? Number(expectedStatus) : undefined,
-      });
+      await createMonitor(toCreateInput(submitted));
       navigate("/monitors");
     } catch (err) {
       setError(err instanceof ApiError ? err : "No se pudo crear el monitor");
@@ -58,75 +60,7 @@ export function NewMonitorPage() {
       >
         <FormError error={error} />
 
-        <Field label="Nombre">
-          <input
-            required
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className={inputClass}
-          />
-        </Field>
-
-        <Field label="Tipo">
-          <select
-            value={type}
-            onChange={(e) => setType(e.target.value as MonitorType)}
-            className={inputClass}
-          >
-            <option value="http">HTTP</option>
-            <option value="tcp">TCP</option>
-            <option value="ping">Ping (ICMP)</option>
-          </select>
-        </Field>
-
-        <Field label={type === "tcp" ? "Host:puerto" : type === "ping" ? "Host o IP" : "URL"}>
-          <input
-            required
-            value={target}
-            onChange={(e) => setTarget(e.target.value)}
-            placeholder={
-              type === "http"
-                ? "https://ejemplo.com"
-                : type === "tcp"
-                  ? "ejemplo.com:443"
-                  : "ejemplo.com"
-            }
-            className={inputClass}
-          />
-        </Field>
-
-        {type === "http" && (
-          <Field label="Status HTTP esperado (opcional; si no se indica, cualquier status < 400 cuenta como operativo)">
-            <input
-              value={expectedStatus}
-              onChange={(e) => setExpectedStatus(e.target.value)}
-              placeholder="200"
-              className={inputClass}
-            />
-          </Field>
-        )}
-
-        <Field label="Intervalo en segundos (mínimo 30)">
-          <input
-            type="number"
-            min={30}
-            required
-            value={intervalSeconds}
-            onChange={(e) => setIntervalSeconds(Number(e.target.value))}
-            className={inputClass}
-          />
-        </Field>
-
-        <Field label="Timeout en milisegundos">
-          <input
-            type="number"
-            min={1000}
-            required
-            value={timeoutMs}
-            onChange={(e) => setTimeoutMs(Number(e.target.value))}
-            className={inputClass}
-          />
-        </Field>
+        <MonitorFormFields values={values} onChange={setValues} tagSuggestions={tagSuggestions} />
 
         <button
           type="submit"

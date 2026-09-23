@@ -7,8 +7,10 @@ info:
     (Swagger UI) desde la propia API.
 
     **Autenticación.** Dos formas, ambas por `Authorization: Bearer …`:
-    - un *access token* JWT de 15 min (de `/auth/register`, `/auth/login` o
-      `/auth/refresh`; el refresh token viaja en una cookie httpOnly);
+    - un *access token* JWT de 5 min (de `/auth/register`, `/auth/login` o
+      `/auth/refresh`; el refresh token viaja en una cookie httpOnly y caduca
+      a los `SESSION_IDLE_TIMEOUT_MINUTES` de inactividad, 15 por defecto,
+      renovándose en cada refresh);
     - una **API key** `up_…` creada por un admin en
       `/organizations/{id}/api-keys`. Actúa en nombre de la organización con
       el rol equivalente a sus scopes (`read` → readonly, `write` → editor) y
@@ -61,7 +63,13 @@ components:
     range:
       name: range
       in: query
-      schema: { type: string, enum: [24h, 7d, 30d, 90d], default: 24h }
+      schema: { type: string, enum: [24h, 7d, 30d, 90d, all], default: 24h }
+      description: |
+        `all` = histórico total, sin ventana. El uptime % lo cubre entero
+        (`checks_hourly` no caduca); el tiempo de respuesta medio y la serie
+        temporal llegan hasta donde alcance la retención de checks en crudo
+        (90 días). Con `all`, `/timeseries` devuelve un punto por día en vez
+        de por hora.
   schemas:
     Error:
       type: object
@@ -82,7 +90,16 @@ components:
       type: object
       properties:
         user: { $ref: "#/components/schemas/User" }
-        accessToken: { type: string, description: JWT de 15 minutos. }
+        accessToken: { type: string, description: JWT de 5 minutos. }
+        sessionIdleMinutes:
+          type: integer
+          description: |
+            Minutos de inactividad tras los que caduca la sesión
+            (`SESSION_IDLE_TIMEOUT_MINUTES`, 15 por defecto). Es la caducidad
+            del refresh token, y cada `/auth/refresh` emite uno nuevo con la
+            cuenta a cero: usar la aplicación prorroga la sesión, dejar de
+            usarla la cierra. La cookie no lleva `Max-Age`, así que cerrar el
+            navegador también la borra.
     RegisterInput:
       type: object
       required: [username, fullName, email, password]
@@ -108,12 +125,23 @@ components:
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        slug: { $ref: "#/components/schemas/OrganizationSlug" }
         role: { $ref: "#/components/schemas/Role" }
+    OrganizationSlug:
+      type: string
+      nullable: true
+      pattern: "^[a-z0-9-]+$"
+      maxLength: 60
+      description: |
+        Identificador público de la organización: hace que sus status pages
+        sean alcanzables en `/status/team/<slug>/<page-slug>`. Único entre
+        todas las organizaciones. null = sin URL pública propia.
     OrganizationDetail:
       type: object
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        slug: { $ref: "#/components/schemas/OrganizationSlug" }
         role: { $ref: "#/components/schemas/Role" }
         usage:
           type: object
@@ -293,7 +321,28 @@ components:
         slug: { type: string, pattern: "^[a-z0-9-]+$", maxLength: 60, description: Único dentro de la organización. }
         title: { type: string, maxLength: 200 }
         isPublic: { type: boolean, default: true }
-        monitorIds: { type: array, items: { type: string, format: uuid } }
+        monitorIds:
+          type: array
+          items: { type: string, format: uuid }
+          description: |
+            Forma antigua, sin nombre público. Si se manda `monitors`, este
+            campo se ignora.
+        monitors:
+          type: array
+          description: Monitores de la página, con su nombre público opcional.
+          items: { $ref: "#/components/schemas/StatusPageMonitor" }
+    StatusPageMonitor:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, format: uuid }
+        displayName:
+          type: string
+          nullable: true
+          maxLength: 200
+          description: |
+            Nombre con el que se enseña el monitor en la página pública.
+            null o ausente = se usa el nombre del monitor.
     StatusPage:
       type: object
       properties:
@@ -301,7 +350,14 @@ components:
         slug: { type: string }
         title: { type: string }
         isPublic: { type: boolean }
-        monitorIds: { type: array, items: { type: string, format: uuid } }
+        monitorIds:
+          type: array
+          items: { type: string, format: uuid }
+          description: Solo en POST/PATCH/GET de una página concreta, no en el listado.
+        monitors:
+          type: array
+          items: { $ref: "#/components/schemas/StatusPageMonitor" }
+          description: Solo en POST/PATCH/GET de una página concreta, no en el listado.
         createdAt: { type: string, format: date-time }
     PublicStatus:
       type: object
@@ -471,6 +527,26 @@ paths:
       responses:
         "200": { description: "Detalle.", content: { application/json: { schema: { $ref: "#/components/schemas/OrganizationDetail" } } } }
         "403": { $ref: "#/components/responses/Forbidden" }
+    patch:
+      tags: [Organizaciones]
+      summary: Renombrar la organización o cambiar su identificador público
+      description: Requiere rol admin.
+      security: [{ bearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/id" }, { $ref: "#/components/parameters/organizationHeader" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 100 }
+                slug: { $ref: "#/components/schemas/OrganizationSlug" }
+      responses:
+        "200": { description: "Actualizada.", content: { application/json: { schema: { $ref: "#/components/schemas/Organization" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: "Ese identificador público ya está en uso." }
   /organizations/{id}/members:
     get:
       tags: [Organizaciones]
@@ -855,6 +931,25 @@ paths:
       responses:
         "204": { description: "Borrada." }
 
+  /public/status/team/{orgSlug}/{slug}:
+    get:
+      tags: [Público]
+      summary: Status page pública de una organización (sin sesión)
+      security: []
+      description: |
+        Misma respuesta que `/public/status/{username}/{slug}`, pero
+        resolviendo por el identificador público de la ORGANIZACIÓN
+        (`organizations.slug`) en vez de por el username de una persona. Es la
+        única forma de que una organización de equipo tenga URL propia: la
+        ruta por username siempre resuelve a la organización personal de ese
+        usuario. 404 idéntico si la organización o el slug no existen.
+      parameters:
+        - { name: orgSlug, in: path, required: true, schema: { type: string } }
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Estado.", content: { application/json: { schema: { $ref: "#/components/schemas/PublicStatus" } } } }
+        "404": { description: "Página no encontrada." }
+        "429": { $ref: "#/components/responses/TooMany" }
   /public/status/{username}/{slug}:
     get:
       tags: [Público]

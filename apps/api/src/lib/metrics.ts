@@ -1,14 +1,21 @@
 import { sql } from "drizzle-orm";
 import { db } from "@uptimepulse/db";
 
-export const UPTIME_RANGES = ["24h", "7d", "30d", "90d"] as const;
+export const UPTIME_RANGES = ["24h", "7d", "30d", "90d", "all"] as const;
 export type UptimeRange = (typeof UPTIME_RANGES)[number];
 
+// "all" = histórico total (README §2.3). No hay un caso especial en las
+// consultas: es un intervalo tan largo que `now() - interval` cae siempre
+// antes de que existiera el monitor, así que la misma SQL sirve para los
+// cinco rangos. En la práctica el techo real lo pone la retención de 90 días
+// de la hypertable `checks`; `checks_hourly` (el agregado sobre el que se
+// calculan uptime y gráficos) no la tiene, así que "all" sí ve más atrás.
 const RANGE_TO_INTERVAL: Record<UptimeRange, string> = {
   "24h": "24 hours",
   "7d": "7 days",
   "30d": "30 days",
   "90d": "90 days",
+  all: "100 years",
 };
 
 // Reutilizado por la ruta de incidentes (filtrar por rango, Fase 2.4) para no
@@ -61,8 +68,10 @@ export async function getMonitorMetrics(monitorId: string, range: UptimeRange): 
   // ponderarlo por `total_checks` daba una media incorrecta en cuanto el
   // rango cruzaba varios buckets (lo destapó el test de integración de la
   // Fase 5.3: 7 up de 100–160 ms y 3 down → 104 en vez de 130). Es un
-  // recorrido de índice (monitor_id, timestamp) acotado por la retención
-  // de 90 días de la hypertable, que coincide con el rango máximo.
+  // recorrido de índice (monitor_id, timestamp) acotado en la práctica por
+  // la retención de 90 días de la hypertable — también con range="all", que
+  // por eso promedia sobre los últimos 90 días aunque el uptime % de al lado
+  // sí cubra todo el histórico (`checks_hourly` no caduca).
   const [responseTime] = (
     await db.execute(sql`
       SELECT avg(response_time_ms)::int AS avg_response_time_ms
@@ -124,33 +133,60 @@ export interface TimeseriesPoint {
 export async function getMonitorTimeseries(monitorId: string, range: UptimeRange): Promise<TimeseriesPoint[]> {
   const interval = RANGE_TO_INTERVAL[range];
 
-  // `count(*)` (usado por la vista) llega como bigint y `avg(...)` como
-  // numeric — el driver de pg devuelve ambos como *string* en JS para no
-  // perder precisión, no como number. Hay que castear explícitamente (igual
-  // que ya hace getMonitorMetrics) o el contrato de la API mentiría sobre su
-  // propio tipo.
-  const result = await db.execute(sql`
-    SELECT
-      bucket,
-      total_checks::int AS total_checks,
-      up_checks::int AS up_checks,
-      down_checks::int AS down_checks,
-      round(avg_response_time_ms)::int AS avg_response_time_ms
-    FROM checks_hourly
-    WHERE monitor_id = ${monitorId} AND bucket >= now() - ${interval}::interval
-    ORDER BY bucket ASC
-  `);
+  // Un punto por hora sirve hasta 90 días (2160 puntos); "all" no tiene
+  // techo, así que ahí se reagrupa por día — si no, un monitor de dos años
+  // devolvería ~17.500 puntos para dibujar un gráfico de 600 píxeles. La
+  // media ponderada por bucket (`sum(x*n)/sum(n)`) es necesaria: promediar
+  // las medias horarias a secas daría el mismo peso a una hora con 2 checks
+  // que a una con 60.
+  const result = await db.execute(
+    range === "all"
+      ? sql`
+          SELECT
+            date_trunc('day', bucket) AS bucket,
+            sum(total_checks)::int AS total_checks,
+            sum(up_checks)::int AS up_checks,
+            sum(down_checks)::int AS down_checks,
+            round(
+              sum(avg_response_time_ms * total_checks) FILTER (WHERE avg_response_time_ms IS NOT NULL)
+              / nullif(sum(total_checks) FILTER (WHERE avg_response_time_ms IS NOT NULL), 0)
+            )::int AS avg_response_time_ms
+          FROM checks_hourly
+          WHERE monitor_id = ${monitorId}
+          GROUP BY 1
+          ORDER BY 1 ASC
+        `
+      : // `count(*)` (usado por la vista) llega como bigint y `avg(...)` como
+        // numeric — el driver de pg devuelve ambos como *string* en JS para no
+        // perder precisión, no como number. Hay que castear explícitamente (igual
+        // que ya hace getMonitorMetrics) o el contrato de la API mentiría sobre su
+        // propio tipo.
+        sql`
+          SELECT
+            bucket,
+            total_checks::int AS total_checks,
+            up_checks::int AS up_checks,
+            down_checks::int AS down_checks,
+            round(avg_response_time_ms)::int AS avg_response_time_ms
+          FROM checks_hourly
+          WHERE monitor_id = ${monitorId} AND bucket >= now() - ${interval}::interval
+          ORDER BY bucket ASC
+        `
+  );
 
   return (
     result.rows as {
-      bucket: Date;
+      bucket: Date | string;
       total_checks: number;
       up_checks: number;
       down_checks: number;
       avg_response_time_ms: number | null;
     }[]
   ).map((row) => ({
-    bucket: row.bucket,
+    // Con range="all" el bucket es un `date_trunc(...)` calculado, que no
+    // siempre vuelve ya parseado como Date (misma nota que en
+    // getMonitorDailyHistory) — `new Date(...)` normaliza los dos casos.
+    bucket: new Date(row.bucket),
     totalChecks: row.total_checks,
     upChecks: row.up_checks,
     downChecks: row.down_checks,

@@ -21,16 +21,29 @@ export interface PublicStatusPageData {
   monitors: PublicStatusMonitor[];
 }
 
-export async function getPublicStatusPage(
-  username: string,
-  slug: string
-): Promise<PublicStatusPageData> {
-  const response = await fetch(
-    `${API_BASE}/public/status/${encodeURIComponent(username)}/${encodeURIComponent(slug)}`
-  );
+async function fetchPublicStatus(path: string): Promise<PublicStatusPageData> {
+  const response = await fetch(`${API_BASE}${path}`);
   const data = await response.json();
   if (!response.ok) {
     throw new Error((data as { error?: string })?.error ?? `Error ${response.status}`);
   }
   return data as PublicStatusPageData;
+}
+
+/** /status/<username>/<slug> — la organización personal de ese usuario. */
+export function getPublicStatusPage(username: string, slug: string): Promise<PublicStatusPageData> {
+  return fetchPublicStatus(
+    `/public/status/${encodeURIComponent(username)}/${encodeURIComponent(slug)}`
+  );
+}
+
+/**
+ * /status/team/<org-slug>/<slug> — cualquier organización con identificador
+ * público, que es la única forma de que una de equipo publique con su propio
+ * nombre en vez de con el username de su dueño.
+ */
+export function getTeamStatusPage(orgSlug: string, slug: string): Promise<PublicStatusPageData> {
+  return fetchPublicStatus(
+    `/public/status/team/${encodeURIComponent(orgSlug)}/${encodeURIComponent(slug)}`
+  );
 }

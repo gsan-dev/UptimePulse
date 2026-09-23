@@ -35,6 +35,13 @@ export const channelTypeEnum = pgEnum("channel_type", [
 export const organizations = pgTable("organizations", {
   id: uuid("id").defaultRandom().primaryKey(),
   name: text("name").notNull(),
+  // Identificador público de la organización, para su propia URL de estado
+  // (/status/team/<slug>/<page-slug>). Es NULL mientras no tenga URL
+  // pública: en Postgres un UNIQUE admite tantos NULL como haga falta, así
+  // que "sin slug" no compite con nadie. Vive en un espacio de nombres
+  // distinto al de `users.username` (va detrás de /status/team/), así que
+  // una organización y un usuario pueden llamarse igual sin conflicto.
+  slug: text("slug").unique(),
   // Quién la creó (Fase 4.1). La organización "personal" de un usuario es la
   // que se creó en su registro; con equipos ya no vale "la más antigua de
   // las que es miembro" (puede unirse a una más antigua que la suya), así

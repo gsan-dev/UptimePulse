@@ -4,6 +4,25 @@ import type { ApiUser } from "./types";
 interface AuthResponse {
   user: ApiUser;
   accessToken: string;
+  sessionIdleMinutes: number;
+}
+
+// Minutos de inactividad tras los que la sesión caduca. Lo decide la API
+// (SESSION_IDLE_TIMEOUT_MINUTES) y lo manda en cada login/registro/refresh;
+// aquí se guarda el último valor conocido para que el temporizador del
+// navegador use exactamente la misma ventana que el servidor, en vez de una
+// constante duplicada que pueda quedar desfasada.
+const DEFAULT_SESSION_IDLE_MINUTES = 15;
+let sessionIdleMinutes = DEFAULT_SESSION_IDLE_MINUTES;
+
+export function getSessionIdleMinutes(): number {
+  return sessionIdleMinutes;
+}
+
+function rememberIdleWindow(minutes: number | undefined): void {
+  if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
+    sessionIdleMinutes = minutes;
+  }
 }
 
 export interface RegisterInput {
@@ -29,6 +48,7 @@ export interface UsernameAvailability {
 export async function register(input: RegisterInput): Promise<ApiUser> {
   const data = await apiFetch<AuthResponse>("/auth/register", { method: "POST", body: input });
   setAccessToken(data.accessToken);
+  rememberIdleWindow(data.sessionIdleMinutes);
   return data.user;
 }
 
@@ -36,6 +56,7 @@ export async function register(input: RegisterInput): Promise<ApiUser> {
 export async function login(identifier: string, password: string): Promise<ApiUser> {
   const data = await apiFetch<AuthResponse>("/auth/login", { method: "POST", body: { identifier, password } });
   setAccessToken(data.accessToken);
+  rememberIdleWindow(data.sessionIdleMinutes);
   return data.user;
 }
 
@@ -63,8 +84,12 @@ export async function logout(): Promise<void> {
 /** Intenta recuperar una sesión existente usando la cookie httpOnly de refresh (ej. al recargar la página). */
 export async function silentRefresh(): Promise<string | null> {
   try {
-    const data = await apiFetch<{ accessToken: string }>("/auth/refresh", { method: "POST", skipAuthRetry: true });
+    const data = await apiFetch<{ accessToken: string; sessionIdleMinutes?: number }>("/auth/refresh", {
+      method: "POST",
+      skipAuthRetry: true,
+    });
     setAccessToken(data.accessToken);
+    rememberIdleWindow(data.sessionIdleMinutes);
     return data.accessToken;
   } catch {
     return null;

@@ -10,8 +10,8 @@
 
 Checks HTTP/TCP/ping desde varias regiones con quórum, incidentes, alertas
 (email, Discord, Slack, webhook firmado), SSL, status pages públicas por
-usuario, equipos con roles, API keys, métricas
-Prometheus, tests (unitarios, integración, E2E) y CI con imágenes Docker.
+usuario, equipos con roles, [API REST documentada con API keys](#usar-la-api-desde-fuera),
+métricas Prometheus, tests (unitarios, integración, E2E) y CI con imágenes Docker.
 Lo que no está hecho a propósito (SMS, OAuth…) está en
 [TODO.md](TODO.md); cada decisión, en los ADR de [TASK.md](TASK.md); cada
 paso reproducible, en [DIARIO.md](DIARIO.md).
@@ -22,7 +22,7 @@ paso reproducible, en [DIARIO.md](DIARIO.md).
 | --- | --- |
 | ![Dashboard](docs/screenshots/dashboard.png) | ![Detalle](docs/screenshots/monitor-detail.png) |
 
-| Status page pública (`/status/<usuario>/<slug>`) | API (`/docs`) |
+| Status page pública (`/status/<usuario>/<slug>` o `/status/team/<organización>/<slug>`) | API (`/docs`) |
 | --- | --- |
 | ![Status page](docs/screenshots/status-page.png) | ![Swagger](docs/screenshots/api-docs.png) |
 
@@ -42,21 +42,47 @@ Imágenes en GHCR (`ghcr.io/gsan-dev/uptimepulse/{api,worker,web}`),
 migraciones automáticas al arrancar, copias con `scripts/backup.sh` /
 `scripts/restore.sh`. Guía completa: [docs/DEPLOY.md](docs/DEPLOY.md).
 
-### Arrancar en local (desarrollo) en 5 comandos
+### Probarlo entero con un comando
 
-Requisitos: Node 22+, Docker con Compose v2.
+Requisitos: Docker con Compose v2. Nada más — ni Node, ni `.env`.
 
 ```bash
 git clone https://github.com/gsan-dev/UptimePulse.git && cd UptimePulse
-cp .env.example .env          # los valores de ejemplo valen para desarrollo
-docker compose up -d          # TimescaleDB, Redis y Mailpit (emails en http://localhost:8025)
+docker compose up
+```
+
+Levanta TimescaleDB, Redis, Mailpit, las migraciones, la API, el worker y la
+web. Abre http://localhost:8080, regístrate y crea un monitor: en unos
+segundos verás "Operativo" sin recargar.
+
+| | |
+| --- | --- |
+| Web | http://localhost:8080 |
+| API | http://localhost:3000 — [cómo llamarla](#usar-la-api-desde-fuera) · `/docs` (Swagger) · `/health` · `/metrics` |
+| Worker | http://localhost:3001 (`/health`, `/metrics`) |
+| Emails (Mailpit) | http://localhost:8025 |
+
+Todos esos puertos salen del `.env` (`WEB_PORT`, `API_PORT`,
+`WORKER_HTTP_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `MAILPIT_*`). Cada
+variable manda a la vez en el puerto publicado, en el puerto donde escucha el
+servicio y en la URL con la que le hablan los demás: cambias el número y no
+hay que tocar nada más.
+
+### Arrancar en local para programar
+
+Con los procesos en tu máquina (recarga en caliente) y solo la
+infraestructura en Docker. Requisitos: Node 22+ y Docker.
+
+```bash
+cp .env.example .env                    # los valores de ejemplo valen para desarrollo
+docker compose up -d postgres redis mailpit
 npm install && npm run db:migrate
 npm run dev:api & npm run dev:worker & npm run dev:web   # o tres terminales
 ```
 
-Abre http://localhost:5173, regístrate y crea un monitor: en unos segundos
-verás "Operativo" sin recargar. API en http://localhost:3000 (`/docs`,
-`/health`, `/metrics`); worker en http://localhost:3001 (`/health`, `/metrics`).
+Aquí la web es el servidor de Vite: http://localhost:5173. (Los puertos de la
+API y el worker chocan con los del stack completo, así que no levantes los
+dos a la vez.)
 
 ```bash
 npm run lint && npm run typecheck   # calidad
@@ -68,6 +94,111 @@ Más detalle por aplicación: [apps/api](apps/api/README.md),
 [apps/worker](apps/worker/README.md), [apps/web](apps/web/README.md).
 Self-hosting: [docs/DEPLOY.md](docs/DEPLOY.md). Seguridad:
 [docs/SECURITY.md](docs/SECURITY.md).
+
+---
+
+## Usar la API desde fuera
+
+Todo lo que hace la interfaz se puede hacer por API. La referencia completa
+—todas las rutas con sus esquemas— se sirve como Swagger UI en
+**http://localhost:3000/docs** y vive en [docs/openapi.yaml](docs/openapi.yaml).
+
+Dos formas de autenticarse, las dos con la misma cabecera `Authorization: Bearer …`:
+
+| | Para qué | De dónde sale |
+| --- | --- | --- |
+| **Access token (JWT)** | La propia interfaz web. Dura 5 min y se renueva sola mientras la uses. | `POST /auth/login` |
+| **API key** (`up_…`) | Scripts, CI, integraciones. No caduca; se revoca a mano. | La página `/api-keys`, o `POST /organizations/{id}/api-keys` |
+
+Para cualquier cosa automatizada, usa una API key.
+
+### 1. Crear la clave
+
+En la interfaz: **API keys** (`/api-keys`), siendo administrador de la
+organización. O por API, con tu sesión iniciada:
+
+```bash
+curl -X POST http://localhost:3000/organizations/<ORG_ID>/api-keys \
+  -H "Authorization: Bearer <TU_ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"GitHub Actions","scopes":["read","write"]}'
+```
+
+```json
+{
+  "id": "c2171886-…",
+  "name": "GitHub Actions",
+  "keyPrefix": "up_f922ed97",
+  "scopes": ["read", "write"],
+  "key": "up_f922ed974cb9af5c25f09d13cc068f608e478bcbd1736799d6f3547692e3d3fb"
+}
+```
+
+El campo `key` **se muestra una sola vez**: después solo queda su prefijo
+(`up_f922ed97`), porque en la base de datos se guarda únicamente su sha256.
+Si la pierdes, revócala y crea otra.
+
+Crear claves exige sesión de una persona: una API key no puede fabricar más
+claves, a propósito.
+
+### 2. Usarla
+
+```bash
+KEY=up_f922ed97…
+
+# Leer (scope "read")
+curl -H "Authorization: Bearer $KEY" http://localhost:3000/monitors
+
+# Escribir (scope "write")
+curl -X POST http://localhost:3000/monitors \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"api-prod","type":"http","target":"https://api.midominio.com/health","intervalSeconds":60}'
+```
+
+**La URL base** depende de por dónde entres: `http://localhost:3000` llamando
+a la API directamente, `http://localhost:8080/api` si pasas por la web del
+`docker compose` (nginx la reenvía), y `https://tu-dominio/api` en un
+servidor.
+
+Desde una GitHub Action, que es el caso típico — dar de alta el monitor al desplegar:
+
+```yaml
+- name: Registrar el despliegue en UptimePulse
+  env:
+    UPTIMEPULSE_KEY: ${{ secrets.UPTIMEPULSE_KEY }}
+  run: |
+    curl -fsS -X POST https://status.midominio.com/api/monitors \
+      -H "Authorization: Bearer $UPTIMEPULSE_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"api-prod","type":"http","target":"https://api.midominio.com/health"}'
+```
+
+### 3. Qué puede y qué no
+
+| Scope | Equivale al rol | Puede |
+| --- | --- | --- |
+| `read` | solo lectura | ver monitores, checks, incidentes y métricas |
+| `write` | editor | además crear, editar, pausar y borrar |
+
+Una API key **nunca administra la organización**: miembros, invitaciones,
+perfil y la gestión de las propias claves responden `403` aunque tenga
+`write`. Y la organización la fija la clave, así que la cabecera
+`X-Organization-Id` se ignora: una clave no puede actuar sobre otra
+organización.
+
+### 4. Revocar
+
+```bash
+curl -X DELETE http://localhost:3000/organizations/<ORG_ID>/api-keys/<KEY_ID> \
+  -H "Authorization: Bearer <TU_ACCESS_TOKEN>"
+```
+
+Responde `204` y el siguiente uso de esa clave da `401` al instante. El
+listado de claves muestra `lastUsedAt`, útil para localizar las olvidadas.
+
+El límite de peticiones (300/min por defecto) se cuenta **por clave**, no por
+IP: una integración detrás de un NAT no agota la cuota de las demás.
 
 ---
 
@@ -242,6 +373,7 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 | **Fase 3** ✅ | SSL, Discord/Slack/webhook firmado, status pages públicas por usuario (`/status/<usuario>/<slug>`) |
 | **Fase 4** ✅ | Equipos y roles con invitaciones, checks multi-región con quórum. (Los planes con límites se implementaron y se retiraron después: no hay límites de uso.) |
 | **Fase 5** ✅ | Seguridad (helmet, CORS, rate limits, API keys, cuota por host, redirecciones), observabilidad, tests, CI/CD, documentación. Ping ICMP añadido. |
+| **Fase 6** ✅ | Etiquetas con filtro, formulario HTTP completo (método/cabeceras/body) y edición completa del monitor, UI de ventanas de mantenimiento, línea temporal de incidentes, uptime «histórico total», status pages editables con nombre público por monitor y URL propia por organización (`/status/team/<organización>/<slug>`), cierre de sesión por inactividad |
 
 El detalle de cada fase, con lo verificado y cómo, está en [TASK.md](TASK.md).
 
@@ -262,12 +394,13 @@ uptimepulse/
 │   ├── mailer/         # Nodemailer + plantillas
 │   ├── notify-channels/# Discord, Slack, webhook firmado
 │   └── shared/         # Logger JSON, reglas de username, tipos
-├── e2e/                # Playwright (flujo crítico)
+├── e2e/                # Playwright (flujos críticos, contra los procesos de desarrollo)
+├── e2e-docker/         # Playwright contra el stack de `docker compose up`
 ├── test/               # Configuración de los tests de integración (base uptimepulse_test)
 ├── docs/               # openapi.yaml, SECURITY.md, DEPLOY.md, capturas
 ├── .github/workflows/  # CI
-├── docker-compose.yml       # infraestructura de desarrollo
-├── docker-compose.prod.yml  # self-hosting: stack completo en un servidor
+├── docker-compose.yml       # stack completo en local: `docker compose up`
+├── docker-compose.prod.yml  # self-hosting: imágenes publicadas + TLS
 ├── deploy/Caddyfile         # TLS automático (perfil tls)
 ├── scripts/                 # backup.sh / restore.sh
 ├── TASK.md · DIARIO.md · TODO.md
@@ -279,5 +412,6 @@ uptimepulse/
 ## 7. Qué queda
 
 El plan original está cumplido. Lo que se dejó fuera conscientemente y la
-deuda técnica conocida están en [TODO.md](TODO.md) (SMS con Twilio, OAuth, resumen semanal, edición completa del monitor, UI de ventanas
-de mantenimiento, revocación de refresh tokens, entre otros).
+deuda técnica conocida están en [TODO.md](TODO.md) (SMS con Twilio, OAuth,
+resumen semanal, alertas por rol, «degradado» por latencia, revocación
+explícita de refresh tokens, entre otros).

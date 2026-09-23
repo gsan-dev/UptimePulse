@@ -17,6 +17,10 @@ export const RESERVED_USERNAMES = new Set([
   "admin", "administrator", "root", "system", "support", "help",
   "api", "public", "status", "login", "register", "logout", "me",
   "monitors", "channels", "status-pages", "profile", "settings",
+  // "team" es el prefijo de las status pages de una organización
+  // (/status/team/<org-slug>/<page-slug>): un usuario con ese username haría
+  // ambigua la ruta /status/team/<algo>.
+  "team", "teams",
   "uptimepulse", "official", "null", "undefined",
 ]);
 

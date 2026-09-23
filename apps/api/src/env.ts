@@ -65,6 +65,11 @@ export const env = {
   apiRateLimitPerMinute: Number(process.env.API_RATE_LIMIT_PER_MINUTE ?? 300),
   // Login y registro: más estricto (fuerza bruta / spam de cuentas).
   authRateLimitPerMinute: Number(process.env.AUTH_RATE_LIMIT_PER_MINUTE ?? 10),
+  // Minutos de inactividad tras los que la sesión se cierra sola. Es la
+  // caducidad REAL del refresh token, que se renueva en cada /auth/refresh:
+  // mientras se usa la interfaz la sesión se va prorrogando, y en cuanto se
+  // deja de tocar, muere sola. Ver lib/tokens.ts.
+  sessionIdleMinutes: Math.max(1, Number(process.env.SESSION_IDLE_TIMEOUT_MINUTES ?? 15)),
   // Fase 5.2: si se define, /metrics exige "Authorization: Bearer <token>".
   metricsToken: process.env.METRICS_TOKEN || undefined,
   // Cookie de refresh con el atributo Secure (solo viaja por HTTPS). Por

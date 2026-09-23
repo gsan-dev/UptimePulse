@@ -1,48 +1,207 @@
+# UptimePulse entero con un solo comando:
+#
+#   docker compose up          → la web en http://localhost:8080
+#
+# Levanta TODO: Postgres (+TimescaleDB), Redis, Mailpit, las migraciones, la
+# API, el worker y la web (nginx). No hace falta ni .env: cada variable tiene
+# un valor por defecto. Copia .env.example a .env para cambiar puertos,
+# secretos o cualquier otro ajuste.
+#
+# PUERTOS: una sola variable por servicio manda a la vez en (1) el puerto
+# publicado en tu máquina, (2) el puerto en el que el servicio escucha dentro
+# del contenedor y (3) la URL con la que le hablan los demás servicios. Por
+# eso cambiar POSTGRES_PORT o API_PORT en el .env no obliga a tocar ni una
+# línea de código, ni de este archivo, ni de la configuración de nginx:
+#
+#   WEB_PORT=8080          la web — lo que abres en el navegador
+#   API_PORT=3000          la API (REST + WebSocket)
+#   WORKER_HTTP_PORT=3001  /health y /metrics del worker
+#   POSTGRES_PORT=5432     base de datos
+#   REDIS_PORT=6379        cola de trabajo
+#   MAILPIT_SMTP_PORT=1025 SMTP de pruebas
+#   MAILPIT_UI_PORT=8025   bandeja de entrada de Mailpit (web)
+#
+# Para programar con los procesos en tu máquina (npm run dev:api/worker/web),
+# levanta solo la infraestructura y deja libres los puertos de la app:
+#
+#   docker compose up postgres redis mailpit
+#
+# Este archivo es la pila LOCAL: HTTP plano, Mailpit en vez de un SMTP real y
+# NODE_ENV=development. Para un servidor de verdad (imágenes publicadas,
+# HTTPS con Caddy, SMTP real, CORS estricto) está docker-compose.prod.yml —
+# ver docs/DEPLOY.md.
+
 services:
   postgres:
     # Versión fijada (Fase 5.4): la misma que se verificó en desarrollo y en CI.
     image: timescale/timescaledb:2.30.1-pg16
     container_name: uptimepulse-postgres
     restart: unless-stopped
+    # `-p` se le pasa tal cual a postgres: el puerto de dentro del contenedor
+    # es el mismo que el publicado, así que la cadena de conexión es idéntica
+    # desde fuera (localhost:PORT) y desde dentro (postgres:PORT).
+    command: ["-p", "${POSTGRES_PORT:-5432}"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-uptimepulse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-uptimepulse}
       POSTGRES_DB: ${POSTGRES_DB:-uptimepulse}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-uptimepulse}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-uptimepulse} -p ${POSTGRES_PORT:-5432}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   redis:
     image: redis:7-alpine
     container_name: uptimepulse-redis
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--port", "${REDIS_PORT:-6379}"]
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_PORT:-6379}:${REDIS_PORT:-6379}"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
-  # Servidor SMTP de pruebas (Fase 1.5): captura los emails que envía el
-  # worker sin salir a internet ni necesitar una cuenta real de Resend/SES.
-  # UI web para verlos en http://localhost:8025 ; API JSON para comprobarlos
-  # por script en http://localhost:8025/api/v1/messages.
+  # Servidor SMTP de pruebas (Fase 1.5): captura los emails que envían la API
+  # y el worker sin salir a internet ni necesitar una cuenta real. La bandeja
+  # se ve en http://localhost:${MAILPIT_UI_PORT} y su API JSON
+  # (…/api/v1/messages) es lo que permite comprobar por script que un correo
+  # se envió de verdad.
   mailpit:
     image: axllent/mailpit:latest
     container_name: uptimepulse-mailpit
     restart: unless-stopped
+    environment:
+      MP_SMTP_BIND_ADDR: 0.0.0.0:${MAILPIT_SMTP_PORT:-1025}
+      MP_UI_BIND_ADDR: 0.0.0.0:${MAILPIT_UI_PORT:-8025}
     ports:
-      - "${MAILPIT_SMTP_PORT:-1025}:1025"
-      - "${MAILPIT_UI_PORT:-8025}:8025"
+      - "${MAILPIT_SMTP_PORT:-1025}:${MAILPIT_SMTP_PORT:-1025}"
+      - "${MAILPIT_UI_PORT:-8025}:${MAILPIT_UI_PORT:-8025}"
+
+  # Aplica las migraciones y termina. La API y el worker esperan a que salga
+  # con código 0 (service_completed_successfully), así que nunca arrancan
+  # contra un esquema viejo.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: uptimepulse/api:local
+    container_name: uptimepulse-migrate
+    working_dir: /app
+    command: ["node", "node_modules/.bin/tsx", "packages/db/src/migrate.ts"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-uptimepulse}:${POSTGRES_PASSWORD:-uptimepulse}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-uptimepulse}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    # Misma imagen que "migrate": se construye una sola vez.
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: uptimepulse/api:local
+    container_name: uptimepulse-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-3000}:${API_PORT:-3000}"
+    environment:
+      # Pila local: HTTP plano y herramientas de desarrollo disponibles. Para
+      # producción, docker-compose.prod.yml.
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${API_PORT:-3000}
+      # Los hosts son los nombres de servicio de esta red, no localhost: el
+      # DATABASE_URL/REDIS_URL del .env (pensado para ejecutar la app en tu
+      # máquina) no valdría aquí dentro. Los puertos sí salen del .env.
+      DATABASE_URL: postgres://${POSTGRES_USER:-uptimepulse}:${POSTGRES_PASSWORD:-uptimepulse}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-uptimepulse}
+      REDIS_URL: redis://redis:${REDIS_PORT:-6379}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-changeme_access_secret}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-changeme_refresh_secret}
+      # URL pública del frontend, para los enlaces de los emails de
+      # invitación. Se deriva de WEB_PORT; con PUBLIC_URL se fija a mano si
+      # entras por la IP de la máquina en vez de por localhost.
+      APP_URL: ${PUBLIC_URL:-http://localhost:${WEB_PORT:-8080}}
+      # "*" en desarrollo = cualquier origen, para que la pila funcione igual
+      # entrando por localhost, por 127.0.0.1 o por la IP de la LAN.
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      # HTTP plano: con Secure el navegador descartaría la cookie de sesión.
+      COOKIE_SECURE: ${COOKIE_SECURE_LOCAL:-false}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-300}
+      AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-10}
+      SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-15}
+      ALLOW_PRIVATE_MONITOR_TARGETS: ${ALLOW_PRIVATE_MONITOR_TARGETS:-false}
+      CHECK_REGIONS: ${CHECK_REGIONS:-local}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # Mailpit es el SMTP de esta pila; el SMTP_HOST del .env apunta a
+      # localhost, que aquí dentro sería el propio contenedor.
+      SMTP_HOST: mailpit
+      SMTP_PORT: ${MAILPIT_SMTP_PORT:-1025}
+      SMTP_SECURE: "false"
+      MAIL_FROM: ${MAIL_FROM:-UptimePulse <alerts@uptimepulse.local>}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    image: uptimepulse/worker:local
+    container_name: uptimepulse-worker
+    restart: unless-stopped
+    ports:
+      - "${WORKER_HTTP_PORT:-3001}:${WORKER_HTTP_PORT:-3001}"
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      WORKER_HTTP_PORT: ${WORKER_HTTP_PORT:-3001}
+      DATABASE_URL: postgres://${POSTGRES_USER:-uptimepulse}:${POSTGRES_PASSWORD:-uptimepulse}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-uptimepulse}
+      REDIS_URL: redis://redis:${REDIS_PORT:-6379}
+      CHECK_REGIONS: ${CHECK_REGIONS:-local}
+      WORKER_REGION: ${WORKER_REGION:-local}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
+      INCIDENT_FAILURE_THRESHOLD: ${INCIDENT_FAILURE_THRESHOLD:-2}
+      CHECK_MAX_PER_HOST_PER_MINUTE: ${CHECK_MAX_PER_HOST_PER_MINUTE:-60}
+      ALLOW_PRIVATE_MONITOR_TARGETS: ${ALLOW_PRIVATE_MONITOR_TARGETS:-false}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      SMTP_HOST: mailpit
+      SMTP_PORT: ${MAILPIT_SMTP_PORT:-1025}
+      SMTP_SECURE: "false"
+      MAIL_FROM: ${MAIL_FROM:-UptimePulse <alerts@uptimepulse.local>}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # nginx: sirve la SPA y hace de proxy de /api y /socket.io hacia la API, así
+  # que todo vive en un solo origen (sin CORS en el navegador) y la imagen
+  # sirve para cualquier dominio sin reconstruirla. A dónde reenvía sale de
+  # API_UPSTREAM, que aquí se construye con el mismo API_PORT del .env.
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    image: uptimepulse/web:local
+    container_name: uptimepulse-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    environment:
+      API_UPSTREAM: api:${API_PORT:-3000}
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:

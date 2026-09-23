@@ -8,20 +8,38 @@ quedan documentadas, no olvidos.
 
 - [x] Contraseñas con bcrypt (`apps/api/src/lib/password.ts`); nunca se
       devuelven ni se registran en logs.
-- [x] Access token JWT de 15 min en memoria del navegador; refresh token de
-      7 días en cookie `httpOnly` + `SameSite=Strict` con `Path=/auth`
+- [x] Access token JWT de 5 min en memoria del navegador; refresh token en
+      cookie `httpOnly` + `SameSite=Strict` con `Path=/auth`
       (`routes/auth.ts`). Secretos distintos para cada uno. Atributo `Secure`
       por defecto en producción (`COOKIE_SECURE`; `false` solo para self-hosting
       en HTTP plano).
+- [x] **La sesión se cierra sola tras 15 minutos sin tocar la interfaz**
+      (`SESSION_IDLE_TIMEOUT_MINUTES`). Esa es la caducidad real del refresh
+      token (`lib/tokens.ts`) y cada `/auth/refresh` emite uno nuevo con la
+      cuenta a cero, así que usar la aplicación la prorroga y dejar de usarla
+      la mata. El navegador colabora por su lado (`hooks/useIdleSession.ts`):
+      refresca como mucho una vez por minuto mientras hay actividad real y,
+      al agotarse la ventana, cierra la sesión y lleva a /login en vez de
+      dejar datos a la vista. Comprobado en Chromium con la ventana puesta a
+      1 minuto: con clics cada 20 s la sesión aguanta; sin tocar nada, salta
+      sola y recargar no la recupera.
+- [x] La cookie de refresh **no lleva `Max-Age`**: es una cookie de sesión y
+      el navegador la borra al cerrarse. Para los navegadores que restauran
+      la sesión al reabrirse ("continuar donde lo dejaste"), el token que
+      lleva dentro ya ha caducado por inactividad. Comprobado: la respuesta
+      de `/auth/login` manda `Path=/auth; HttpOnly; SameSite=Strict` sin
+      `Expires` ni `Max-Age`.
 - [x] En producción la API **no arranca** con secretos de ejemplo
       (`changeme…`) ni de menos de 32 caracteres (`env.ts`, función
       `secret()`). Comprobado: `NODE_ENV=production
       JWT_ACCESS_SECRET=changeme_access_secret` → error al arrancar.
 - [x] Login y registro limitados a 10 peticiones/min por IP (`routes/auth.ts`).
       Comprobado: el 11º intento devuelve 429.
-- [ ] Revocación de refresh tokens ("cerrar sesión en todos los
-      dispositivos"): no implementada; un refresh token filtrado vale hasta 7
-      días. Ver TODO.md.
+- [ ] Revocación explícita de refresh tokens ("cerrar sesión en todos los
+      dispositivos"): no implementada. La ventana de un token filtrado ya no
+      es de 7 días sino de los minutos de inactividad configurados, pero
+      quien lo tenga puede irlo renovando indefinidamente mientras siga
+      siendo válido. Ver TODO.md.
 - [ ] Verificación de email y recuperación de contraseña: no implementadas.
 
 ## API keys (integraciones)
@@ -100,8 +118,16 @@ quedan documentadas, no olvidos.
       API rechaza en producción.
 - [x] Bull Board (`/admin/queues`) desactivado con `NODE_ENV=production`.
 - [x] `/metrics` opcionalmente protegido con `METRICS_TOKEN`.
-- [ ] Contraseña de Postgres `changeme` en `docker-compose.yml` por defecto:
-      cámbiala en `.env` (`POSTGRES_PASSWORD`) antes de exponer el puerto.
+- [ ] `docker-compose.yml` (la pila de `docker compose up`) es para uso
+      LOCAL: `NODE_ENV=development`, HTTP plano con `COOKIE_SECURE=false`,
+      `CORS_ORIGINS=*`, Bull Board accesible en `/api/admin/queues` sin
+      autenticación y todos los puertos publicados, incluidos los de Postgres
+      y Redis. Para un despliegue real está `docker-compose.prod.yml`, que
+      solo publica la web, exige secretos de verdad y usa
+      `NODE_ENV=production`.
+- [ ] Contraseña de Postgres por defecto (`uptimepulse` en
+      `docker-compose.yml`, `changeme` en `.env.example`): cámbiala en `.env`
+      (`POSTGRES_PASSWORD`) antes de exponer el puerto fuera de tu máquina.
 
 ## Dependencias
 

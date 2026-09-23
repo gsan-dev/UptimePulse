@@ -13,6 +13,7 @@ import {
   type ApiOrganizationMember,
   type OrganizationRole,
 } from "../api/organizations";
+import { OrganizationSlugSection } from "../components/OrganizationSlugSection";
 import { useAuth } from "../context/AuthContext";
 import { useConfirm } from "../context/ConfirmContext";
 import { useOrganization } from "../context/OrganizationContext";
@@ -151,6 +152,10 @@ export function TeamPage() {
 
       {error && <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
       {notice && <p className="mb-4 rounded-md bg-emerald-500/10 px-3 py-2 text-sm text-emerald-400">{notice}</p>}
+
+      {isAdmin && (
+        <OrganizationSlugSection organization={active} onSaved={refreshOrganizations} />
+      )}
 
       {isAdmin && (
         <form onSubmit={(e) => void handleInvite(e)} className="mb-8 space-y-4 rounded-xl border border-white/10 bg-white/5 p-6">

@@ -21,13 +21,16 @@ const baseFields = {
   name: z.string().min(1).max(200),
   intervalSeconds: z.number().int().min(30).max(86400).default(300),
   timeoutMs: z.number().int().min(1000).max(60000).default(5000),
-  tags: z.array(z.string()).default([]),
+  // Etiquetas libres para agrupar monitores (README §2.1). Sin catálogo ni
+  // tabla aparte a propósito: se escriben al vuelo y el dashboard deriva la
+  // lista de las que existen de los propios monitores.
+  tags: z.array(z.string().trim().min(1).max(40)).max(20).default([]),
 };
 
 const httpMonitorSchema = z.object({
   ...baseFields,
   type: z.literal("http"),
-  target: z.string().url(),
+  target: z.string().url("Indica una URL completa, con http:// o https://"),
   method: z.enum(HTTP_METHODS).default("GET"),
   headers: z.record(z.string()).optional(),
   body: z.string().optional(),
@@ -56,19 +59,35 @@ const createMonitorSchema = z.discriminatedUnion("type", [
   pingMonitorSchema,
 ]);
 
+// Los campos de HTTP admiten `null` además de un valor: el formulario de
+// edición necesita poder VACIARLOS (quitar el body, dejar de exigir un
+// status concreto), y con `.partial()` a secas "ausente" y "vaciado" serían
+// indistinguibles — el campo se quedaría con su valor anterior para siempre.
 const updateMonitorSchema = z
   .object({
     name: z.string().min(1).max(200),
     target: z.string().min(1),
-    method: z.enum(HTTP_METHODS),
-    headers: z.record(z.string()),
-    body: z.string(),
-    expectedStatus: z.number().int().min(100).max(599),
+    method: z.enum(HTTP_METHODS).nullable(),
+    headers: z.record(z.string()).nullable(),
+    body: z.string().nullable(),
+    expectedStatus: z.number().int().min(100).max(599).nullable(),
     intervalSeconds: z.number().int().min(30).max(86400),
     timeoutMs: z.number().int().min(1000).max(60000),
-    tags: z.array(z.string()),
+    tags: z.array(z.string().trim().min(1).max(40)).max(20),
   })
   .partial();
+
+// El tipo de un monitor no se puede cambiar (cambiaría el significado de su
+// historial de checks), así que al editar el `target` hay que validarlo
+// contra el tipo que YA tiene. Sin esto, un target HTTP inválido llegaba
+// hasta `new URL(...)` dentro de extractHostname y reventaba con un 500 en
+// vez de un 400 — algo que no se notaba mientras la UI no dejaba editarlo.
+function getTargetError(type: "http" | "tcp" | "ping", target: string): string | null {
+  const schema =
+    type === "http" ? httpMonitorSchema.shape.target : type === "tcp" ? tcpMonitorSchema.shape.target : pingMonitorSchema.shape.target;
+  const result = schema.safeParse(target);
+  return result.success ? null : (result.error.issues[0]?.message ?? "Destino inválido");
+}
 
 const idParamSchema = z.object({ id: z.string().uuid() });
 const idAndWindowIdParamSchema = z.object({ id: z.string().uuid(), windowId: z.string().uuid() });
@@ -289,7 +308,22 @@ export async function monitorRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "Monitor no encontrado" });
     }
 
+    // Los campos propios de HTTP no tienen sentido en un monitor tcp/ping:
+    // guardarlos ahí sería dejar datos muertos que el worker ignora y que la
+    // UI volvería a enseñar como si contaran.
+    if (existing.type !== "http") {
+      for (const field of ["method", "headers", "body", "expectedStatus"] as const) {
+        if (patch[field] !== undefined && patch[field] !== null) {
+          return reply.code(400).send({ error: `"${field}" solo se puede usar en monitores HTTP` });
+        }
+      }
+    }
+
     if (patch.target !== undefined) {
+      const targetError = getTargetError(existing.type, patch.target);
+      if (targetError) {
+        return reply.code(400).send({ error: targetError });
+      }
       try {
         await assertPublicHost(extractHostname(existing.type, patch.target), { allowPrivateTargets: env.allowPrivateMonitorTargets });
       } catch (error) {

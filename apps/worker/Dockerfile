@@ -36,7 +36,9 @@ COPY apps/worker ./apps/worker
 RUN apk add --no-cache iputils-ping && chown -R node:node /app
 USER node
 EXPOSE 3001
+# Igual que en la API: el puerto se resuelve en tiempo de ejecución a partir
+# de WORKER_HTTP_PORT, no se fija al construir la imagen.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD wget -qO- http://127.0.0.1:3001/health || exit 1
+  CMD wget -qO- "http://127.0.0.1:${WORKER_HTTP_PORT:-3001}/health" || exit 1
 WORKDIR /app/apps/worker
 CMD ["node", "../../node_modules/.bin/tsx", "src/index.ts"]

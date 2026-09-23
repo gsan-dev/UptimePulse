@@ -11,7 +11,7 @@ import {
   users,
 } from "@uptimepulse/db";
 import { createMailer, organizationInvitationEmail } from "@uptimepulse/mailer";
-import { createLogger } from "@uptimepulse/shared";
+import { createLogger, getSlugError, normalizeSlug } from "@uptimepulse/shared";
 import { env } from "../env.js";
 import { getMembership, type OrganizationRole } from "../lib/organizations.js";
 import {
@@ -32,6 +32,27 @@ const mailer = createMailer({
 });
 
 const roleSchema = z.enum(["admin", "editor", "readonly"]);
+
+// Slug público de la organización (/status/team/<slug>/<page-slug>).
+// `null` lo quita: la organización deja de tener URL pública propia y sus
+// status pages solo siguen siendo alcanzables por la del username del dueño,
+// si es la personal de alguien.
+const updateOrganizationSchema = z
+  .object({
+    name: z.string().trim().min(1).max(100).optional(),
+    slug: z
+      .string()
+      .transform(normalizeSlug)
+      .superRefine((value, ctx) => {
+        const error = getSlugError(value);
+        if (error) ctx.addIssue({ code: z.ZodIssueCode.custom, message: error });
+      })
+      .nullable()
+      .optional(),
+  })
+  .refine((data) => data.name !== undefined || data.slug !== undefined, {
+    message: "No hay nada que actualizar",
+  });
 const idParamSchema = z.object({ id: z.string().uuid() });
 const memberParamSchema = z.object({ id: z.string().uuid(), userId: z.string().uuid() });
 const invitationParamSchema = z.object({ id: z.string().uuid(), invitationId: z.string().uuid() });
@@ -104,6 +125,7 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
       .select({
         id: organizations.id,
         name: organizations.name,
+        slug: organizations.slug,
         role: organizationMembers.role,
         createdAt: organizations.createdAt,
       })
@@ -137,9 +159,45 @@ export async function organizationRoutes(app: FastifyInstance): Promise<void> {
       return reply.send({
         id: org.id,
         name: org.name,
+        slug: org.slug,
         role: request.organization!.role,
         usage: { monitors: count?.count ?? 0 },
       });
+    });
+
+    // Renombrar la organización y, sobre todo, darle (o quitarle) su slug
+    // público — el que hace que sus status pages sean alcanzables en
+    // /status/team/<slug>/<page-slug>. Solo un admin.
+    scoped.patch("/organizations/:id", { preHandler: requireRole("admin") }, async (request, reply) => {
+      const params = idParamSchema.safeParse(request.params);
+      if (!params.success || !assertRouteOrganizationMatches(request, params.data.id)) {
+        return reply.code(403).send({ error: "No perteneces a esa organización" });
+      }
+      const body = updateOrganizationSchema.safeParse(request.body);
+      if (!body.success) {
+        return reply.code(400).send({ error: body.error.flatten() });
+      }
+      const { name, slug } = body.data;
+
+      if (slug) {
+        const taken = await db.query.organizations.findFirst({ where: eq(organizations.slug, slug) });
+        if (taken && taken.id !== params.data.id) {
+          return reply.code(409).send({ error: "Ese identificador público ya está en uso" });
+        }
+      }
+
+      const [updated] = await db
+        .update(organizations)
+        .set({
+          ...(name !== undefined ? { name } : {}),
+          ...(slug !== undefined ? { slug } : {}),
+        })
+        .where(eq(organizations.id, params.data.id))
+        .returning();
+      if (!updated) {
+        return reply.code(404).send({ error: "Organización no encontrada" });
+      }
+      return reply.send({ id: updated.id, name: updated.name, slug: updated.slug, role: request.organization!.role });
     });
 
     scoped.get("/organizations/:id/members", async (request, reply) => {

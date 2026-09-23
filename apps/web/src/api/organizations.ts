@@ -5,6 +5,12 @@ export type OrganizationRole = "admin" | "editor" | "readonly";
 export interface ApiOrganizationSummary {
   id: string;
   name: string;
+  /**
+   * Identificador público de la organización: lo que hace que sus status
+   * pages sean alcanzables en `/status/team/<slug>/<page-slug>`.
+   * null = todavía no tiene URL pública propia.
+   */
+  slug: string | null;
   role: OrganizationRole;
   createdAt: string;
 }
@@ -40,6 +46,13 @@ export const ROLE_LABELS: Record<OrganizationRole, string> = {
 
 export function listOrganizations(): Promise<ApiOrganizationSummary[]> {
   return apiFetch<ApiOrganizationSummary[]>("/organizations");
+}
+
+export function updateOrganization(
+  organizationId: string,
+  patch: { name?: string; slug?: string | null }
+): Promise<{ id: string; name: string; slug: string | null; role: OrganizationRole }> {
+  return apiFetch(`/organizations/${organizationId}`, { method: "PATCH", body: patch });
 }
 
 export function listMembers(organizationId: string): Promise<ApiOrganizationMember[]> {

@@ -3,6 +3,7 @@ import type {
   ApiCheck,
   ApiDashboardSummary,
   ApiIncident,
+  ApiMaintenanceWindow,
   ApiMonitor,
   ApiMonitorMetrics,
   ApiTimeseriesPoint,
@@ -24,7 +25,15 @@ export interface CreateMonitorInput {
   tags?: string[];
 }
 
-export type UpdateMonitorInput = Partial<Omit<CreateMonitorInput, "type">>;
+// Los campos de HTTP admiten `null` además de un valor: es la forma de
+// VACIARLOS (quitar el body, dejar de exigir un status concreto). Omitirlos
+// deja el valor anterior intacto; mandar null lo borra.
+export type UpdateMonitorInput = Partial<Omit<CreateMonitorInput, "type" | "method" | "headers" | "body" | "expectedStatus">> & {
+  method?: string | null;
+  headers?: Record<string, string> | null;
+  body?: string | null;
+  expectedStatus?: number | null;
+};
 
 export function listMonitors(): Promise<ApiMonitor[]> {
   return apiFetch<ApiMonitor[]>("/monitors");
@@ -75,4 +84,33 @@ export function listMonitorIncidents(id: string, range?: UptimeRange): Promise<A
 
 export function getDashboardSummary(): Promise<ApiDashboardSummary> {
   return apiFetch<ApiDashboardSummary>("/monitors/summary");
+}
+
+// --- Ventanas de mantenimiento ---
+// Durante una ventana el motor de incidentes del worker no abre incidentes
+// ni manda alertas para ese monitor. No hay edición: el backend solo ofrece
+// crear y borrar (para este alcance basta con borrar y volver a crear).
+
+export interface CreateMaintenanceWindowInput {
+  startsAt: string;
+  endsAt: string;
+  note?: string;
+}
+
+export function listMaintenanceWindows(monitorId: string): Promise<ApiMaintenanceWindow[]> {
+  return apiFetch<ApiMaintenanceWindow[]>(`/monitors/${monitorId}/maintenance-windows`);
+}
+
+export function createMaintenanceWindow(
+  monitorId: string,
+  input: CreateMaintenanceWindowInput
+): Promise<ApiMaintenanceWindow> {
+  return apiFetch<ApiMaintenanceWindow>(`/monitors/${monitorId}/maintenance-windows`, {
+    method: "POST",
+    body: input,
+  });
+}
+
+export function deleteMaintenanceWindow(monitorId: string, windowId: string): Promise<void> {
+  return apiFetch<void>(`/monitors/${monitorId}/maintenance-windows/${windowId}`, { method: "DELETE" });
 }

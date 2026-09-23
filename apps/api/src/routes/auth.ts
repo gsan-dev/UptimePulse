@@ -51,6 +51,14 @@ function toPublicUser(user: InferSelectModel<typeof users>): PublicUser {
   return rest;
 }
 
+/**
+ * Cookie de sesión a propósito: SIN `maxAge`/`expires`, para que el
+ * navegador la borre al cerrarse. Los navegadores que restauran la sesión al
+ * reabrirse ("continuar donde lo dejaste") la devuelven igualmente, y por
+ * eso el token que lleva dentro caduca por sí solo a los
+ * SESSION_IDLE_TIMEOUT_MINUTES (ver lib/tokens.ts): reabrir el navegador más
+ * tarde encuentra una sesión cerrada.
+ */
 function setRefreshCookie(reply: import("fastify").FastifyReply, token: string): void {
   reply.setCookie(REFRESH_COOKIE, token, {
     httpOnly: true,
@@ -87,11 +95,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const passwordHash = await hashPassword(password);
 
+    // La organización nace con el username como slug público, para que sus
+    // status pages tengan desde el primer día las dos URLs posibles
+    // (/status/<username>/… y /status/team/<slug>/…) y el usuario pueda
+    // cambiarlo luego. Si ese slug ya lo tiene otra organización — un
+    // username liberado al borrar a su dueño, cuya organización sobrevive —
+    // se queda sin slug en vez de reventar el registro: es algo que se
+    // arregla desde la página de equipo en diez segundos.
+    const slugTaken = await db.query.organizations.findFirst({ where: eq(organizations.slug, username) });
+
     const user = await db.transaction(async (tx) => {
       const [newUser] = await tx.insert(users).values({ username, fullName, email, passwordHash }).returning();
       const [org] = await tx
         .insert(organizations)
-        .values({ name: organizationName ?? `Organización de ${fullName}`, ownerUserId: newUser.id })
+        .values({
+          name: organizationName ?? `Organización de ${fullName}`,
+          slug: slugTaken ? null : username,
+          ownerUserId: newUser.id,
+        })
         .returning();
       await tx.insert(organizationMembers).values({
         userId: newUser.id,
@@ -104,7 +125,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const accessToken = signAccessToken({ sub: user.id, email: user.email });
     setRefreshCookie(reply, signRefreshToken({ sub: user.id, email: user.email }));
 
-    return reply.code(201).send({ user: toPublicUser(user), accessToken });
+    return reply.code(201).send({ user: toPublicUser(user), accessToken, sessionIdleMinutes: env.sessionIdleMinutes });
   });
 
   // Público y sin sesión (lo usa el formulario de registro mientras se
@@ -151,7 +172,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     const accessToken = signAccessToken({ sub: user.id, email: user.email });
     setRefreshCookie(reply, signRefreshToken({ sub: user.id, email: user.email }));
 
-    return reply.send({ user: toPublicUser(user), accessToken });
+    return reply.send({ user: toPublicUser(user), accessToken, sessionIdleMinutes: env.sessionIdleMinutes });
   });
 
   app.post("/auth/refresh", async (request, reply) => {
@@ -162,7 +183,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     try {
       const payload = verifyRefreshToken(token);
       const accessToken = signAccessToken({ sub: payload.sub, email: payload.email });
-      return reply.send({ accessToken });
+      // Rotación: cada refresh emite un token nuevo con la ventana de
+      // inactividad a cero. Esto es lo que hace que usar la aplicación
+      // prorrogue la sesión y dejar de usarla la cierre — sin ello, el
+      // refresh original caducaría 15 minutos después del login pasara lo
+      // que pasara.
+      setRefreshCookie(reply, signRefreshToken({ sub: payload.sub, email: payload.email }));
+      return reply.send({ accessToken, sessionIdleMinutes: env.sessionIdleMinutes });
     } catch {
       return reply.code(401).send({ error: "Refresh token inválido o caducado" });
     }

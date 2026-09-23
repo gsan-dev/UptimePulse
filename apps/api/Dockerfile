@@ -34,7 +34,11 @@ COPY docs/openapi.yaml ./docs/openapi.yaml
 RUN chown -R node:node /app
 USER node
 EXPOSE 3000
+# El puerto se resuelve en tiempo de EJECUCIÓN a partir de PORT, no se fija
+# al construir: así la misma imagen vale aunque el compose la arranque en
+# otro puerto. (HEALTHCHECK en forma shell, que es la que expande variables;
+# en forma exec — ["wget", …] — el ${PORT} llegaría literal.)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD wget -qO- http://127.0.0.1:3000/health || exit 1
+  CMD wget -qO- "http://127.0.0.1:${PORT:-3000}/health" || exit 1
 WORKDIR /app/apps/api
 CMD ["node", "../../node_modules/.bin/tsx", "src/index.ts"]

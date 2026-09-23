@@ -10,17 +10,45 @@ const slugSchema = z
   .max(60)
   .regex(/^[a-z0-9-]+$/, "El slug solo puede tener minúsculas, números y guiones");
 
+// Un monitor dentro de una status page puede llevar un nombre propio de cara
+// al público (`display_name`): el nombre interno suele ser técnico ("api-prod
+// eu-west") y no es el que se quiere enseñar fuera. `null` = usar el nombre
+// del monitor.
+const statusPageMonitorSchema = z.object({
+  id: z.string().uuid(),
+  displayName: z.string().trim().min(1).max(200).nullish(),
+});
+
+// Se aceptan las dos formas: `monitorIds` (lista de ids pelados, que es lo
+// que mandaban los clientes antes de que existiera `display_name`) y
+// `monitors` (con nombre público). Si llegan las dos, manda `monitors`.
+const monitorSelectionFields = {
+  monitorIds: z.array(z.string().uuid()).optional(),
+  monitors: z.array(statusPageMonitorSchema).optional(),
+};
+
+type MonitorSelection = { id: string; displayName?: string | null };
+
+function resolveMonitorSelection(input: {
+  monitorIds?: string[];
+  monitors?: MonitorSelection[];
+}): MonitorSelection[] | undefined {
+  if (input.monitors !== undefined) return input.monitors;
+  if (input.monitorIds !== undefined) return input.monitorIds.map((id) => ({ id }));
+  return undefined;
+}
+
 const createStatusPageSchema = z.object({
   slug: slugSchema,
   title: z.string().min(1).max(200),
   isPublic: z.boolean().default(true),
-  monitorIds: z.array(z.string().uuid()).default([]),
+  ...monitorSelectionFields,
 });
 
 const updateStatusPageSchema = z.object({
   title: z.string().min(1).max(200).optional(),
   isPublic: z.boolean().optional(),
-  monitorIds: z.array(z.string().uuid()).optional(),
+  ...monitorSelectionFields,
 });
 
 const idParamSchema = z.object({ id: z.string().uuid() });
@@ -37,20 +65,46 @@ async function findOwnedStatusPage(organizationId: string, id: string) {
  * "colar" el id de un monitor ajeno aquí sería una fuga de datos entre
  * organizaciones, no solo un error de validación cualquiera.
  */
-async function filterOwnedMonitorIds(organizationId: string, monitorIds: string[]): Promise<string[]> {
-  if (monitorIds.length === 0) return [];
+async function filterOwnedMonitors(
+  organizationId: string,
+  selection: MonitorSelection[]
+): Promise<MonitorSelection[]> {
+  if (selection.length === 0) return [];
   const rows = await db
     .select({ id: monitors.id })
     .from(monitors)
-    .where(and(eq(monitors.organizationId, organizationId), inArray(monitors.id, monitorIds)));
-  return rows.map((row) => row.id);
+    .where(and(eq(monitors.organizationId, organizationId), inArray(monitors.id, selection.map((m) => m.id))));
+  const owned = new Set(rows.map((row) => row.id));
+  // Se quitan los repetidos: (status_page_id, monitor_id) es la clave
+  // primaria de la tabla, así que mandar dos veces el mismo monitor haría
+  // reventar el INSERT con un 500 en vez de guardarlo una sola vez.
+  const seen = new Set<string>();
+  return selection.filter((entry) => {
+    if (!owned.has(entry.id) || seen.has(entry.id)) return false;
+    seen.add(entry.id);
+    return true;
+  });
 }
 
-async function replaceStatusPageMonitors(statusPageId: string, monitorIds: string[]): Promise<void> {
+async function replaceStatusPageMonitors(statusPageId: string, selection: MonitorSelection[]): Promise<void> {
   await db.delete(statusPageMonitors).where(eq(statusPageMonitors.statusPageId, statusPageId));
-  if (monitorIds.length > 0) {
-    await db.insert(statusPageMonitors).values(monitorIds.map((monitorId) => ({ statusPageId, monitorId })));
+  if (selection.length > 0) {
+    await db.insert(statusPageMonitors).values(
+      selection.map((entry) => ({
+        statusPageId,
+        monitorId: entry.id,
+        displayName: entry.displayName ?? null,
+      }))
+    );
   }
+}
+
+async function loadStatusPageMonitors(statusPageId: string): Promise<MonitorSelection[]> {
+  const links = await db
+    .select({ id: statusPageMonitors.monitorId, displayName: statusPageMonitors.displayName })
+    .from(statusPageMonitors)
+    .where(eq(statusPageMonitors.statusPageId, statusPageId));
+  return links;
 }
 
 export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
@@ -78,7 +132,7 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: "Ya tienes una status page con ese slug, prueba con otro" });
     }
 
-    const ownedMonitorIds = await filterOwnedMonitorIds(organizationId, parsed.data.monitorIds);
+    const ownedMonitors = await filterOwnedMonitors(organizationId, resolveMonitorSelection(parsed.data) ?? []);
 
     const [page] = await db
       .insert(statusPages)
@@ -90,9 +144,15 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       })
       .returning();
 
-    await replaceStatusPageMonitors(page.id, ownedMonitorIds);
+    await replaceStatusPageMonitors(page.id, ownedMonitors);
 
-    return reply.code(201).send({ ...page, monitorIds: ownedMonitorIds });
+    return reply.code(201).send({
+      ...page,
+      monitors: ownedMonitors,
+      // `monitorIds` se mantiene por compatibilidad con los clientes
+      // anteriores a `display_name` (y con docs/openapi.yaml).
+      monitorIds: ownedMonitors.map((m) => m.id),
+    });
   });
 
   app.get("/status-pages", async (request, reply) => {
@@ -113,12 +173,8 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "Página no encontrada" });
     }
 
-    const links = await db
-      .select({ monitorId: statusPageMonitors.monitorId })
-      .from(statusPageMonitors)
-      .where(eq(statusPageMonitors.statusPageId, page.id));
-
-    return reply.send({ ...page, monitorIds: links.map((link) => link.monitorId) });
+    const pageMonitors = await loadStatusPageMonitors(page.id);
+    return reply.send({ ...page, monitors: pageMonitors, monitorIds: pageMonitors.map((m) => m.id) });
   });
 
   app.patch("/status-pages/:id", { preHandler: requireRole("editor") }, async (request, reply) => {
@@ -138,18 +194,19 @@ export async function statusPageRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "Página no encontrada" });
     }
 
-    const { monitorIds, ...patch } = parsed.data;
+    const { monitorIds: _ids, monitors: _monitors, ...patch } = parsed.data;
     const [updated] =
       Object.keys(patch).length > 0
         ? await db.update(statusPages).set(patch).where(eq(statusPages.id, page.id)).returning()
         : [page];
 
-    if (monitorIds !== undefined) {
-      const ownedMonitorIds = await filterOwnedMonitorIds(organizationId, monitorIds);
-      await replaceStatusPageMonitors(page.id, ownedMonitorIds);
+    const selection = resolveMonitorSelection(parsed.data);
+    if (selection !== undefined) {
+      await replaceStatusPageMonitors(page.id, await filterOwnedMonitors(organizationId, selection));
     }
 
-    return reply.send(updated);
+    const pageMonitors = await loadStatusPageMonitors(page.id);
+    return reply.send({ ...updated, monitors: pageMonitors, monitorIds: pageMonitors.map((m) => m.id) });
   });
 
   app.delete("/status-pages/:id", { preHandler: requireRole("editor") }, async (request, reply) => {

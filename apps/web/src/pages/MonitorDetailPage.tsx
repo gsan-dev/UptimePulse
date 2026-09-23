@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ApiError } from "../api/client";
 import {
@@ -8,6 +8,7 @@ import {
   getMonitorTimeseries,
   listMonitorChecks,
   listMonitorIncidents,
+  listMonitors,
   pauseMonitor,
   resumeMonitor,
   updateMonitor,
@@ -20,14 +21,24 @@ import type {
   ApiTimeseriesPoint,
   UptimeRange,
 } from "../api/types";
+import { IncidentTimeline } from "../components/IncidentTimeline";
+import { MaintenanceWindowsSection } from "../components/MaintenanceWindowsSection";
 import { MonitorChannelsSection } from "../components/MonitorChannelsSection";
-import { RangeSelector } from "../components/RangeSelector";
+import {
+  commitPendingTag,
+  MonitorFormFields,
+  monitorToForm,
+  toUpdateInput,
+  type MonitorFormValues,
+} from "../components/MonitorFormFields";
+import { RangeSelector, rangeStart } from "../components/RangeSelector";
 import { ResponseTimeChart } from "../components/ResponseTimeChart";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
 import { useConfirm } from "../context/ConfirmContext";
 import { useOrganization } from "../context/OrganizationContext";
 import { useRealtime } from "../context/RealtimeContext";
 import { useToast } from "../context/ToastContext";
+import { collectTags } from "../lib/tags";
 
 const CHECKS_LIMIT = 20;
 
@@ -50,9 +61,9 @@ export function MonitorDetailPage() {
   const [monitor, setMonitor] = useState<ApiMonitorDetail | null>(null);
   const [checks, setChecks] = useState<ApiCheck[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [isEditing, setIsEditing] = useState(false);
-  const [editName, setEditName] = useState("");
-  const [editInterval, setEditInterval] = useState(300);
+  const [editValues, setEditValues] = useState<MonitorFormValues | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
   const [range, setRange] = useState<UptimeRange>("24h");
   const [metrics, setMetrics] = useState<ApiMonitorMetrics | null>(null);
   const [timeseries, setTimeseries] = useState<ApiTimeseriesPoint[]>([]);
@@ -121,12 +132,17 @@ export function MonitorDetailPage() {
     });
   }, [subscribe, refresh, refreshRangeData, showToast, id]);
 
-  useEffect(() => {
-    if (monitor && !isEditing) {
-      setEditName(monitor.name);
-      setEditInterval(monitor.intervalSeconds);
-    }
-  }, [monitor, isEditing]);
+  const isEditing = editValues !== null;
+
+  function startEditing(): void {
+    if (!monitor) return;
+    setEditValues(monitorToForm(monitor));
+    // Las etiquetas del resto de monitores, para no inventar variantes de
+    // una que ya existe. Si falla, el campo sigue admitiendo texto libre.
+    void listMonitors()
+      .then((all) => setTagSuggestions(collectTags(all)))
+      .catch(() => undefined);
+  }
 
   async function handleTogglePause(): Promise<void> {
     if (!monitor) return;
@@ -158,19 +174,32 @@ export function MonitorDetailPage() {
   }
 
   async function handleSaveEdit(): Promise<void> {
-    if (!monitor) return;
+    if (!monitor || !editValues) return;
+    setIsSaving(true);
+    const submitted = commitPendingTag(editValues);
+    setEditValues(submitted);
     try {
-      const updated = await updateMonitor(monitor.id, {
-        name: editName,
-        intervalSeconds: editInterval,
-      });
+      const updated = await updateMonitor(monitor.id, toUpdateInput(submitted));
       setMonitor({ ...updated, regions: monitor.regions });
-      setIsEditing(false);
+      setEditValues(null);
       setError(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo guardar el cambio");
+    } finally {
+      setIsSaving(false);
     }
   }
+
+  // El eje de la línea temporal: con "all" no hay ventana fija, así que
+  // empieza donde empiece el dato más antiguo que haya llegado (el primer
+  // bucket del gráfico o el incidente más viejo, lo que sea anterior).
+  const timelineFrom = useMemo(() => {
+    const candidates = [
+      ...timeseries.map((point) => new Date(point.bucket).getTime()),
+      ...rangeIncidents.map((incident) => new Date(incident.startedAt).getTime()),
+    ];
+    return rangeStart(range, Date.now(), candidates.length > 0 ? Math.min(...candidates) : undefined);
+  }, [range, timeseries, rangeIncidents]);
 
   if (error && !monitor) {
     return <div className="mx-auto max-w-3xl px-4 py-8 text-red-400">{error}</div>;
@@ -187,18 +216,22 @@ export function MonitorDetailPage() {
 
       <header className="mt-4 mb-6 flex items-start justify-between">
         <div>
-          {isEditing ? (
-            <input
-              value={editName}
-              onChange={(e) => setEditName(e.target.value)}
-              className="rounded-md border border-white/10 bg-black/30 px-2 py-1 text-2xl font-semibold text-white"
-            />
-          ) : (
-            <h1 className="text-2xl font-semibold text-white">{monitor.name}</h1>
-          )}
+          <h1 className="text-2xl font-semibold text-white">{monitor.name}</h1>
           <p className="text-sm text-gray-400">
             {monitor.type.toUpperCase()} · {monitor.target}
           </p>
+          {(monitor.tags?.length ?? 0) > 0 && (
+            <ul className="mt-2 flex flex-wrap gap-2">
+              {monitor.tags?.map((tag) => (
+                <li
+                  key={tag}
+                  className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-300"
+                >
+                  {tag}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
         <StatusBadge status={monitorDisplayStatus(monitor)} />
       </header>
@@ -219,6 +252,35 @@ export function MonitorDetailPage() {
           }
         />
       </div>
+
+      {/* Lo que de verdad se le pide al destino en cada check. Estaba
+          guardado desde la Fase 1.2 pero no se enseñaba en ningún sitio, así
+          que un monitor con cabeceras o body era una caja negra. */}
+      {monitor.type === "http" && (monitor.method || monitor.headers || monitor.body) && (
+        <div className="mb-6 rounded-lg border border-white/10 bg-white/5 p-4 text-sm">
+          <p className="mb-2 text-xs text-gray-400">Petición</p>
+          <p className="font-mono text-gray-200">
+            {monitor.method ?? "GET"} {monitor.target}
+          </p>
+          {monitor.headers && Object.keys(monitor.headers).length > 0 && (
+            <ul className="mt-2 space-y-0.5 font-mono text-xs text-gray-400">
+              {Object.entries(monitor.headers).map(([key, value]) => (
+                <li key={key}>
+                  {key}: {value}
+                </li>
+              ))}
+            </ul>
+          )}
+          {monitor.body && (
+            <pre className="mt-2 overflow-x-auto rounded bg-black/30 p-2 font-mono text-xs text-gray-300">
+              {monitor.body}
+            </pre>
+          )}
+          {monitor.expectedStatus != null && (
+            <p className="mt-2 text-xs text-gray-400">Status esperado: {monitor.expectedStatus}</p>
+          )}
+        </div>
+      )}
 
       {/* Fase 4.2: desde qué regiones se ve el monitor. Con una sola región
           configurada no aporta nada y se omite. */}
@@ -257,7 +319,7 @@ export function MonitorDetailPage() {
 
       {/* Fase 4.1: con rol de solo lectura no se enseñan las acciones (la
           API las rechazaría con 403 igualmente). */}
-      {canEdit && (
+      {canEdit && !isEditing && (
         <div className="mb-6 flex flex-wrap items-center gap-3">
           <button
             onClick={() => void handleTogglePause()}
@@ -265,42 +327,12 @@ export function MonitorDetailPage() {
           >
             {monitor.isPaused ? "Reanudar" : "Pausar"}
           </button>
-
-          {isEditing ? (
-            <>
-              <label htmlFor="edit-interval" className="text-sm text-gray-400">
-                Intervalo (s):
-              </label>
-              <input
-                id="edit-interval"
-                type="number"
-                min={30}
-                value={editInterval}
-                onChange={(e) => setEditInterval(Number(e.target.value))}
-                className="w-24 rounded-md border border-white/10 bg-black/30 px-2 py-1 text-white"
-              />
-              <button
-                onClick={() => void handleSaveEdit()}
-                className="rounded-md bg-emerald-600 px-4 py-2 text-sm text-white hover:bg-emerald-500"
-              >
-                Guardar
-              </button>
-              <button
-                onClick={() => setIsEditing(false)}
-                className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
-              >
-                Cancelar
-              </button>
-            </>
-          ) : (
-            <button
-              onClick={() => setIsEditing(true)}
-              className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-200 hover:bg-white/5"
-            >
-              Editar
-            </button>
-          )}
-
+          <button
+            onClick={startEditing}
+            className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-200 hover:bg-white/5"
+          >
+            Editar
+          </button>
           <button
             onClick={() => void handleDelete()}
             className="ml-auto rounded-md border border-red-500/30 px-4 py-2 text-sm text-red-400 hover:bg-red-500/10"
@@ -310,7 +342,46 @@ export function MonitorDetailPage() {
         </div>
       )}
 
+      {canEdit && isEditing && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void handleSaveEdit();
+          }}
+          className="mb-6 space-y-4 rounded-xl border border-white/10 bg-white/5 p-6"
+        >
+          <h2 className="text-lg font-medium text-white">Editar monitor</h2>
+          <MonitorFormFields
+            values={editValues}
+            // El estado es `MonitorFormValues | null` (null = no se está
+            // editando), así que la actualización solo se aplica si sigue
+            // habiendo formulario abierto.
+            onChange={(update) => setEditValues((previous) => (previous ? update(previous) : previous))}
+            typeLocked
+            tagSuggestions={tagSuggestions}
+          />
+          <div className="flex gap-3">
+            <button
+              type="submit"
+              disabled={isSaving}
+              className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+            >
+              {isSaving ? "Guardando…" : "Guardar"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditValues(null)}
+              className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      )}
+
       <MonitorChannelsSection monitorId={monitor.id} readOnly={!canEdit} />
+
+      <MaintenanceWindowsSection monitorId={monitor.id} readOnly={!canEdit} />
 
       <div className="mb-3 flex items-center justify-between">
         <h2 className="text-lg font-medium text-white">Histórico</h2>
@@ -335,6 +406,11 @@ export function MonitorDetailPage() {
 
       <div className="mb-6 rounded-lg border border-white/10 bg-white/5 p-4">
         <ResponseTimeChart points={timeseries} incidents={rangeIncidents} />
+      </div>
+
+      <h2 className="mb-3 text-lg font-medium text-white">Incidentes</h2>
+      <div className="mb-6 rounded-lg border border-white/10 bg-white/5 p-4">
+        <IncidentTimeline incidents={rangeIncidents} from={timelineFrom} to={Date.now()} />
       </div>
 
       <h2 className="mb-3 text-lg font-medium text-white">Últimos checks</h2>

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
   getPublicStatusPage,
+  getTeamStatusPage,
   type DailyStatus,
   type OverallStatus,
   type PublicStatusPageData,
@@ -42,16 +43,31 @@ function DailyHistoryBar({ history }: { history: { date: string; status: DailySt
 // sesión, sin sidebar, sin enlaces a /monitors — una página aislada pensada
 // para compartirse con quien NO tiene cuenta.
 export function PublicStatusPage() {
-  // /status/:username/:slug — el username delimita el espacio de nombres
-  // (dos usuarios pueden tener el mismo slug), ver ADR en TASK.md.
-  const { username, slug } = useParams<{ username: string; slug: string }>();
+  // Dos rutas, una misma vista:
+  //  - /status/:username/:slug — el username delimita el espacio de nombres
+  //    (dos usuarios pueden tener el mismo slug), ver ADR en TASK.md.
+  //  - /status/team/:orgSlug/:slug — la organización con ese identificador
+  //    público, sea de quien sea. Es lo que da URL propia a una organización
+  //    de equipo, que con la primera ruta no tenía ninguna.
+  const { username, orgSlug, slug } = useParams<{
+    username?: string;
+    orgSlug?: string;
+    slug: string;
+  }>();
   const [data, setData] = useState<PublicStatusPageData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!username || !slug) return;
+    if (!slug) return;
+    const request = orgSlug
+      ? getTeamStatusPage(orgSlug, slug)
+      : username
+        ? getPublicStatusPage(username, slug)
+        : null;
+    if (!request) return;
+
     let cancelled = false;
-    getPublicStatusPage(username, slug)
+    request
       .then((result) => {
         if (!cancelled) setData(result);
       })
@@ -61,7 +77,7 @@ export function PublicStatusPage() {
     return () => {
       cancelled = true;
     };
-  }, [username, slug]);
+  }, [username, orgSlug, slug]);
 
   if (error) {
     return (

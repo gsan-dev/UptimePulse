@@ -1,23 +1,27 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { ApiError } from "../api/client";
 import { listMonitors } from "../api/monitors";
-import { createStatusPage, deleteStatusPage, listStatusPages } from "../api/statusPages";
+import {
+  createStatusPage,
+  deleteStatusPage,
+  getStatusPage,
+  listStatusPages,
+  updateStatusPage,
+} from "../api/statusPages";
+import { Field, FieldGroup, inputClass } from "../components/forms";
+import { StatusPageMonitorsEditor } from "../components/StatusPageMonitorsEditor";
 import { useAuth } from "../context/AuthContext";
 import { useConfirm } from "../context/ConfirmContext";
 import { useOrganization } from "../context/OrganizationContext";
-import type { ApiMonitor, ApiStatusPage } from "../api/types";
+import type { ApiMonitor, ApiStatusPage, ApiStatusPageMonitor } from "../api/types";
 
-const inputClass =
-  "w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-500";
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label className="block space-y-1">
-      <span className="text-sm text-gray-400">{label}</span>
-      {children}
-    </label>
-  );
+/** Lo que se está editando de una página ya creada. */
+interface EditState {
+  id: string;
+  title: string;
+  isPublic: boolean;
+  monitors: ApiStatusPageMonitor[];
 }
 
 export function StatusPagesPage() {
@@ -26,12 +30,14 @@ export function StatusPagesPage() {
   const [monitors, setMonitors] = useState<ApiMonitor[]>([]);
   const [slug, setSlug] = useState("");
   const [title, setTitle] = useState("");
-  const [selectedMonitorIds, setSelectedMonitorIds] = useState<Set<string>>(new Set());
+  const [selectedMonitors, setSelectedMonitors] = useState<ApiStatusPageMonitor[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [edit, setEdit] = useState<EditState | null>(null);
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
   const confirm = useConfirm();
-  const { canEdit } = useOrganization();
+  const { canEdit, active } = useOrganization();
 
   const refresh = useCallback(async () => {
     const [pagesData, monitorsData] = await Promise.all([listStatusPages(), listMonitors()]);
@@ -43,29 +49,58 @@ export function StatusPagesPage() {
     void refresh();
   }, [refresh]);
 
-  function toggleMonitor(id: string): void {
-    setSelectedMonitorIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
   async function handleSubmit(event: FormEvent): Promise<void> {
     event.preventDefault();
     setError(null);
     setIsSubmitting(true);
     try {
-      await createStatusPage({ slug, title, monitorIds: [...selectedMonitorIds] });
+      await createStatusPage({ slug, title, monitors: selectedMonitors });
       setSlug("");
       setTitle("");
-      setSelectedMonitorIds(new Set());
+      setSelectedMonitors([]);
       await refresh();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo crear la página");
     } finally {
       setIsSubmitting(false);
+    }
+  }
+
+  // El listado no trae los monitores de cada página (solo el detalle), así
+  // que al abrir la edición hay que pedirlos: si no, guardar cualquier
+  // cambio de título vaciaría la lista de monitores sin querer.
+  async function startEditing(page: ApiStatusPage): Promise<void> {
+    setError(null);
+    try {
+      const detail = await getStatusPage(page.id);
+      setEdit({
+        id: page.id,
+        title: detail.title,
+        isPublic: detail.isPublic,
+        monitors: detail.monitors ?? (detail.monitorIds ?? []).map((id) => ({ id })),
+      });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "No se pudo cargar la status page");
+    }
+  }
+
+  async function handleSaveEdit(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    if (!edit) return;
+    setError(null);
+    setIsSavingEdit(true);
+    try {
+      await updateStatusPage(edit.id, {
+        title: edit.title,
+        isPublic: edit.isPublic,
+        monitors: edit.monitors,
+      });
+      setEdit(null);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "No se pudo guardar la status page");
+    } finally {
+      setIsSavingEdit(false);
     }
   }
 
@@ -81,6 +116,7 @@ export function StatusPagesPage() {
     setDeletingId(id);
     try {
       await deleteStatusPage(id);
+      if (edit?.id === id) setEdit(null);
       await refresh();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo borrar la status page");
@@ -96,12 +132,34 @@ export function StatusPagesPage() {
       </Link>
 
       <h1 className="mt-4 mb-6 text-2xl font-semibold text-white">Status pages públicas</h1>
-      <p className="mb-6 text-sm text-gray-400">
+      <p className="mb-2 text-sm text-gray-400">
         Comparte el estado de los monitores que elijas en una URL pública, sin login, sin exponer el
         resto de tu cuenta. Todas tus páginas cuelgan de tu nombre de usuario (
         <code>/status/{user?.username}/…</code>), así que el slug solo tiene que ser único entre las
         tuyas.
       </p>
+      {/* La organización puede tener además su propia URL, independiente del
+          username de nadie: es la única forma de que una organización de
+          equipo publique algo con su nombre. Se configura en /team. */}
+      <p className="mb-6 text-sm text-gray-400">
+        {active?.slug ? (
+          <>
+            Esta organización también publica en <code>/status/team/{active.slug}/…</code>.
+          </>
+        ) : (
+          <>
+            Esta organización todavía no tiene URL pública propia.{" "}
+            <Link to="/team" className="text-emerald-400 hover:underline">
+              Dale un identificador
+            </Link>{" "}
+            para publicar en <code>/status/team/…</code>.
+          </>
+        )}
+      </p>
+
+      {error && (
+        <p className="mb-4 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>
+      )}
 
       {!canEdit && (
         <p className="mb-6 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
@@ -113,10 +171,6 @@ export function StatusPagesPage() {
           onSubmit={(e) => void handleSubmit(e)}
           className="mb-8 space-y-4 rounded-xl border border-white/10 bg-white/5 p-6"
         >
-          {error && (
-            <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>
-          )}
-
           <Field
             label={`Slug — la URL será /status/${user?.username ?? "…"}/${slug || "mi-empresa"}`}
           >
@@ -144,27 +198,14 @@ export function StatusPagesPage() {
             />
           </Field>
 
-          <Field label="Monitores a mostrar">
-            <div className="space-y-1 rounded-md border border-white/10 bg-black/20 p-2">
-              {monitors.length === 0 ? (
-                <p className="px-1 py-1 text-sm text-gray-500">No tienes monitores todavía.</p>
-              ) : (
-                monitors.map((monitor) => (
-                  <label
-                    key={monitor.id}
-                    className="flex items-center gap-2 px-1 py-1 text-sm text-gray-200"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedMonitorIds.has(monitor.id)}
-                      onChange={() => toggleMonitor(monitor.id)}
-                    />
-                    {monitor.name}
-                  </label>
-                ))
-              )}
-            </div>
-          </Field>
+          <FieldGroup label="Monitores a mostrar">
+            <StatusPageMonitorsEditor
+              monitors={monitors}
+              value={selectedMonitors}
+              onChange={setSelectedMonitors}
+              idPrefix="new"
+            />
+          </FieldGroup>
 
           <button
             type="submit"
@@ -185,29 +226,104 @@ export function StatusPagesPage() {
 
       <ul className="space-y-2">
         {pages?.map((page) => (
-          <li
-            key={page.id}
-            className="flex items-center justify-between rounded-lg border border-white/10 bg-white/5 px-4 py-3"
-          >
-            <div>
-              <p className="font-medium text-white">{page.title}</p>
-              <a
-                href={`/status/${user?.username}/${page.slug}`}
-                target="_blank"
-                rel="noreferrer"
-                className="text-sm text-emerald-400 hover:underline"
-              >
-                /status/{user?.username}/{page.slug}
-              </a>
+          <li key={page.id} className="rounded-lg border border-white/10 bg-white/5 px-4 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="font-medium text-white">
+                  {page.title}
+                  {!page.isPublic && (
+                    <span className="ml-2 rounded bg-white/10 px-1.5 py-0.5 text-xs text-gray-400">
+                      no publicada
+                    </span>
+                  )}
+                </p>
+                <a
+                  href={`/status/${user?.username}/${page.slug}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block text-sm text-emerald-400 hover:underline"
+                >
+                  /status/{user?.username}/{page.slug}
+                </a>
+                {active?.slug && (
+                  <a
+                    href={`/status/team/${active.slug}/${page.slug}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block text-sm text-emerald-400/80 hover:underline"
+                  >
+                    /status/team/{active.slug}/{page.slug}
+                  </a>
+                )}
+              </div>
+              {canEdit && (
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => void startEditing(page)}
+                    className="rounded-md border border-white/10 px-3 py-1.5 text-sm text-gray-300 hover:bg-white/10"
+                  >
+                    {edit?.id === page.id ? "Editando" : "Editar"}
+                  </button>
+                  <button
+                    onClick={() => void handleDelete(page.id, page.title)}
+                    disabled={deletingId === page.id}
+                    className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+                  >
+                    {deletingId === page.id ? "Borrando…" : "Borrar"}
+                  </button>
+                </div>
+              )}
             </div>
-            {canEdit && (
-              <button
-                onClick={() => void handleDelete(page.id, page.title)}
-                disabled={deletingId === page.id}
-                className="rounded-md border border-red-500/30 px-3 py-1.5 text-sm text-red-400 hover:bg-red-500/10 disabled:opacity-50"
+
+            {edit?.id === page.id && (
+              <form
+                onSubmit={(e) => void handleSaveEdit(e)}
+                className="mt-4 space-y-4 border-t border-white/10 pt-4"
               >
-                {deletingId === page.id ? "Borrando…" : "Borrar"}
-              </button>
+                <Field label="Título">
+                  <input
+                    required
+                    value={edit.title}
+                    onChange={(e) => setEdit({ ...edit, title: e.target.value })}
+                    className={inputClass}
+                  />
+                </Field>
+
+                <label className="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={edit.isPublic}
+                    onChange={(e) => setEdit({ ...edit, isPublic: e.target.checked })}
+                  />
+                  Visible públicamente (si se desmarca, la URL responde 404)
+                </label>
+
+                <FieldGroup label="Monitores a mostrar">
+                  <StatusPageMonitorsEditor
+                    monitors={monitors}
+                    value={edit.monitors}
+                    onChange={(value) => setEdit({ ...edit, monitors: value })}
+                    idPrefix={`edit-${page.id}`}
+                  />
+                </FieldGroup>
+
+                <div className="flex gap-3">
+                  <button
+                    type="submit"
+                    disabled={isSavingEdit}
+                    className="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+                  >
+                    {isSavingEdit ? "Guardando…" : "Guardar cambios"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEdit(null)}
+                    className="rounded-md border border-white/10 px-4 py-2 text-sm text-gray-300 hover:bg-white/5"
+                  >
+                    Cancelar
+                  </button>
+                </div>
+              </form>
             )}
           </li>
         ))}

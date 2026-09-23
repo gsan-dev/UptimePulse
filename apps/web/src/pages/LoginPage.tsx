@@ -4,7 +4,7 @@ import { ApiError } from "../api/client";
 import { useAuth } from "../context/AuthContext";
 
 export function LoginPage() {
-  const { login } = useAuth();
+  const { login, sessionExpired } = useAuth();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   // Solo rutas internas: evita que un enlace externo use ?next= para
@@ -37,6 +37,13 @@ export function LoginPage() {
         className="w-full max-w-sm space-y-4 rounded-xl border border-white/10 bg-white/5 p-8"
       >
         <h1 className="text-xl font-semibold text-white">Iniciar sesión</h1>
+        {/* Sin esto, una sesión cerrada por inactividad se vive como "me ha
+            echado sin motivo". */}
+        {sessionExpired && !error && (
+          <p className="rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+            Tu sesión se cerró por inactividad. Vuelve a entrar para continuar.
+          </p>
+        )}
         {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
         <div className="space-y-1">
           <label className="text-sm text-gray-400" htmlFor="identifier">

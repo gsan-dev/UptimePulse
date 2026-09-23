@@ -28,7 +28,11 @@ export default function App() {
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
                 <Route path="/register" element={<RegisterPage />} />
-                {/* Pública a propósito (Fase 3.3): sin <ProtectedRoute>, no requiere sesión. */}
+                {/* Públicas a propósito (Fase 3.3): sin <ProtectedRoute>, no requieren sesión.
+                    La de "team" va primero por claridad; al tener cuatro segmentos frente a
+                    tres, no puede solaparse con la de username (y "team" está reservado como
+                    nombre de usuario, así que /status/team/x tampoco es ambiguo). */}
+                <Route path="/status/team/:orgSlug/:slug" element={<PublicStatusPage />} />
                 <Route path="/status/:username/:slug" element={<PublicStatusPage />} />
                 {/* Pública (Fase 4.3): la página de precios se ve sin cuenta. */}
                 {/* Pública (Fase 4.1): el invitado puede no tener cuenta todavía. */}

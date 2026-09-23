@@ -40,7 +40,9 @@ export interface ApiRegionSnapshot {
 }
 export type ApiMonitorDetail = ApiMonitor & { regions: ApiRegionSnapshot[] };
 
-export type UptimeRange = "24h" | "7d" | "30d" | "90d";
+// "all" = histórico total (sin ventana). Refleja UPTIME_RANGES de
+// apps/api/src/lib/metrics.ts.
+export type UptimeRange = "24h" | "7d" | "30d" | "90d" | "all";
 
 // Refleja MonitorMetrics de apps/api/src/lib/metrics.ts (Fase 2.2/2.4).
 export interface ApiMonitorMetrics {
@@ -71,9 +73,21 @@ export interface ApiDashboardSummary {
   sparklines: Record<string, ApiTimeseriesPoint[]>;
 }
 
-// monitorIds no es una columna de "status_pages": la añade apps/api al vuelo
-// a partir de status_page_monitors (igual que lastCheck en ApiMonitor) —
-// solo en POST/GET de una página concreta, no en el listado.
-export type ApiStatusPage = Serialized<StatusPage> & { monitorIds?: string[] };
+// Un monitor dentro de una status page: su id y, opcionalmente, el nombre
+// con el que se le quiere enseñar en público (columna
+// status_page_monitors.display_name). null = usar el nombre del monitor.
+export interface ApiStatusPageMonitor {
+  id: string;
+  displayName?: string | null;
+}
+
+// `monitors`/`monitorIds` no son columnas de "status_pages": las añade
+// apps/api al vuelo a partir de status_page_monitors (igual que lastCheck en
+// ApiMonitor) — solo en POST/PATCH/GET de una página concreta, no en el
+// listado.
+export type ApiStatusPage = Serialized<StatusPage> & {
+  monitors?: ApiStatusPageMonitor[];
+  monitorIds?: string[];
+};
 
 export type { MonitorType, CheckStatus };

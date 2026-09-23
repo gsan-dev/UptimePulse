@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { getDashboardSummary, listMonitors } from "../api/monitors";
 import type { ApiDashboardSummary, ApiMonitor } from "../api/types";
@@ -6,6 +6,8 @@ import { OrganizationSwitcher } from "../components/OrganizationSwitcher";
 import { Sparkline } from "../components/Sparkline";
 import { monitorDisplayStatus, StatusBadge } from "../components/StatusBadge";
 import { SummaryHeader } from "../components/SummaryHeader";
+import { TagFilter } from "../components/TagFilter";
+import { collectTags, filterByTags } from "../lib/tags";
 import { useAuth } from "../context/AuthContext";
 import { useOrganization } from "../context/OrganizationContext";
 import { useRealtime } from "../context/RealtimeContext";
@@ -18,6 +20,7 @@ export function DashboardPage() {
   const { showToast } = useToast();
   const [monitors, setMonitors] = useState<ApiMonitor[] | null>(null);
   const [summary, setSummary] = useState<ApiDashboardSummary | null>(null);
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -56,9 +59,19 @@ export function DashboardPage() {
     });
   }, [subscribe, refresh, showToast]);
 
-  const upCount = monitors?.filter((m) => monitorDisplayStatus(m) === "up").length ?? 0;
-  const downCount = monitors?.filter((m) => monitorDisplayStatus(m) === "down").length ?? 0;
-  const pausedCount = monitors?.filter((m) => monitorDisplayStatus(m) === "paused").length ?? 0;
+  // Las etiquetas salen de TODOS los monitores (si no, filtrar por una
+  // haría desaparecer las demás del filtro y no habría forma de volver),
+  // pero la lista y los contadores hablan de lo que se está viendo: con un
+  // filtro puesto, "3 operativos" tiene que referirse a esos tres.
+  const allTags = useMemo(() => collectTags(monitors ?? []), [monitors]);
+  const visibleMonitors = useMemo(
+    () => (monitors === null ? null : filterByTags(monitors, selectedTags)),
+    [monitors, selectedTags]
+  );
+
+  const upCount = visibleMonitors?.filter((m) => monitorDisplayStatus(m) === "up").length ?? 0;
+  const downCount = visibleMonitors?.filter((m) => monitorDisplayStatus(m) === "down").length ?? 0;
+  const pausedCount = visibleMonitors?.filter((m) => monitorDisplayStatus(m) === "paused").length ?? 0;
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
@@ -110,6 +123,10 @@ export function DashboardPage() {
       )}
 
       {monitors !== null && monitors.length > 0 && (
+        <TagFilter tags={allTags} selected={selectedTags} onChange={setSelectedTags} />
+      )}
+
+      {visibleMonitors !== null && visibleMonitors.length > 0 && (
         <SummaryHeader
           upCount={upCount}
           downCount={downCount}
@@ -131,8 +148,14 @@ export function DashboardPage() {
         </p>
       )}
 
+      {monitors !== null && monitors.length > 0 && visibleMonitors?.length === 0 && (
+        <p className="rounded-lg border border-dashed border-white/10 p-8 text-center text-gray-400">
+          Ningún monitor tiene {selectedTags.length === 1 ? "esa etiqueta" : "todas esas etiquetas"}.
+        </p>
+      )}
+
       <ul className="space-y-2">
-        {monitors?.map((monitor) => {
+        {visibleMonitors?.map((monitor) => {
           const sparklinePoints = summary?.sparklines[monitor.id] ?? [];
           return (
             <li key={monitor.id}>
@@ -143,6 +166,18 @@ export function DashboardPage() {
                 <div className="min-w-0">
                   <p className="truncate font-medium text-white">{monitor.name}</p>
                   <p className="truncate text-sm text-gray-400">{monitor.target}</p>
+                  {(monitor.tags?.length ?? 0) > 0 && (
+                    <ul className="mt-1 flex flex-wrap gap-1">
+                      {monitor.tags?.map((tag) => (
+                        <li
+                          key={tag}
+                          className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[11px] text-gray-400"
+                        >
+                          {tag}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
                 <div className="flex shrink-0 items-center gap-6">
                   <Sparkline
