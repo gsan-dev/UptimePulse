@@ -1,0 +1,167 @@
+# UptimePulse self-hosted: todo el stack en un servidor (Fase 5.4).
+#
+#   cp .env.example .env      # rellena POSTGRES_PASSWORD, JWT_*, APP_URL, SMTP_*
+#   docker compose -f docker-compose.prod.yml up -d              # HTTP en WEB_PORT (8080)
+#   docker compose -f docker-compose.prod.yml --profile tls up -d   # + Caddy con HTTPS automático en DOMAIN
+#
+# Para probar en local con un solo comando está docker-compose.yml, que
+# construye las imágenes, incluye Mailpit y publica todos los puertos. Este
+# archivo es el de un servidor de verdad: imágenes publicadas, SMTP real,
+# CORS estricto y solo la web expuesta. Los dos leen las MISMAS variables de
+# puerto del .env (WEB_PORT, API_PORT, WORKER_HTTP_PORT, POSTGRES_PORT,
+# REDIS_PORT), así que cambiar una vale para los dos sin tocar nada más.
+#
+# Por defecto usa las imágenes publicadas en GHCR (UPTIMEPULSE_VERSION, "latest"
+# si no se indica); `--build` las construye desde este repositorio.
+# Un solo origen: nginx (servicio "web") sirve la SPA y reenvía /api y
+# /socket.io a la API, así que solo se publica un puerto y no hace falta CORS.
+# Las migraciones las aplica el servicio "migrate" antes de que arranque la
+# API. Sin Mailpit: SMTP_* debe apuntar a un proveedor real.
+services:
+  postgres:
+    image: timescale/timescaledb:2.30.1-pg16
+    restart: unless-stopped
+    # No se publica en el host (solo lo usan los contenedores de esta red),
+    # pero escucha en el mismo puerto del .env que en docker-compose.yml para
+    # que las cadenas de conexión sean idénticas en los dos archivos.
+    command: ["-p", "${POSTGRES_PORT:-5432}"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-uptimepulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: ${POSTGRES_DB:-uptimepulse}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-uptimepulse} -p ${POSTGRES_PORT:-5432}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--port", "${REDIS_PORT:-6379}"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT:-6379}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: ghcr.io/gsan-dev/uptimepulse/api:${UPTIMEPULSE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    working_dir: /app
+    command: ["node", "node_modules/.bin/tsx", "packages/db/src/migrate.ts"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-uptimepulse}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-uptimepulse}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: ghcr.io/gsan-dev/uptimepulse/api:${UPTIMEPULSE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    # No se publica: se llega a la API a través de "web" (/api). Para
+    # exponerla directamente añade ports en un override.
+    expose: ["${API_PORT:-3000}"]
+    environment:
+      NODE_ENV: production
+      PORT: ${API_PORT:-3000}
+      DATABASE_URL: postgres://${POSTGRES_USER:-uptimepulse}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-uptimepulse}
+      REDIS_URL: redis://redis:${REDIS_PORT:-6379}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?Define JWT_ACCESS_SECRET en .env}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?Define JWT_REFRESH_SECRET en .env}
+      APP_URL: ${APP_URL:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      API_RATE_LIMIT_PER_MINUTE: ${API_RATE_LIMIT_PER_MINUTE:-300}
+      AUTH_RATE_LIMIT_PER_MINUTE: ${AUTH_RATE_LIMIT_PER_MINUTE:-10}
+      SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-15}
+      CHECK_REGIONS: ${CHECK_REGIONS:-local}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-UptimePulse <alerts@example.com>}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/gsan-dev/uptimepulse/worker:${UPTIMEPULSE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-uptimepulse}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-uptimepulse}
+      REDIS_URL: redis://redis:${REDIS_PORT:-6379}
+      CHECK_REGIONS: ${CHECK_REGIONS:-local}
+      WORKER_REGION: ${WORKER_REGION:-local}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
+      WORKER_HTTP_PORT: ${WORKER_HTTP_PORT:-3001}
+      INCIDENT_FAILURE_THRESHOLD: ${INCIDENT_FAILURE_THRESHOLD:-2}
+      CHECK_MAX_PER_HOST_PER_MINUTE: ${CHECK_MAX_PER_HOST_PER_MINUTE:-60}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-UptimePulse <alerts@example.com>}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  web:
+    image: ghcr.io/gsan-dev/uptimepulse/web:${UPTIMEPULSE_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    environment:
+      API_UPSTREAM: api:${API_PORT:-3000}
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+
+  # HTTPS automático (Let's Encrypt) delante de "web". Solo con
+  # `--profile tls`; necesita DOMAIN apuntando a este servidor y los puertos
+  # 80/443 libres. Sin este servicio, pon tu propio proxy TLS delante de WEB_PORT.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

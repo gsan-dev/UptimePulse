@@ -1,0 +1,26 @@
+{
+  "name": "@uptimepulse/worker",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@socket.io/redis-emitter": "^5.1.0",
+    "@uptimepulse/db": "*",
+    "@uptimepulse/mailer": "*",
+    "@uptimepulse/notify-channels": "*",
+    "@uptimepulse/queue": "*",
+    "@uptimepulse/server-utils": "*",
+    "@uptimepulse/shared": "*",
+    "dotenv": "^16.4.0",
+    "drizzle-orm": "^0.45.0",
+    "prom-client": "^15.1.3",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

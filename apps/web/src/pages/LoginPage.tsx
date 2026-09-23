@@ -1,0 +1,91 @@
+import { useState, type FormEvent } from "react";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { ApiError } from "../api/client";
+import { useAuth } from "../context/AuthContext";
+
+export function LoginPage() {
+  const { login, sessionExpired } = useAuth();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  // Solo rutas internas: evita que un enlace externo use ?next= para
+  // redirigir a otro dominio tras el login.
+  const rawNext = searchParams.get("next");
+  const next = rawNext && rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/monitors";
+  const [identifier, setIdentifier] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function handleSubmit(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    setError(null);
+    setIsSubmitting(true);
+    try {
+      await login(identifier, password);
+      navigate(next);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4">
+      <form
+        onSubmit={(e) => void handleSubmit(e)}
+        className="w-full max-w-sm space-y-4 rounded-xl border border-white/10 bg-white/5 p-8"
+      >
+        <h1 className="text-xl font-semibold text-white">Iniciar sesión</h1>
+        {/* Sin esto, una sesión cerrada por inactividad se vive como "me ha
+            echado sin motivo". */}
+        {sessionExpired && !error && (
+          <p className="rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+            Tu sesión se cerró por inactividad. Vuelve a entrar para continuar.
+          </p>
+        )}
+        {error && <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>}
+        <div className="space-y-1">
+          <label className="text-sm text-gray-400" htmlFor="identifier">
+            Email o nombre de usuario
+          </label>
+          <input
+            id="identifier"
+            type="text"
+            autoComplete="username"
+            required
+            value={identifier}
+            onChange={(e) => setIdentifier(e.target.value)}
+            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-500"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-sm text-gray-400" htmlFor="password">
+            Contraseña
+          </label>
+          <input
+            id="password"
+            type="password"
+            required
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="w-full rounded-md border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-emerald-500"
+          />
+        </div>
+        <button
+          type="submit"
+          disabled={isSubmitting}
+          className="w-full rounded-md bg-emerald-600 px-3 py-2 font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+        >
+          {isSubmitting ? "Entrando…" : "Entrar"}
+        </button>
+        <p className="text-center text-sm text-gray-400">
+          ¿No tienes cuenta?{" "}
+          <Link to={rawNext ? `/register?next=${encodeURIComponent(next)}` : "/register"} className="text-emerald-400 hover:underline">
+            Regístrate
+          </Link>
+        </p>
+      </form>
+    </div>
+  );
+}

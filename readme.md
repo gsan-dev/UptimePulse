@@ -4,6 +4,204 @@
 
 ---
 
+## Estado: las 5 fases del plan están completas
+
+[![CI](https://github.com/gsan-dev/UptimePulse/actions/workflows/ci.yml/badge.svg)](https://github.com/gsan-dev/UptimePulse/actions/workflows/ci.yml)
+
+Checks HTTP/TCP/ping desde varias regiones con quórum, incidentes, alertas
+(email, Discord, Slack, webhook firmado), SSL, status pages públicas por
+usuario, equipos con roles, [API REST documentada con API keys](#usar-la-api-desde-fuera),
+métricas Prometheus, tests (unitarios, integración, E2E) y CI con imágenes Docker.
+Lo que no está hecho a propósito (SMS, OAuth…) está en
+[TODO.md](TODO.md); cada decisión, en los ADR de [TASK.md](TASK.md); cada
+paso reproducible, en [DIARIO.md](DIARIO.md).
+
+### Capturas (reales, tomadas con Playwright sobre la app en local)
+
+| Dashboard en tiempo real | Detalle de un monitor |
+| --- | --- |
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Detalle](docs/screenshots/monitor-detail.png) |
+
+| Status page pública (`/status/<usuario>/<slug>` o `/status/team/<organización>/<slug>`) | API (`/docs`) |
+| --- | --- |
+| ![Status page](docs/screenshots/status-page.png) | ![Swagger](docs/screenshots/api-docs.png) |
+
+### Self-hosting en un servidor (Docker Compose)
+
+Un solo origen: `web` (nginx) sirve la interfaz y reenvía `/api` y el
+WebSocket a la API. Con dominio, Caddy pone HTTPS automático.
+
+```bash
+git clone https://github.com/gsan-dev/UptimePulse.git && cd UptimePulse
+cp .env.example .env     # POSTGRES_PASSWORD, JWT_* (openssl rand -hex 32), DOMAIN, APP_URL, SMTP_*
+docker compose -f docker-compose.prod.yml --profile tls up -d    # HTTPS en DOMAIN
+# o sin dominio:  docker compose -f docker-compose.prod.yml up -d  → http://IP:8080 (con COOKIE_SECURE=false)
+```
+
+Imágenes en GHCR (`ghcr.io/gsan-dev/uptimepulse/{api,worker,web}`),
+migraciones automáticas al arrancar, copias con `scripts/backup.sh` /
+`scripts/restore.sh`. Guía completa: [docs/DEPLOY.md](docs/DEPLOY.md).
+
+### Probarlo entero con un comando
+
+Requisitos: Docker con Compose v2. Nada más — ni Node, ni `.env`.
+
+```bash
+git clone https://github.com/gsan-dev/UptimePulse.git && cd UptimePulse
+docker compose up
+```
+
+Levanta TimescaleDB, Redis, Mailpit, las migraciones, la API, el worker y la
+web. Abre http://localhost:8080, regístrate y crea un monitor: en unos
+segundos verás "Operativo" sin recargar.
+
+| | |
+| --- | --- |
+| Web | http://localhost:8080 |
+| API | http://localhost:3000 — [cómo llamarla](#usar-la-api-desde-fuera) · `/docs` (Swagger) · `/health` · `/metrics` |
+| Worker | http://localhost:3001 (`/health`, `/metrics`) |
+| Emails (Mailpit) | http://localhost:8025 |
+
+Todos esos puertos salen del `.env` (`WEB_PORT`, `API_PORT`,
+`WORKER_HTTP_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `MAILPIT_*`). Cada
+variable manda a la vez en el puerto publicado, en el puerto donde escucha el
+servicio y en la URL con la que le hablan los demás: cambias el número y no
+hay que tocar nada más.
+
+### Arrancar en local para programar
+
+Con los procesos en tu máquina (recarga en caliente) y solo la
+infraestructura en Docker. Requisitos: Node 22+ y Docker.
+
+```bash
+cp .env.example .env                    # los valores de ejemplo valen para desarrollo
+docker compose up -d postgres redis mailpit
+npm install && npm run db:migrate
+npm run dev:api & npm run dev:worker & npm run dev:web   # o tres terminales
+```
+
+Aquí la web es el servidor de Vite: http://localhost:5173. (Los puertos de la
+API y el worker chocan con los del stack completo, así que no levantes los
+dos a la vez.)
+
+```bash
+npm run lint && npm run typecheck   # calidad
+npm test                            # unitarios + integración (usa la base uptimepulse_test)
+npm run test:e2e                    # Playwright contra los procesos arrancados
+```
+
+Más detalle por aplicación: [apps/api](apps/api/README.md),
+[apps/worker](apps/worker/README.md), [apps/web](apps/web/README.md).
+Self-hosting: [docs/DEPLOY.md](docs/DEPLOY.md). Seguridad:
+[docs/SECURITY.md](docs/SECURITY.md).
+
+---
+
+## Usar la API desde fuera
+
+Todo lo que hace la interfaz se puede hacer por API. La referencia completa
+—todas las rutas con sus esquemas— se sirve como Swagger UI en
+**http://localhost:3000/docs** y vive en [docs/openapi.yaml](docs/openapi.yaml).
+
+Dos formas de autenticarse, las dos con la misma cabecera `Authorization: Bearer …`:
+
+| | Para qué | De dónde sale |
+| --- | --- | --- |
+| **Access token (JWT)** | La propia interfaz web. Dura 5 min y se renueva sola mientras la uses. | `POST /auth/login` |
+| **API key** (`up_…`) | Scripts, CI, integraciones. No caduca; se revoca a mano. | La página `/api-keys`, o `POST /organizations/{id}/api-keys` |
+
+Para cualquier cosa automatizada, usa una API key.
+
+### 1. Crear la clave
+
+En la interfaz: **API keys** (`/api-keys`), siendo administrador de la
+organización. O por API, con tu sesión iniciada:
+
+```bash
+curl -X POST http://localhost:3000/organizations/<ORG_ID>/api-keys \
+  -H "Authorization: Bearer <TU_ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"GitHub Actions","scopes":["read","write"]}'
+```
+
+```json
+{
+  "id": "c2171886-…",
+  "name": "GitHub Actions",
+  "keyPrefix": "up_f922ed97",
+  "scopes": ["read", "write"],
+  "key": "up_f922ed974cb9af5c25f09d13cc068f608e478bcbd1736799d6f3547692e3d3fb"
+}
+```
+
+El campo `key` **se muestra una sola vez**: después solo queda su prefijo
+(`up_f922ed97`), porque en la base de datos se guarda únicamente su sha256.
+Si la pierdes, revócala y crea otra.
+
+Crear claves exige sesión de una persona: una API key no puede fabricar más
+claves, a propósito.
+
+### 2. Usarla
+
+```bash
+KEY=up_f922ed97…
+
+# Leer (scope "read")
+curl -H "Authorization: Bearer $KEY" http://localhost:3000/monitors
+
+# Escribir (scope "write")
+curl -X POST http://localhost:3000/monitors \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"api-prod","type":"http","target":"https://api.midominio.com/health","intervalSeconds":60}'
+```
+
+**La URL base** depende de por dónde entres: `http://localhost:3000` llamando
+a la API directamente, `http://localhost:8080/api` si pasas por la web del
+`docker compose` (nginx la reenvía), y `https://tu-dominio/api` en un
+servidor.
+
+Desde una GitHub Action, que es el caso típico — dar de alta el monitor al desplegar:
+
+```yaml
+- name: Registrar el despliegue en UptimePulse
+  env:
+    UPTIMEPULSE_KEY: ${{ secrets.UPTIMEPULSE_KEY }}
+  run: |
+    curl -fsS -X POST https://status.midominio.com/api/monitors \
+      -H "Authorization: Bearer $UPTIMEPULSE_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"api-prod","type":"http","target":"https://api.midominio.com/health"}'
+```
+
+### 3. Qué puede y qué no
+
+| Scope | Equivale al rol | Puede |
+| --- | --- | --- |
+| `read` | solo lectura | ver monitores, checks, incidentes y métricas |
+| `write` | editor | además crear, editar, pausar y borrar |
+
+Una API key **nunca administra la organización**: miembros, invitaciones,
+perfil y la gestión de las propias claves responden `403` aunque tenga
+`write`. Y la organización la fija la clave, así que la cabecera
+`X-Organization-Id` se ignora: una clave no puede actuar sobre otra
+organización.
+
+### 4. Revocar
+
+```bash
+curl -X DELETE http://localhost:3000/organizations/<ORG_ID>/api-keys/<KEY_ID> \
+  -H "Authorization: Bearer <TU_ACCESS_TOKEN>"
+```
+
+Responde `204` y el siguiente uso de esa clave da `401` al instante. El
+listado de claves muestra `lastUsedAt`, útil para localizar las olvidadas.
+
+El límite de peticiones (300/min por defecto) se cuenta **por clave**, no por
+IP: una integración detrás de un NAT no agota la cuota de las demás.
+
+---
+
 ## 1. Descripción del proyecto
 
 **UptimePulse** es una aplicación web tipo SaaS que permite a un usuario registrar URLs, APIs o servicios y monitorizarlos de forma continua. El sistema realiza comprobaciones periódicas (HTTP, TCP, SSL), detecta caídas y recuperaciones, calcula métricas de disponibilidad y rendimiento, y notifica al usuario por email, SMS o webhook cuando algo falla.
@@ -73,7 +271,7 @@ No es un CRUD más. Obliga a diseñar y justificar decisiones de:
 
 ### 2.7 Cuentas y equipos
 - Registro/login con email y contraseña (y opcionalmente OAuth con GitHub/Google).
-- Planes con límites distintos (nº de monitores, intervalo mínimo de chequeo, canales de alerta disponibles) — aunque sea un proyecto de portfolio, modelar planes de suscripción es un buen ejercicio de diseño de producto.
+- Sin planes ni límites de uso: cualquier organización puede crear los monitores que quiera, con intervalo mínimo de 30 s y cualquier canal (decisión del 2026-09-22; el sistema de planes de la Fase 4.3 se retiró).
 - Equipos/organizaciones con roles (admin, editor, solo lectura) — funcionalidad de la fase 2.
 
 ---
@@ -153,14 +351,15 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
                           (email / SMS / webhook)
 ```
 
-**Stack sugerido:**
-- Backend: Node.js (Express/Fastify) o Python (FastAPI)
-- Cola: Redis + BullMQ (o Celery + Redis)
-- Base de datos: PostgreSQL + extensión TimescaleDB
-- Frontend: React + TailwindCSS + Recharts
-- Tiempo real: WebSockets (Socket.io)
-- Alertas: Nodemailer/Resend (email), Twilio (SMS), fetch a webhooks
-- Infraestructura: Docker Compose en desarrollo, despliegue en VPS o Fly.io/Railway
+**Stack real (el que hay en el repositorio):**
+- Backend: Node.js 22 + Fastify 5 + zod; Drizzle ORM sobre PostgreSQL 16 + TimescaleDB 2.30 (hypertable `checks`, agregado continuo `checks_hourly`)
+- Cola: Redis 7 + BullMQ (job schedulers, una cola por región)
+- Frontend: React 18 + Vite + TailwindCSS + Recharts
+- Tiempo real: Socket.io con adaptador Redis (el worker publica, la API reenvía)
+- Alertas: Nodemailer (Mailpit en desarrollo, cualquier SMTP en producción), Discord, Slack, webhook genérico firmado con HMAC-SHA256. SMS pendiente (sin cuenta de Twilio).
+- Observabilidad: logs JSON con request id, `prom-client` en `/metrics`, `/health` con dependencias
+- Tests: Vitest (unitarios e integración contra la base real), Playwright (E2E)
+- Infraestructura: Docker Compose en desarrollo y self-hosting (`docker-compose.prod.yml`: nginx como único origen + Caddy TLS opcional), GitHub Actions (lint, type-check, tests, E2E, imágenes en GHCR), guía para Fly.io
 
 ---
 
@@ -168,10 +367,15 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 
 | Fase | Contenido |
 |---|---|
-| **Fase 1 — MVP** | Auth, CRUD de monitores, worker simple con checks HTTP, dashboard básico, alertas por email |
-| **Fase 2** | Cola de trabajo real (Redis/BullMQ), lógica de incidentes, WebSockets para tiempo real |
-| **Fase 3** | SSL check, webhooks/SMS, status pages públicas |
-| **Fase 4** | Equipos/roles, checks multi-región, planes de suscripción con límites |
+| **Fase 0 — Base** ✅ | Monorepo, Docker Compose, esquema y migraciones, logging JSON |
+| **Fase 1 — MVP** ✅ | Auth (JWT + refresh httpOnly), CRUD de monitores con anti-SSRF, worker HTTP/TCP, dashboard, alertas por email |
+| **Fase 2** ✅ | BullMQ, incidentes con umbral y ventanas de mantenimiento, WebSockets, métricas sobre TimescaleDB |
+| **Fase 3** ✅ | SSL, Discord/Slack/webhook firmado, status pages públicas por usuario (`/status/<usuario>/<slug>`) |
+| **Fase 4** ✅ | Equipos y roles con invitaciones, checks multi-región con quórum. (Los planes con límites se implementaron y se retiraron después: no hay límites de uso.) |
+| **Fase 5** ✅ | Seguridad (helmet, CORS, rate limits, API keys, cuota por host, redirecciones), observabilidad, tests, CI/CD, documentación. Ping ICMP añadido. |
+| **Fase 6** ✅ | Etiquetas con filtro, formulario HTTP completo (método/cabeceras/body) y edición completa del monitor, UI de ventanas de mantenimiento, línea temporal de incidentes, uptime «histórico total», status pages editables con nombre público por monitor y URL propia por organización (`/status/team/<organización>/<slug>`), cierre de sesión por inactividad |
+
+El detalle de cada fase, con lo verificado y cómo, está en [TASK.md](TASK.md).
 
 ---
 
@@ -180,21 +384,34 @@ Cliente (React) ──REST/WebSocket──► API Server ──► PostgreSQL (+
 ```
 uptimepulse/
 ├── apps/
-│   ├── api/            # Servidor REST + WebSocket
-│   ├── worker/         # Proceso de checks (independiente del API)
-│   └── web/            # Cliente React
+│   ├── api/            # Fastify: REST + Socket.io, productor de la cola (README propio)
+│   ├── worker/         # Consumidor de la cola: checks, quórum, incidentes, alertas (README propio)
+│   └── web/            # React + Vite (README propio)
 ├── packages/
-│   └── shared/         # Tipos e interfaces compartidas (TS)
-├── docker-compose.yml
+│   ├── db/             # Esquema Drizzle, migraciones SQL, cliente
+│   ├── queue/          # BullMQ: colas por región, job schedulers, quórum
+│   ├── server-utils/   # Anti-SSRF, validación de targets
+│   ├── mailer/         # Nodemailer + plantillas
+│   ├── notify-channels/# Discord, Slack, webhook firmado
+│   └── shared/         # Logger JSON, reglas de username, tipos
+├── e2e/                # Playwright (flujos críticos, contra los procesos de desarrollo)
+├── e2e-docker/         # Playwright contra el stack de `docker compose up`
+├── test/               # Configuración de los tests de integración (base uptimepulse_test)
+├── docs/               # openapi.yaml, SECURITY.md, DEPLOY.md, capturas
+├── .github/workflows/  # CI
+├── docker-compose.yml       # stack completo en local: `docker compose up`
+├── docker-compose.prod.yml  # self-hosting: imágenes publicadas + TLS
+├── deploy/Caddyfile         # TLS automático (perfil tls)
+├── scripts/                 # backup.sh / restore.sh
+├── TASK.md · DIARIO.md · TODO.md
 └── README.md
 ```
 
 ---
 
-## 7. Próximos pasos
+## 7. Qué queda
 
-1. Definir el esquema de base de datos (migraciones).
-2. Levantar el esqueleto del backend (API + auth).
-3. Construir el worker más simple posible (un ping cada minuto guardado en DB).
-4. Conectar un dashboard mínimo que lea esos datos.
-5. Iterar añadiendo cola de trabajo, tiempo real y alertas.
+El plan original está cumplido. Lo que se dejó fuera conscientemente y la
+deuda técnica conocida están en [TODO.md](TODO.md) (SMS con Twilio, OAuth,
+resumen semanal, alertas por rol, «degradado» por latencia, revocación
+explícita de refresh tokens, entre otros).
